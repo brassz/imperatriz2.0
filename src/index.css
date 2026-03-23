@@ -1,0 +1,117 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 228 14% 7%;
+    --foreground: 220 20% 92%;
+
+    --card: 228 14% 10%;
+    --card-foreground: 220 20% 92%;
+
+    --popover: 228 14% 10%;
+    --popover-foreground: 220 20% 92%;
+
+    --primary: 172 66% 40%;
+    --primary-foreground: 228 14% 7%;
+
+    --secondary: 228 14% 14%;
+    --secondary-foreground: 220 20% 80%;
+
+    --muted: 228 10% 16%;
+    --muted-foreground: 220 10% 50%;
+
+    --accent: 228 14% 18%;
+    --accent-foreground: 220 20% 92%;
+
+    --destructive: 0 72% 51%;
+    --destructive-foreground: 0 0% 100%;
+
+    --success: 152 60% 42%;
+    --success-foreground: 0 0% 100%;
+
+    --warning: 38 92% 50%;
+    --warning-foreground: 0 0% 0%;
+
+    --border: 228 10% 18%;
+    --input: 228 10% 18%;
+    --ring: 172 66% 40%;
+
+    --radius: 0.625rem;
+
+    --sidebar-background: 228 14% 8%;
+    --sidebar-foreground: 220 10% 60%;
+    --sidebar-primary: 172 66% 40%;
+    --sidebar-primary-foreground: 228 14% 7%;
+    --sidebar-accent: 228 14% 12%;
+    --sidebar-accent-foreground: 220 20% 92%;
+    --sidebar-border: 228 10% 14%;
+    --sidebar-ring: 172 66% 40%;
+
+    --surface: 228 14% 11%;
+    --surface-hover: 228 14% 14%;
+    --glow: 172 66% 40%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground font-sans antialiased;
+  }
+
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: hsl(var(--background));
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background: hsl(var(--muted));
+    border-radius: 3px;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background: hsl(var(--muted-foreground));
+  }
+}
+
+@layer utilities {
+  .glass-card {
+    @apply bg-card border border-border/50 rounded-xl shadow-lg backdrop-blur-sm;
+  }
+
+  .glass-card-hover {
+    @apply glass-card transition-all duration-300 hover:border-primary/30 hover:shadow-primary/5 hover:shadow-xl;
+  }
+
+  .glow-border {
+    @apply border border-primary/20 shadow-[0_0_15px_-3px_hsl(var(--primary)/0.15)];
+  }
+
+  .metric-card {
+    @apply glass-card p-5 relative overflow-hidden;
+  }
+
+  .metric-card::before {
+    content: '';
+    @apply absolute top-0 left-0 w-full h-[2px] bg-gradient-to-r from-transparent via-primary/40 to-transparent;
+  }
+
+  .text-gradient {
+    @apply bg-clip-text text-transparent bg-gradient-to-r from-primary to-teal-300;
+  }
+
+  .nexus-input {
+    @apply bg-secondary border-border/50 focus:border-primary/50 focus:ring-1 focus:ring-primary/20 transition-all duration-200;
+  }
+}
