@@ -89,6 +89,61 @@ export async function calculateLoanRemaining(loanId: string): Promise<LoanRemain
   };
 }
 
+export type PaymentRowInput = {
+  amount: unknown;
+  payment_type?: unknown;
+  fine_amount?: unknown;
+};
+
+/**
+ * Mesma lógica de {@link calculateLoanRemaining}, sem I/O — para lote (WhatsApp / automação).
+ */
+export function computeLoanRemainingFromData(
+  loan: { amount?: unknown; interest_rate?: unknown; original_amount?: unknown },
+  payments: PaymentRowInput[],
+): Pick<LoanRemainingResult, "capital" | "interestAmount" | "totalAmount" | "minimumPayment"> {
+  const originalCapital = parseFloat(String((loan as { original_amount?: unknown }).original_amount || loan.amount || 0));
+  let interestRate = parseFloat(String(loan.interest_rate || 0));
+  if (interestRate > 100) interestRate = interestRate / 100;
+
+  const realPayments = payments.filter((p) => parseFloat(String(p.amount || 0)) > 0);
+
+  let capitalPaid = 0;
+  let interestPaid = 0;
+  let currentCapital = originalCapital;
+
+  for (const payment of realPayments) {
+    const amt = parseFloat(String(payment.amount || 0));
+    const type = String(payment.payment_type || "");
+
+    if (INTEREST_ONLY_TYPES.includes(type)) {
+      interestPaid += amt;
+    } else {
+      const currentInterest = currentCapital * (interestRate / 100);
+      if (amt > currentInterest) {
+        interestPaid += currentInterest;
+        const capitalReduction = amt - currentInterest;
+        capitalPaid += capitalReduction;
+        currentCapital = Math.max(0, currentCapital - capitalReduction);
+      } else {
+        interestPaid += amt;
+      }
+    }
+  }
+
+  const remainingCapital = Math.max(0, originalCapital - capitalPaid);
+  const remainingInterest = remainingCapital * (interestRate / 100);
+  const remainingAmount = remainingCapital + remainingInterest;
+  const minimumPayment = remainingInterest;
+
+  return {
+    capital: remainingCapital,
+    interestAmount: remainingInterest,
+    totalAmount: remainingAmount,
+    minimumPayment,
+  };
+}
+
 export function calculateNextDueDate(currentDueDate: string, termDays: number): string {
   const d = new Date(String(currentDueDate).split("T")[0]);
   d.setDate(d.getDate() + termDays);

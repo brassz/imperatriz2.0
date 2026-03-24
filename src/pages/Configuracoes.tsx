@@ -1,4 +1,4 @@
-import { Plus, MessageCircle, Send, KeyRound, FolderOpen, RefreshCw, Clock, Calendar, StopCircle } from "lucide-react";
+import { Plus, MessageCircle, Send, KeyRound, FolderOpen, RefreshCw, Clock, Calendar, StopCircle, ListChecks } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -24,9 +24,20 @@ import { useQuery } from "@tanstack/react-query";
 import { fetchPixKeys } from "@/api/pix-keys";
 import { fetchExpenseCategories } from "@/api/categories";
 import { getEvolutionConfig, saveEvolutionConfig } from "@/lib/evolution-settings";
-import { useState, useCallback, useRef, useEffect } from "react";
+import { getSupabaseCompany } from "@/lib/supabase";
+import { useAuth } from "@/contexts/AuthContext";
+import {
+  fetchWhatsAppSchedules,
+  insertWhatsAppSchedule,
+  updateWhatsAppSchedule,
+  deleteWhatsAppSchedule,
+  migrateLocalSchedulesToSupabase,
+} from "@/api/whatsapp-schedules";
+import { useState, useCallback, useRef, useMemo, useEffect } from "react";
 import { toast } from "sonner";
 import { fetchLoansForAutomation, type AutomationLoan } from "@/api/automation";
+import { fetchInstallments, type InstallmentRow } from "@/api/installments";
+import { fetchClientsForSelect } from "@/api/clients";
 import {
   fetchEvolutionQrCode,
   getQrImageUrl,
@@ -40,15 +51,7 @@ import {
   type PixInfo,
 } from "@/lib/whatsapp-messages";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import {
-  getAgendamentos,
-  saveAgendamento,
-  updateAgendamento,
-  removeAgendamento,
-  type Agendamento,
-  type DiaSemana,
-  type FiltroAgendamento,
-} from "@/lib/agendamentos";
+import { type Agendamento, type DiaSemana, type FiltroAgendamento } from "@/lib/agendamentos";
 import { PDF_BRAND } from "@/lib/pdf-branding";
 
 const EMPRESAS = ["FRANCA", "Litoral", "Mogiana", "Imperatriz"];
@@ -63,18 +66,51 @@ const DIAS_LABELS: { value: DiaSemana; label: string }[] = [
   { value: "domingo", label: "Domingo" },
 ];
 const FILTROS_OPCOES: { value: FiltroAgendamento; label: string }[] = [
-  { value: "vencem_hoje", label: "Vencem Hoje" },
   { value: "vencidos", label: "Vencidos" },
+  { value: "vencem_hoje", label: "Vencem hoje" },
+  { value: "lembretes", label: "Lembretes (vencem amanhã)" },
   { value: "parcelamentos", label: "Parcelamentos" },
 ];
 
+function formatPreviewCurrency(n: number) {
+  return n.toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
+}
+
+function formatPreviewDate(iso: string) {
+  if (!iso) return "—";
+  const [y, m, d] = String(iso).split("T")[0].split("-");
+  return d && m && y ? `${d}/${m}/${y}` : iso;
+}
+
+function nextPendingInstallment(inst: InstallmentRow) {
+  const pending = inst.installment_payments
+    .filter((p) => p.status === "pending")
+    .sort((a, b) => a.due_date.localeCompare(b.due_date));
+  return pending[0] ?? null;
+}
+
+function labelTipoAutomacao(t: AutomationLoan["type"]): string {
+  switch (t) {
+    case "cobranca":
+      return "Vencido";
+    case "lembrete_hoje":
+      return "Vence hoje";
+    case "lembrete_amanha":
+      return "Lembrete (amanhã)";
+    default:
+      return t;
+  }
+}
+
 function NovoAgendamentoModal({
-  instance,
+  evolution,
+  pixInfo,
   onCreated,
   open,
   onOpenChange,
 }: {
-  instance: string;
+  evolution: { baseUrl: string; apiKey: string; instance: string };
+  pixInfo: PixInfo | null;
   onCreated: () => void;
   open: boolean;
   onOpenChange: (v: boolean) => void;
@@ -87,6 +123,82 @@ function NovoAgendamentoModal({
   const [delayMinutos, setDelayMinutos] = useState(7);
   const [ativo, setAtivo] = useState(true);
   const [erroFiltro, setErroFiltro] = useState("");
+  const [targetClientIds, setTargetClientIds] = useState<string[]>([]);
+  const [clientSearch, setClientSearch] = useState("");
+
+  const { data: clientsSelect = [] } = useQuery({
+    queryKey: ["clients-select-agendamento"],
+    queryFn: fetchClientsForSelect,
+    enabled: open,
+  });
+
+  const { data: modalPreviewLoans = [], isLoading: loadingModalLoans } = useQuery({
+    queryKey: ["agendamento-modal-loans-preview"],
+    queryFn: () => fetchLoansForAutomation({ requirePhone: false }),
+    enabled: open,
+    staleTime: 30_000,
+  });
+  const { data: modalInstallments = [], isLoading: loadingModalInst } = useQuery({
+    queryKey: ["agendamento-modal-installments-preview"],
+    queryFn: fetchInstallments,
+    enabled: open,
+    staleTime: 30_000,
+  });
+
+  const eligibleClientIds = useMemo(() => {
+    const set = new Set<string>();
+    if (filtros.includes("vencidos")) {
+      for (const l of modalPreviewLoans) {
+        if (l.type === "cobranca") set.add(l.client_id);
+      }
+    }
+    if (filtros.includes("vencem_hoje")) {
+      for (const l of modalPreviewLoans) {
+        if (l.type === "lembrete_hoje") set.add(l.client_id);
+      }
+    }
+    if (filtros.includes("lembretes")) {
+      for (const l of modalPreviewLoans) {
+        if (l.type === "lembrete_amanha") set.add(l.client_id);
+      }
+    }
+    if (filtros.includes("parcelamentos")) {
+      for (const inst of modalInstallments) {
+        if (nextPendingInstallment(inst)) set.add(String(inst.client_id));
+      }
+    }
+    return set;
+  }, [filtros, modalPreviewLoans, modalInstallments]);
+
+  const eligibleClientIdsKey = useMemo(
+    () => [...eligibleClientIds].sort().join(","),
+    [eligibleClientIds],
+  );
+
+  useEffect(() => {
+    if (filtros.length === 0) {
+      setTargetClientIds([]);
+      return;
+    }
+    if (loadingModalLoans || loadingModalInst) return;
+    setTargetClientIds((prev) => prev.filter((id) => eligibleClientIds.has(id)));
+  }, [
+    filtros.length,
+    eligibleClientIdsKey,
+    loadingModalLoans,
+    loadingModalInst,
+    eligibleClientIds,
+  ]);
+
+  const clientsForPicker = useMemo(() => {
+    if (filtros.length === 0) return [];
+    const q = clientSearch.trim().toLowerCase();
+    return clientsSelect
+      .filter((c) => eligibleClientIds.has(String(c.id)))
+      .filter((c) => !q || (c.name || "").toLowerCase().includes(q));
+  }, [clientsSelect, clientSearch, filtros.length, eligibleClientIds]);
+
+  const loadingEligibleClients = filtros.length > 0 && (loadingModalLoans || loadingModalInst);
 
   const toggleDia = (d: DiaSemana) => {
     if (d === "todos") {
@@ -110,30 +222,50 @@ function NovoAgendamentoModal({
     setErroFiltro("");
   };
 
-  const handleCriar = () => {
+  const handleCriar = async () => {
     if (filtros.length === 0) {
       setErroFiltro("Selecione pelo menos um filtro");
       return;
     }
-    saveAgendamento({
-      nome: nome.trim() || "Agendamento sem nome",
-      instance,
-      empresa,
-      horario,
-      dias,
-      filtros,
-      delayMinutos,
-      ativo,
-    });
-    toast.success("Agendamento criado");
-    onCreated();
-    onOpenChange(false);
-    setNome("");
-    setHorario("08:00");
-    setDias(["todos"]);
-    setFiltros([]);
-    setDelayMinutos(7);
-    setAtivo(true);
+    if (!pixInfo?.chave?.trim()) {
+      toast.error("Selecione uma chave PIX na seção «Envio manual de cobranças» abaixo.");
+      return;
+    }
+    if (!evolution.instance?.trim()) {
+      toast.error("Preencha e salve a instância Evolution acima.");
+      return;
+    }
+    try {
+      await insertWhatsAppSchedule({
+        nome: nome.trim() || "Agendamento sem nome",
+        instance: evolution.instance,
+        empresa,
+        horario,
+        dias,
+        filtros,
+        delayMinutos,
+        ativo,
+        evolutionBaseUrl: evolution.baseUrl,
+        evolutionApiKey: evolution.apiKey,
+        pixTipo: pixInfo.tipo,
+        pixTitular: pixInfo.titular,
+        pixChave: pixInfo.chave,
+        targetClientIds,
+      });
+      toast.success("Agendamento salvo no servidor");
+      onCreated();
+      onOpenChange(false);
+      setNome("");
+      setHorario("08:00");
+      setDias(["todos"]);
+      setFiltros([]);
+      setDelayMinutos(7);
+      setAtivo(true);
+      setTargetClientIds([]);
+      setClientSearch("");
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "Erro ao salvar agendamento (rode o SQL da tabela no Supabase?)");
+    }
   };
 
   return (
@@ -144,7 +276,7 @@ function NovoAgendamentoModal({
           Novo Agendamento
         </Button>
       </DialogTrigger>
-      <DialogContent className="max-w-md">
+      <DialogContent className="max-w-lg max-h-[90vh] overflow-y-auto">
         <DialogHeader>
           <DialogTitle>Novo Agendamento</DialogTitle>
         </DialogHeader>
@@ -160,7 +292,7 @@ function NovoAgendamentoModal({
           </div>
           <div>
             <Label className="text-xs">Instância WhatsApp</Label>
-            <Input value={instance} disabled className="mt-1 bg-muted" />
+            <Input value={evolution.instance} disabled className="mt-1 bg-muted" />
           </div>
           <div>
             <Label className="text-xs">Empresa</Label>
@@ -226,6 +358,67 @@ function NovoAgendamentoModal({
             )}
           </div>
           <div>
+            <Label className="text-xs">Clientes (opcional)</Label>
+            <Input
+              placeholder="Buscar cliente..."
+              value={clientSearch}
+              onChange={(e) => setClientSearch(e.target.value)}
+              disabled={filtros.length === 0}
+              className="h-8 text-xs mb-2"
+            />
+            <ScrollArea className="h-[140px] rounded-md border border-border/60 p-2">
+              <div className="space-y-1 pr-3">
+                {filtros.length === 0 ? (
+                  <p className="text-xs text-muted-foreground py-2">
+                    Marque Vencidos, Vencem hoje, Lembretes ou Parcelamentos para listar quem pode entrar no envio.
+                  </p>
+                ) : loadingEligibleClients ? (
+                  <p className="text-xs text-muted-foreground py-2">Carregando lista...</p>
+                ) : clientsForPicker.length === 0 ? (
+                  <p className="text-xs text-muted-foreground py-2">Nenhum cliente nesta combinação de filtros agora.</p>
+                ) : (
+                  clientsForPicker.map((c) => {
+                    const id = String(c.id);
+                    return (
+                      <label key={id} className="flex items-center gap-2 text-xs cursor-pointer py-0.5">
+                        <Checkbox
+                          checked={targetClientIds.includes(id)}
+                          onCheckedChange={() =>
+                            setTargetClientIds((prev) =>
+                              prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id],
+                            )
+                          }
+                        />
+                        <span className="truncate">{c.name}</span>
+                      </label>
+                    );
+                  })
+                )}
+              </div>
+            </ScrollArea>
+            <div className="flex flex-wrap gap-2 mt-2">
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className="h-7 text-xs"
+                disabled={filtros.length === 0 || loadingEligibleClients || clientsForPicker.length === 0}
+                onClick={() => setTargetClientIds(clientsForPicker.map((c) => String(c.id)))}
+              >
+                Marcar visíveis
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className="h-7 text-xs"
+                onClick={() => setTargetClientIds([])}
+              >
+                Limpar seleção
+              </Button>
+            </div>
+          </div>
+          <div>
             <Label className="text-xs">Delay entre mensagens (minutos)</Label>
             <Input
               type="number"
@@ -271,6 +464,8 @@ function formatFiltros(f: FiltroAgendamento[]): string {
 }
 
 export default function Configuracoes() {
+  const { user } = useAuth();
+  const companyId = getSupabaseCompany();
   const config = getEvolutionConfig();
   const [evolution, setEvolution] = useState({
     baseUrl: config.baseUrl,
@@ -280,6 +475,8 @@ export default function Configuracoes() {
   const [selectedPixId, setSelectedPixId] = useState<string>("");
   const [isSending, setIsSending] = useState(false);
   const [delayModalOpen, setDelayModalOpen] = useState(false);
+  /** IDs dos empréstimos (fila manual) marcados para envio */
+  const [manualQueueSelection, setManualQueueSelection] = useState<string[]>([]);
   const [delayMinutes, setDelayMinutes] = useState("2");
   const [automationLoans, setAutomationLoans] = useState<AutomationLoan[] | null>(null);
   const [loadingAutomationLoans, setLoadingAutomationLoans] = useState(false);
@@ -303,37 +500,66 @@ export default function Configuracoes() {
   const [queueCurrentName, setQueueCurrentName] = useState("");
   const [queueNextName, setQueueNextName] = useState("");
   const abortQueueRef = useRef(false);
+  const migratedSchedulesRef = useRef(false);
   const [activeTab, setActiveTab] = useState("whatsapp");
-  const [agendamentos, setAgendamentos] = useState<Agendamento[]>(() => getAgendamentos());
   const [modalAgendamento, setModalAgendamento] = useState(false);
 
-  const refreshAgendamentos = useCallback(() => setAgendamentos(getAgendamentos()), []);
+  const {
+    data: agendamentos = [],
+    refetch: refetchAgendamentos,
+    isLoading: loadingAgendamentos,
+  } = useQuery({
+    queryKey: ["whatsapp-schedules", user?.id, companyId],
+    queryFn: fetchWhatsAppSchedules,
+    enabled: activeTab === "whatsapp" && !!user?.id,
+  });
 
-  // Carrega a fila de clientes para automação sempre que a tela é acessada
-  useEffect(() => {
-    let cancelled = false;
-    const loadLoans = async () => {
-      setLoadingAutomationLoans(true);
-      try {
-        const loans = await fetchLoansForAutomation();
-        if (!cancelled) {
-          setAutomationLoans(loans);
-        }
-      } catch (e) {
-        if (!cancelled) {
-          console.error("Erro ao carregar clientes para automação:", e);
-        }
-      } finally {
-        if (!cancelled) {
-          setLoadingAutomationLoans(false);
-        }
-      }
-    };
-    loadLoans();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+  const {
+    data: previewLoans = [],
+    isLoading: loadingPreviewLoans,
+    isFetching: fetchingPreviewLoans,
+    refetch: refetchPreviewLoans,
+    error: previewLoansError,
+  } = useQuery({
+    queryKey: ["config-whatsapp-automation-preview"],
+    queryFn: () => fetchLoansForAutomation({ requirePhone: false }),
+    enabled: activeTab === "whatsapp",
+    staleTime: 60_000,
+  });
+
+  const {
+    data: installmentPreview = [],
+    isLoading: loadingInstallmentsPreview,
+    isFetching: fetchingInstallmentsPreview,
+    refetch: refetchInstallmentsPreview,
+  } = useQuery({
+    queryKey: ["config-whatsapp-installments-preview"],
+    queryFn: fetchInstallments,
+    enabled: activeTab === "whatsapp",
+    staleTime: 60_000,
+  });
+
+  const previewVencidos = useMemo(
+    () => previewLoans.filter((l) => l.type === "cobranca"),
+    [previewLoans],
+  );
+  const previewVencemHoje = useMemo(
+    () => previewLoans.filter((l) => l.type === "lembrete_hoje"),
+    [previewLoans],
+  );
+  const previewLembretes = useMemo(
+    () => previewLoans.filter((l) => l.type === "lembrete_amanha"),
+    [previewLoans],
+  );
+  const previewParcelamentosRows = useMemo(() => {
+    return installmentPreview
+      .map((inst) => {
+        const next = nextPendingInstallment(inst);
+        if (!next) return null;
+        return { inst, next };
+      })
+      .filter((x): x is { inst: InstallmentRow; next: NonNullable<ReturnType<typeof nextPendingInstallment>> } => x !== null);
+  }, [installmentPreview]);
 
   const { data: connectionState, refetch: refetchConnection } = useQuery({
     queryKey: ["evolution-connection", activeTab, evolution.instance],
@@ -385,6 +611,28 @@ export default function Configuracoes() {
     };
   }, [pixKeys, selectedPixId]);
 
+  useEffect(() => {
+    if (activeTab !== "whatsapp" || !user?.id) return;
+    if (migratedSchedulesRef.current) return;
+    const pix = getPixInfoForAutomation();
+    if (!pix?.chave?.trim()) return;
+    migratedSchedulesRef.current = true;
+    void migrateLocalSchedulesToSupabase(evolution, {
+      tipo: pix.tipo,
+      titular: pix.titular,
+      chave: pix.chave,
+    })
+      .then((n) => {
+        if (n > 0) {
+          toast.success(`${n} agendamento(s) migrados para o servidor.`);
+          void refetchAgendamentos();
+        }
+      })
+      .catch(() => {
+        migratedSchedulesRef.current = false;
+      });
+  }, [activeTab, user?.id, evolution, selectedPixId, getPixInfoForAutomation, refetchAgendamentos]);
+
   /** Delay que pode ser interrompido ao fechar o modal ou clicar em Interromper */
   const interruptibleDelay = useCallback((ms: number) => {
     return new Promise<void>((resolve) => {
@@ -416,6 +664,7 @@ export default function Configuracoes() {
     try {
       const loans = await fetchLoansForAutomation();
       setAutomationLoans(loans);
+      setManualQueueSelection(loans.map((l) => l.id));
     } catch (e) {
       toast.error(e instanceof Error ? e.message : "Erro ao carregar clientes para automação");
     } finally {
@@ -483,11 +732,18 @@ export default function Configuracoes() {
       }
 
       const toSend = loans.filter(
-        (l) => l.loan.client_phone?.trim() && activeTypes.has(l.type)
+        (l) =>
+          manualQueueSelection.includes(l.id) &&
+          l.loan.client_phone?.trim() &&
+          activeTypes.has(l.type),
       );
 
       if (toSend.length === 0) {
-        toast.info("Nenhum cliente na fila para enviar.");
+        if (manualQueueSelection.length === 0) {
+          toast.error("Selecione ao menos um destinatário na lista.");
+        } else {
+          toast.info("Nenhum destinatário selecionado com telefone e tipo de envio compatível.");
+        }
         setQueuePhase("done");
         setQueueCurrentName("—");
         setQueueNextName("—");
@@ -568,16 +824,24 @@ export default function Configuracoes() {
     setQueueModalOpen(open);
   };
 
-  const toggleAgendamentoAtivo = (a: Agendamento) => {
-    updateAgendamento(a.id, { ativo: !a.ativo });
-    refreshAgendamentos();
-    toast.success(a.ativo ? "Agendamento desativado" : "Agendamento ativado");
+  const toggleAgendamentoAtivo = async (a: Agendamento) => {
+    try {
+      await updateWhatsAppSchedule(a.id, { ativo: !a.ativo });
+      await refetchAgendamentos();
+      toast.success(a.ativo ? "Agendamento desativado" : "Agendamento ativado");
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "Erro ao atualizar agendamento");
+    }
   };
 
-  const handleRemoveAgendamento = (a: Agendamento) => {
-    removeAgendamento(a.id);
-    refreshAgendamentos();
-    toast.success("Agendamento removido");
+  const handleRemoveAgendamento = async (a: Agendamento) => {
+    try {
+      await deleteWhatsAppSchedule(a.id);
+      await refetchAgendamentos();
+      toast.success("Agendamento removido");
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "Erro ao remover agendamento");
+    }
   };
 
   const isLoading = loadingPix || loadingCat;
@@ -669,6 +933,141 @@ export default function Configuracoes() {
             </Button>
           </motion.div>
 
+          {/* Prévia: mesmas bases usadas no envio manual / agendamentos */}
+          <motion.div
+            initial={{ opacity: 0, y: 8 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ delay: 0.03 }}
+            className="glass-card p-5"
+          >
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between mb-4">
+              <div>
+                <h3 className="text-sm font-semibold text-foreground flex items-center gap-2">
+                  <ListChecks className="h-4 w-4" />
+                  Prévia para cobrança (empréstimos e parcelamentos)
+                </h3>
+                <p className="text-xs text-muted-foreground mt-1 max-w-xl">
+                  Vencidos, vencem hoje e Lembretes (vencem amanhã) vêm dos empréstimos com vencimento até amanhã. Parcelamentos: contratos ativos com próxima parcela pendente.
+                  Clientes sem telefone aparecem aqui, mas não entram na fila de envio até cadastrar o número.
+                </p>
+                {previewLoansError ? (
+                  <p className="text-xs text-destructive mt-2">
+                    {previewLoansError instanceof Error ? previewLoansError.message : "Erro ao carregar empréstimos."}
+                  </p>
+                ) : null}
+              </div>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className="gap-2 shrink-0"
+                disabled={loadingPreviewLoans || fetchingPreviewLoans || loadingInstallmentsPreview || fetchingInstallmentsPreview}
+                onClick={() => {
+                  void refetchPreviewLoans();
+                  void refetchInstallmentsPreview();
+                }}
+              >
+                <RefreshCw className="h-3 w-3" />
+                Atualizar listas
+              </Button>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
+              {(
+                [
+                  {
+                    title: "Vencidos",
+                    items: previewVencidos,
+                    empty: "Nenhum empréstimo vencido neste critério.",
+                  },
+                  {
+                    title: "Vencem hoje",
+                    items: previewVencemHoje,
+                    empty: "Nenhum empréstimo com vencimento hoje.",
+                  },
+                  {
+                    title: "Lembretes",
+                    items: previewLembretes,
+                    empty: "Nenhum empréstimo com vencimento amanhã.",
+                  },
+                  {
+                    title: "Parcelamentos (próx. pendente)",
+                    items: null as AutomationLoan[] | null,
+                    empty: "",
+                    isParcel: true,
+                  },
+                ] as const
+              ).map((col) => (
+                <div
+                  key={col.title}
+                  className="rounded-lg border border-border/60 bg-muted/20 flex flex-col min-h-[200px]"
+                >
+                  <div className="px-3 py-2 border-b border-border/50 bg-muted/30">
+                    <p className="text-xs font-semibold text-foreground">
+                      {col.title}
+                      <span className="font-normal text-muted-foreground">
+                        {" "}
+                        (
+                        {"isParcel" in col && col.isParcel
+                          ? previewParcelamentosRows.length
+                          : col.items.length}
+                        )
+                      </span>
+                    </p>
+                  </div>
+                  <ScrollArea className="flex-1 min-h-[180px] max-h-[280px]">
+                    <div className="p-3 space-y-2">
+                      {loadingPreviewLoans || loadingInstallmentsPreview ? (
+                        <p className="text-xs text-muted-foreground">Carregando...</p>
+                      ) : "isParcel" in col && col.isParcel ? (
+                        previewParcelamentosRows.length === 0 ? (
+                          <p className="text-xs text-muted-foreground">Nenhum parcelamento com parcela pendente.</p>
+                        ) : (
+                          previewParcelamentosRows.map(({ inst, next }) => (
+                            <div
+                              key={inst.id}
+                              className="text-xs border-b border-border/40 pb-2 mb-2 last:border-0 last:pb-0 last:mb-0"
+                            >
+                              <p className="font-medium text-foreground">{inst.client_name}</p>
+                              <p className="text-muted-foreground">
+                                {formatPreviewCurrency(next.amount)} · venc. {formatPreviewDate(next.due_date)}
+                              </p>
+                              {!inst.client_phone?.trim() ? (
+                                <p className="text-amber-600 dark:text-amber-500 mt-0.5">Sem telefone</p>
+                              ) : (
+                                <p className="text-muted-foreground mt-0.5">{inst.client_phone}</p>
+                              )}
+                            </div>
+                          ))
+                        )
+                      ) : col.items.length === 0 ? (
+                        <p className="text-xs text-muted-foreground">{col.empty}</p>
+                      ) : (
+                        col.items.map((item) => (
+                          <div
+                            key={item.id}
+                            className="text-xs border-b border-border/40 pb-2 mb-2 last:border-0 last:pb-0 last:mb-0"
+                          >
+                            <p className="font-medium text-foreground">{item.loan.client_name}</p>
+                            <p className="text-muted-foreground">
+                              Venc. {formatPreviewDate(item.loan.due_date)} ·{" "}
+                              {formatPreviewCurrency(item.loan.amount)}
+                            </p>
+                            {!item.loan.client_phone?.trim() ? (
+                              <p className="text-amber-600 dark:text-amber-500 mt-0.5">Sem telefone</p>
+                            ) : (
+                              <p className="text-muted-foreground mt-0.5">{item.loan.client_phone}</p>
+                            )}
+                          </div>
+                        ))
+                      )}
+                    </div>
+                  </ScrollArea>
+                </div>
+              ))}
+            </div>
+          </motion.div>
+
           {/* QR Code - só exibido quando NÃO conectado */}
           {!isConnected && (
             <motion.div
@@ -720,29 +1119,35 @@ export default function Configuracoes() {
             </motion.div>
           )}
 
-          {/* Agendamentos - exibido quando conectado */}
-          {isConnected && (
-            <motion.div
-              initial={{ opacity: 0, y: 8 }}
-              animate={{ opacity: 1, y: 0 }}
-              transition={{ delay: 0.05 }}
-              className="glass-card p-5"
-            >
-              <div className="flex items-center justify-between mb-4">
-                <div>
-                  <h3 className="text-sm font-semibold text-foreground">Agendamentos</h3>
-                  <p className="text-xs text-muted-foreground">Configure envios automáticos de cobranças</p>
-                </div>
-                <NovoAgendamentoModal
-                  instance={evolution.instance}
-                  onCreated={refreshAgendamentos}
-                  open={modalAgendamento}
-                  onOpenChange={setModalAgendamento}
-                />
+          {/* Agendamentos — persistidos no Supabase; execução via Edge Function + cron */}
+          <motion.div
+            initial={{ opacity: 0, y: 8 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ delay: 0.05 }}
+            className="glass-card p-5"
+          >
+            <div className="flex items-center justify-between mb-4">
+              <div>
+                <h3 className="text-sm font-semibold text-foreground">Agendamentos de envio</h3>
+                <p className="text-xs text-muted-foreground">
+                  Roda no servidor (não depende do seu PC). A Evolution API e o WhatsApp precisam estar online no mesmo horário.
+                </p>
               </div>
-              {agendamentos.length === 0 ? (
-                <p className="text-sm text-muted-foreground py-6">Nenhum agendamento criado. Clique em Novo Agendamento.</p>
-              ) : (
+              <NovoAgendamentoModal
+                evolution={evolution}
+                pixInfo={getPixInfoForAutomation()}
+                onCreated={() => void refetchAgendamentos()}
+                open={modalAgendamento}
+                onOpenChange={setModalAgendamento}
+              />
+            </div>
+            {!user?.id ? (
+              <p className="text-sm text-muted-foreground py-4">Faça login para gerenciar agendamentos na nuvem.</p>
+            ) : loadingAgendamentos ? (
+              <p className="text-sm text-muted-foreground py-6">Carregando agendamentos...</p>
+            ) : agendamentos.length === 0 ? (
+              <p className="text-sm text-muted-foreground py-6">Nenhum agendamento criado. Clique em Novo Agendamento.</p>
+            ) : (
                 <div className="space-y-3">
                   {agendamentos.map((a) => (
                     <div
@@ -756,6 +1161,12 @@ export default function Configuracoes() {
                         </p>
                         <p className="text-xs text-muted-foreground mt-0.5">
                           Empresa: {a.empresa} • Delay: {a.delayMinutos} min
+                        </p>
+                        <p className="text-xs text-muted-foreground mt-0.5">
+                          Clientes:{" "}
+                          {a.targetClientIds?.length
+                            ? `${a.targetClientIds.length} restrito(s)`
+                            : "todos os elegíveis pelos filtros"}
                         </p>
                       </div>
                       <div className="flex items-center gap-2">
@@ -777,8 +1188,7 @@ export default function Configuracoes() {
                   ))}
                 </div>
               )}
-            </motion.div>
-          )}
+          </motion.div>
 
           {/* Automação manual */}
           <motion.div
@@ -821,69 +1231,149 @@ export default function Configuracoes() {
             </div>
           </motion.div>
 
-          {/* Modal: intervalo entre envios */}
+          {/* Modal: intervalo + seleção de destinatários */}
           <Dialog open={delayModalOpen} onOpenChange={setDelayModalOpen}>
-            <DialogContent className="sm:max-w-md">
+            <DialogContent className="sm:max-w-lg max-h-[90vh] overflow-y-auto">
               <DialogHeader>
-                <DialogTitle>Intervalo entre envios</DialogTitle>
+                <DialogTitle>Enviar cobranças — fila</DialogTitle>
               </DialogHeader>
-              <p className="text-sm text-muted-foreground">
-                Defina quantos minutos esperar entre o envio de uma mensagem e a próxima (0 = sem pausa).
-              </p>
-              <div className="space-y-4 mt-3">
-                <div className="space-y-2">
-                  <Label htmlFor="delay-minutes" className="text-xs">
-                    Delay (minutos)
-                  </Label>
-                  <Input
-                    id="delay-minutes"
-                    type="number"
-                    min={0}
-                    step={0.5}
-                    value={delayMinutes}
-                    onChange={(e) => setDelayMinutes(e.target.value)}
-                    className="h-9"
-                  />
-                </div>
+              {loadingAutomationLoans ? (
+                <p className="text-sm text-muted-foreground py-4">Carregando lista de empréstimos...</p>
+              ) : !automationLoans?.length ? (
+                <p className="text-sm text-muted-foreground py-4">
+                  Nenhum empréstimo elegível (vencidos, hoje ou amanhã) no momento.
+                </p>
+              ) : (
+                <>
+                  <p className="text-sm text-muted-foreground">
+                    Marque quem entra na fila. Defina o intervalo entre mensagens (0 = sem pausa).
+                  </p>
+                  <div className="space-y-4 mt-3">
+                    <div className="space-y-2">
+                      <Label htmlFor="delay-minutes" className="text-xs">
+                        Delay (minutos)
+                      </Label>
+                      <Input
+                        id="delay-minutes"
+                        type="number"
+                        min={0}
+                        step={0.5}
+                        value={delayMinutes}
+                        onChange={(e) => setDelayMinutes(e.target.value)}
+                        className="h-9"
+                      />
+                    </div>
 
-                <div className="space-y-1">
-                  <p className="text-xs font-medium text-foreground">Tipos para enviar</p>
-                  <div className="flex flex-col gap-1">
-                    <label className="flex items-center gap-2 text-xs">
-                      <Checkbox
-                        checked={sendTypes.cobranca}
-                        onCheckedChange={(checked) =>
-                          setSendTypes((prev) => ({ ...prev, cobranca: Boolean(checked) }))
-                        }
-                      />
-                      <span>Cobranças (vencidos)</span>
-                    </label>
-                    <label className="flex items-center gap-2 text-xs">
-                      <Checkbox
-                        checked={sendTypes.lembrete_hoje}
-                        onCheckedChange={(checked) =>
-                          setSendTypes((prev) => ({ ...prev, lembrete_hoje: Boolean(checked) }))
-                        }
-                      />
-                      <span>Cobranças (vencem hoje)</span>
-                    </label>
-                    <label className="flex items-center gap-2 text-xs">
-                      <Checkbox
-                        checked={sendTypes.lembrete_amanha}
-                        onCheckedChange={(checked) =>
-                          setSendTypes((prev) => ({ ...prev, lembrete_amanha: Boolean(checked) }))
-                        }
-                      />
-                      <span>Lembretes (vencem amanhã)</span>
-                    </label>
+                    <div className="space-y-1">
+                      <p className="text-xs font-medium text-foreground">Tipos para enviar</p>
+                      <div className="flex flex-col gap-1">
+                        <label className="flex items-center gap-2 text-xs">
+                          <Checkbox
+                            checked={sendTypes.cobranca}
+                            onCheckedChange={(checked) =>
+                              setSendTypes((prev) => ({ ...prev, cobranca: Boolean(checked) }))
+                            }
+                          />
+                          <span>Cobranças (vencidos)</span>
+                        </label>
+                        <label className="flex items-center gap-2 text-xs">
+                          <Checkbox
+                            checked={sendTypes.lembrete_hoje}
+                            onCheckedChange={(checked) =>
+                              setSendTypes((prev) => ({ ...prev, lembrete_hoje: Boolean(checked) }))
+                            }
+                          />
+                          <span>Cobranças (vencem hoje)</span>
+                        </label>
+                        <label className="flex items-center gap-2 text-xs">
+                          <Checkbox
+                            checked={sendTypes.lembrete_amanha}
+                            onCheckedChange={(checked) =>
+                              setSendTypes((prev) => ({ ...prev, lembrete_amanha: Boolean(checked) }))
+                            }
+                          />
+                          <span>Lembretes (vencem amanhã)</span>
+                        </label>
+                      </div>
+                    </div>
+
+                    <div className="space-y-2">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <Label className="text-xs">Destinatários (empréstimos)</Label>
+                        <div className="flex gap-2">
+                          <Button
+                            type="button"
+                            variant="outline"
+                            size="sm"
+                            className="h-7 text-xs"
+                            onClick={() =>
+                              setManualQueueSelection(automationLoans.map((l) => l.id))
+                            }
+                          >
+                            Marcar todos
+                          </Button>
+                          <Button
+                            type="button"
+                            variant="outline"
+                            size="sm"
+                            className="h-7 text-xs"
+                            onClick={() => setManualQueueSelection([])}
+                          >
+                            Desmarcar todos
+                          </Button>
+                        </div>
+                      </div>
+                      <ScrollArea className="h-[220px] rounded-md border border-border/60 p-2">
+                        <div className="space-y-2 pr-3">
+                          {automationLoans.map((item) => (
+                            <label
+                              key={item.id}
+                              className="flex items-start gap-2 text-xs cursor-pointer rounded-md p-1.5 hover:bg-muted/40"
+                            >
+                              <Checkbox
+                                className="mt-0.5"
+                                checked={manualQueueSelection.includes(item.id)}
+                                onCheckedChange={(checked) => {
+                                  setManualQueueSelection((prev) => {
+                                    if (checked) {
+                                      return prev.includes(item.id) ? prev : [...prev, item.id];
+                                    }
+                                    return prev.filter((x) => x !== item.id);
+                                  });
+                                }}
+                              />
+                              <span className="min-w-0 flex-1">
+                                <span className="font-medium text-foreground">{item.loan.client_name}</span>
+                                <span className="text-muted-foreground"> · {labelTipoAutomacao(item.type)}</span>
+                                <span className="block text-muted-foreground mt-0.5">
+                                  Venc. {formatPreviewDate(item.loan.due_date)} ·{" "}
+                                  {formatPreviewCurrency(item.loan.amount)}
+                                  {!item.loan.client_phone?.trim() ? (
+                                    <span className="text-amber-600 dark:text-amber-500"> · sem telefone</span>
+                                  ) : null}
+                                </span>
+                              </span>
+                            </label>
+                          ))}
+                        </div>
+                      </ScrollArea>
+                    </div>
                   </div>
-                </div>
-              </div>
+                </>
+              )}
               <DialogFooter className="gap-2 sm:gap-0">
                 <Button variant="outline" onClick={() => setDelayModalOpen(false)}>
                   Cancelar
                 </Button>
-                <Button onClick={handleConfirmDelayAndStartQueue} className="gap-2">
+                <Button
+                  onClick={handleConfirmDelayAndStartQueue}
+                  className="gap-2"
+                  disabled={
+                    loadingAutomationLoans ||
+                    !automationLoans?.length ||
+                    manualQueueSelection.length === 0
+                  }
+                >
                   <Send className="h-4 w-4" />
                   Iniciar fila
                 </Button>

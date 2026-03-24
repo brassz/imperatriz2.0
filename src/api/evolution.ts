@@ -130,6 +130,89 @@ export async function sendWhatsAppMessage(phone: string, text: string): Promise<
   return { ok: true, via: "link" };
 }
 
+/**
+ * Envia PDF (ou outro documento) em base64 puro via Evolution API.
+ * @see https://doc.evolution-api.com/v2/api-reference/message-controller/send-media
+ */
+export async function sendWhatsAppDocument(
+  number: string,
+  opts: { base64: string; fileName: string; caption?: string },
+): Promise<{ ok: boolean; error?: string }> {
+  const { baseUrl, apiKey, instance } = getEvolutionConfig();
+  const num = normalizePhone(number);
+  const base = normalizeBaseUrl(baseUrl);
+  try {
+    assertNoMixedContent(base);
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : "Configuração inválida" };
+  }
+  const url = `${base}/message/sendMedia/${encodeURIComponent(instance)}`;
+  const fileName = opts.fileName?.trim() || "documento.pdf";
+  const body: Record<string, string> = {
+    number: num,
+    mediatype: "document",
+    mimetype: "application/pdf",
+    media: opts.base64,
+    fileName,
+    caption: opts.caption ?? "",
+  };
+
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        apikey: apiKey,
+      },
+      body: JSON.stringify(body),
+    });
+
+    if (!res.ok) {
+      const err = await res.text();
+      return { ok: false, error: err || `HTTP ${res.status}` };
+    }
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : "Erro de conexão" };
+  }
+}
+
+/**
+ * Envia colinha + PDF. Se não estiver conectado à API, abre wa.me com o texto (PDF já deve ter sido baixado).
+ */
+export async function sendWhatsAppComprovante(
+  phone: string,
+  caption: string,
+  pdfBase64: string,
+  fileName: string,
+): Promise<SendResult> {
+  const state = await fetchConnectionState();
+  if (state.ok && state.connected) {
+    const res = await sendWhatsAppDocument(phone, {
+      base64: pdfBase64,
+      fileName,
+      caption,
+    });
+    if (res.ok) return { ok: true, via: "api" };
+    window.open(
+      buildWhatsAppLink(
+        phone,
+        `${caption}\n\n(Baixe o PDF gerado neste computador e anexe na conversa, se necessário.)`,
+      ),
+      "_blank",
+    );
+    return { ok: true, via: "link" };
+  }
+  window.open(
+    buildWhatsAppLink(
+      phone,
+      `${caption}\n\n(Baixe o PDF gerado neste computador e anexe na conversa, se necessário.)`,
+    ),
+    "_blank",
+  );
+  return { ok: true, via: "link" };
+}
+
 export async function sendWhatsAppText(number: string, text: string): Promise<{ ok: boolean; error?: string }> {
   const { baseUrl, apiKey, instance } = getEvolutionConfig();
   const num = normalizePhone(number);

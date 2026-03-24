@@ -52,7 +52,7 @@ import { fetchInstallments, type InstallmentRow } from "@/api/installments";
 import { createPayment, createRenewalPayment, fetchPaymentsByLoanId, deletePayment } from "@/api/payments";
 import { calculateLoanRemaining, calculateNextDueDate, type LoanRemainingResult } from "@/api/loan-calc";
 import { fetchPixKeys } from "@/api/pix-keys";
-import { sendWhatsAppMessage } from "@/api/evolution";
+import { sendWhatsAppComprovante, sendWhatsAppMessage } from "@/api/evolution";
 import { buildCobrancaMessage, buildComprovanteMessage } from "@/lib/whatsapp-messages";
 import { createFine } from "@/api/fines";
 import { fetchClientsForSelect, fetchClientHistory, fetchClientScore } from "@/api/clients";
@@ -63,6 +63,7 @@ import { useState } from "react";
 import { toast } from "sonner";
 import { jsPDF } from "jspdf";
 import { addPdfHeader, addPdfFooter, getPdfMargin, PDF_BRAND } from "@/lib/pdf-utils";
+import { comprovantePdfToBase64, generateComprovantePagamentoPdf } from "@/lib/comprovante-pdf";
 import { Pagination } from "@/components/Pagination";
 import { PAGE_SIZE } from "@/lib/constants";
 import { useAuth } from "@/contexts/AuthContext";
@@ -177,7 +178,11 @@ export default function Emprestimos() {
     clientPhone: string;
     valorPago: number;
     proximoVencimento: string;
+    loanId: string;
+    paymentDate: string;
+    paymentDescription: string;
   } | null>(null);
+  const [comprovanteSending, setComprovanteSending] = useState(false);
   const [selectedLoan, setSelectedLoan] = useState<LoanRow | null>(null);
   const [editForm, setEditForm] = useState({ amount: "", interest_rate: "", loan_date: "", due_date: "", status: "active" });
   const [quitarDate, setQuitarDate] = useState(toInputDate(new Date().toISOString()));
@@ -642,6 +647,9 @@ export default function Emprestimos() {
         clientPhone: String(selectedLoan.client_phone || "").trim(),
         valorPago: valorTotal,
         proximoVencimento: newDue,
+        loanId: String(selectedLoan.id),
+        paymentDate: paymentForm.payment_date,
+        paymentDescription: `${labels[option]} — Renovação +${renewalDays} dias`,
       });
       setComprovanteOpen(true);
     } catch (err) {
@@ -1850,6 +1858,8 @@ export default function Emprestimos() {
                 <>
                   Pagamento de {formatCurrency(comprovanteData.valorPago)} registrado.
                   Próximo vencimento: {formatDate(comprovanteData.proximoVencimento)}.
+                  O PDF oficial com marca d&apos;água será baixado e enviado como anexo no WhatsApp (se a
+                  instância estiver conectada).
                 </>
               )}
             </DialogDescription>
@@ -1857,13 +1867,13 @@ export default function Emprestimos() {
           {comprovanteData && (
             <div className="space-y-4 py-2">
               <div className="rounded-lg border border-border/50 bg-muted/30 p-4 text-sm">
-                <p className="font-medium text-foreground mb-2">Mensagem que será enviada:</p>
+                <p className="font-medium text-foreground mb-2">Colinha (legenda do PDF + mensagem):</p>
                 <p className="text-muted-foreground whitespace-pre-wrap text-xs">
-                  {buildComprovanteMessage(
+                  {`${buildComprovanteMessage(
                     comprovanteData.clientName,
                     comprovanteData.valorPago,
                     comprovanteData.proximoVencimento
-                  )}
+                  )}\n\n📎 Comprovante oficial em PDF anexo (marca d'água).`}
                 </p>
               </div>
               <DialogFooter>
@@ -1872,24 +1882,43 @@ export default function Emprestimos() {
                 </Button>
                 <Button
                   className="gap-2 bg-[#25D366] hover:bg-[#20BD5A]"
-                  disabled={!comprovanteData.clientPhone}
+                  disabled={!comprovanteData.clientPhone || comprovanteSending}
                   onClick={async () => {
                     if (!comprovanteData?.clientPhone) {
                       toast.error("Cliente sem telefone cadastrado");
                       return;
                     }
-                    const msg = buildComprovanteMessage(
-                      comprovanteData.clientName,
-                      comprovanteData.valorPago,
-                      comprovanteData.proximoVencimento
-                    );
-                    const res = await sendWhatsAppMessage(comprovanteData.clientPhone, msg);
-                    if (res.via === "api") toast.success("Mensagem enviada");
-                    setComprovanteOpen(false);
+                    setComprovanteSending(true);
+                    try {
+                      const colinha = `${buildComprovanteMessage(
+                        comprovanteData.clientName,
+                        comprovanteData.valorPago,
+                        comprovanteData.proximoVencimento
+                      )}\n\n📎 Comprovante oficial em PDF anexo (marca d'água).`;
+                      const doc = generateComprovantePagamentoPdf({
+                        clientName: comprovanteData.clientName,
+                        valorPago: comprovanteData.valorPago,
+                        proximoVencimento: comprovanteData.proximoVencimento,
+                        paymentDate: comprovanteData.paymentDate,
+                        paymentDescription: comprovanteData.paymentDescription,
+                        loanId: comprovanteData.loanId,
+                      });
+                      const fileName = `comprovante-${comprovanteData.loanId.slice(0, 8)}-${comprovanteData.paymentDate}.pdf`;
+                      doc.save(fileName);
+                      const b64 = comprovantePdfToBase64(doc);
+                      const res = await sendWhatsAppComprovante(comprovanteData.clientPhone, colinha, b64, fileName);
+                      if (res.via === "api") toast.success("PDF e mensagem enviados pelo WhatsApp");
+                      else toast.success("PDF baixado. Abra o WhatsApp e anexe o arquivo se necessário.");
+                      setComprovanteOpen(false);
+                    } catch (e) {
+                      toast.error(e instanceof Error ? e.message : "Erro ao gerar ou enviar comprovante");
+                    } finally {
+                      setComprovanteSending(false);
+                    }
                   }}
                 >
                   <MessageCircle className="h-4 w-4" />
-                  Enviar via WhatsApp
+                  {comprovanteSending ? "Enviando..." : "Baixar PDF e enviar WhatsApp"}
                 </Button>
               </DialogFooter>
             </div>

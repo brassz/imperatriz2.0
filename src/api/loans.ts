@@ -556,18 +556,29 @@ export async function fetchLoansByDateRange(dateFrom: string, dateTo: string): P
 export async function fetchPaidLoansByDateRange(dateFrom: string, dateTo: string): Promise<LoanForPdf[]> {
   const { data, error } = await supabase
     .from("paid_loans")
-    .select("loan_id, original_amount, interest_rate, loan_date, due_date, paid_date, clients (name)")
+    .select("loan_id, client_id, original_amount, interest_rate, loan_date, due_date, paid_date")
     .gte("paid_date", dateFrom)
     .lte("paid_date", dateTo + "T23:59:59")
     .order("paid_date", { ascending: true });
 
   if (error) throw error;
 
-  return (data || []).map((p: Record<string, unknown>) => {
-    const cl = ((p as { clients?: { name?: string } }).clients) || {};
+  const list = data || [];
+  const clientIds = [...new Set(list.map((p: Record<string, unknown>) => String(p.client_id || "")).filter(Boolean))];
+  const nameById: Record<string, string> = {};
+  if (clientIds.length > 0) {
+    const { data: clientsData } = await supabase.from("clients").select("id, name").in("id", clientIds);
+    for (const c of clientsData || []) {
+      const row = c as Record<string, unknown>;
+      nameById[String(row.id)] = String(row.name || "—");
+    }
+  }
+
+  return list.map((p: Record<string, unknown>) => {
+    const cid = String(p.client_id || "");
     return {
       id: String(p.loan_id),
-      client_name: cl.name || "—",
+      client_name: nameById[cid] || "—",
       amount: parseFloat(String(p.original_amount || 0)),
       interest_rate: parseFloat(String(p.interest_rate || 0)),
       loan_date: (p.loan_date as string)?.split("T")[0] ?? "",

@@ -1,7 +1,7 @@
 import { memo } from "react";
 import {
   LayoutDashboard, Users, Landmark, CalendarCheck, CalendarDays, CreditCard,
-  AlertTriangle, Wallet, Receipt, TrendingUp, History, IdCard,
+  AlertTriangle, Wallet, Receipt, TrendingUp, History, IdCard, Sparkles,
   BarChart3, FileText, Settings, UserCog, ChevronLeft, LogOut
 } from "lucide-react";
 import { NavLink } from "@/components/NavLink";
@@ -22,6 +22,7 @@ const mainItems = [
   { title: "Pagamentos", url: "/pagamentos", icon: CreditCard },
   { title: "Multas", url: "/multas", icon: AlertTriangle },
   { title: "Histórico", url: "/historico", icon: History },
+  { title: "Remarketing", url: "/remarketing", icon: Sparkles },
 ];
 
 const financialItems = [

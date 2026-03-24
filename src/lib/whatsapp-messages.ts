@@ -132,3 +132,21 @@ Cliente: ${loan.client_name}
 * Titular: ${pix.titular}
 * Chave: ${pix.chave}`;
 }
+
+/** Remarketing: cliente quitado — oferta taxa única por tempo limitado */
+export function buildRemarketingRewardMessage(clientName: string, validHours = 12): string {
+  const first = clientName.trim().split(/\s+/)[0] || "Cliente";
+  const company = (PDF_BRAND.companyName || "NOVIXCRED").toUpperCase();
+
+  return `🌟 *${company} — PARABÉNS, ${first.toUpperCase()}!*
+
+Você honrou *cada pagamento* do seu compromisso com a gente. Esse é o tipo de parceria que a gente *RESPEITA*.
+
+🎁 *PRESENTE EXCLUSIVO* — válido por *${validHours}h*
+Taxa *única* de contratação de empréstimo. Condição especial pra quem *já provou* que cumpre o combinado.
+
+⏳ *O relógio tá contando.* Quem demora, perde.
+Responda *agora* ou fale com a equipe *${company}* e *garanta* sua condição antes que expire.
+
+*Obrigado por confiar na ${company}.* 🙏`;
+}
