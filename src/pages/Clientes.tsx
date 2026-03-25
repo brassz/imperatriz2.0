@@ -2,9 +2,9 @@ import { Users, Plus, Search, MoreHorizontal } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { motion } from "framer-motion";
-import { useQuery } from "@tanstack/react-query";
+import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { fetchClients } from "@/api/clients";
-import { useState, useMemo } from "react";
+import { useState, useEffect } from "react";
 import { Pagination } from "@/components/Pagination";
 import { PAGE_SIZE } from "@/lib/constants";
 
@@ -13,24 +13,18 @@ export default function Clientes() {
   const [page, setPage] = useState(1);
 
   const { data, isLoading, error } = useQuery({
-    queryKey: ["clients", page],
-    queryFn: () => fetchClients(page),
+    queryKey: ["clients", page, search],
+    queryFn: () => fetchClients(page, search),
+    placeholderData: keepPreviousData,
   });
   const clients = data?.data ?? [];
   const totalClients = data?.total ?? 0;
 
-  const filtered = useMemo(() => {
-    if (!search.trim()) return clients;
-    const s = search.toLowerCase();
-    return clients.filter(
-      (c: Record<string, unknown>) =>
-        String(c.name).toLowerCase().includes(s) ||
-        String(c.cpf || "").includes(s) ||
-        String(c.email || "").toLowerCase().includes(s)
-    );
-  }, [clients, search]);
+  useEffect(() => {
+    setPage(1);
+  }, [search]);
 
-  if (isLoading) {
+  if (isLoading && data === undefined) {
     return (
       <div className="space-y-6">
         <div>
@@ -77,7 +71,9 @@ export default function Clientes() {
               onChange={(e) => setSearch(e.target.value)}
             />
           </div>
-          <span className="text-xs text-muted-foreground">{search.trim() ? filtered.length : totalClients} clientes</span>
+          <span className="text-xs text-muted-foreground">
+            {totalClients} {search.trim() ? "encontrado(s)" : "cliente(s)"}
+          </span>
         </div>
 
         <div className="overflow-x-auto">
@@ -94,14 +90,14 @@ export default function Clientes() {
               </tr>
             </thead>
             <tbody>
-              {filtered.length === 0 ? (
+              {clients.length === 0 ? (
                 <tr>
                   <td colSpan={7} className="p-8 text-center text-muted-foreground">
                     Nenhum cliente encontrado
                   </td>
                 </tr>
               ) : (
-                filtered.map((client: Record<string, unknown>, i: number) => (
+                clients.map((client: Record<string, unknown>, i: number) => (
                   <motion.tr
                     key={String(client.id)}
                     initial={{ opacity: 0 }}
@@ -145,9 +141,7 @@ export default function Clientes() {
             </tbody>
           </table>
         </div>
-        {!search.trim() && (
-          <Pagination page={page} total={totalClients} pageSize={PAGE_SIZE} onPageChange={setPage} />
-        )}
+        <Pagination page={page} total={totalClients} pageSize={PAGE_SIZE} onPageChange={setPage} />
       </div>
     </div>
   );

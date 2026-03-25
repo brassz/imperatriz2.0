@@ -89,22 +89,43 @@ Cliente: ${loan.client_name}
 * Chave: ${pix.chave}`;
 }
 
-/** Mensagem de COMPROVANTE após registro de pagamento */
+export type ComprovanteScoreInfo = {
+  score: number;
+  label: string;
+};
+
+/**
+ * Colinha / mensagem WhatsApp do comprovante de pagamento (modelo oficial).
+ * Com score: inclui linha "Classificação" e textos sobre histórico e crédito.
+ */
 export function buildComprovanteMessage(
   clientName: string,
   valorPago: number,
-  proximoVencimento: string
+  proximoVencimento: string,
+  scoreInfo?: ComprovanteScoreInfo | null
 ): string {
-  const title = getCompanyTitle();
+  const title = getCompanyTitle().trim();
+  const brandUpper = title.toUpperCase();
   const valor = formatCurrency(valorPago);
   const venc = formatDateBr(proximoVencimento);
 
-  return `✅ COMPROVANTE – ${title}
+  let msg = `✅ Comprovante de Pagamento | ${brandUpper}
 
 Cliente: ${clientName}
-Pagamento recebido: ${valor}
+Valor recebido: ${valor}
 
 📅 Próximo vencimento: ${venc}`;
+
+  if (scoreInfo != null) {
+    msg += `\n\n📊 Score ${brandUpper}: ${scoreInfo.score}/100 (Classificação: ${scoreInfo.label})`;
+  }
+
+  msg += `\n\nSeu pagamento foi processado com sucesso e registrado em nosso sistema.
+Manter os pagamentos em dia contribui diretamente para a evolução do seu score, fortalecendo seu histórico financeiro e ampliando suas chances de aprovação em futuras operações de crédito com a ${brandUpper}.
+
+📎 Comprovante oficial disponível em PDF (documento autenticado com marca d'água)`;
+
+  return msg;
 }
 
 /** Mensagem de LEMBRETE (1 dia antes - vence amanhã) */

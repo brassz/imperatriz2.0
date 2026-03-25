@@ -40,7 +40,13 @@ import {
   TooltipProvider,
 } from "@/components/ui/tooltip";
 import { motion } from "framer-motion";
-import { useMutation, useQuery, useQueries, useQueryClient } from "@tanstack/react-query";
+import {
+  keepPreviousData,
+  useMutation,
+  useQuery,
+  useQueries,
+  useQueryClient,
+} from "@tanstack/react-query";
 import {
   fetchLoans,
   createLoan,
@@ -174,6 +180,7 @@ export default function Emprestimos() {
   const [viewDetailsOpen, setViewDetailsOpen] = useState(false);
   const [comprovanteOpen, setComprovanteOpen] = useState(false);
   const [comprovanteData, setComprovanteData] = useState<{
+    clientId: string;
     clientName: string;
     clientPhone: string;
     valorPago: number;
@@ -227,6 +234,8 @@ export default function Emprestimos() {
     queryKey: ["loans", statusFilter, page, search],
     queryFn: () => fetchLoans(statusFilter, page, search),
     enabled: !isParcelamentos,
+    /** Evita desmontar a página a cada tecla na busca (queryKey muda e isLoading ficava true). */
+    placeholderData: keepPreviousData,
   });
   const loans = data?.data ?? [];
   const totalLoans = data?.total ?? 0;
@@ -274,6 +283,12 @@ export default function Emprestimos() {
     queryKey: ["client-tags", selectedLoan?.client_id],
     queryFn: () => fetchClientTags(String(selectedLoan?.client_id)),
     enabled: !!selectedLoan?.client_id && viewDetailsOpen,
+  });
+
+  const { data: comprovanteScore, isLoading: comprovanteScoreLoading } = useQuery({
+    queryKey: ["client-score", comprovanteData?.clientId],
+    queryFn: () => fetchClientScore(String(comprovanteData!.clientId)),
+    enabled: comprovanteOpen && !!comprovanteData?.clientId,
   });
 
   const [guarantors, setGuarantors] = useState<Array<{ id: string; name: string; phone: string }>>([]);
@@ -642,7 +657,11 @@ export default function Emprestimos() {
         new_due_date: "",
       });
       invalidateLoanRelated(String(selectedLoan.id));
+      if (selectedLoan.client_id) {
+        void queryClient.invalidateQueries({ queryKey: ["client-score", String(selectedLoan.client_id)] });
+      }
       setComprovanteData({
+        clientId: String(selectedLoan.client_id || ""),
         clientName: String(selectedLoan.client_name),
         clientPhone: String(selectedLoan.client_phone || "").trim(),
         valorPago: valorTotal,
@@ -852,7 +871,8 @@ export default function Emprestimos() {
     }
   };
 
-  if (isLoading) {
+  /** Só tela cheia de loading na carga inicial; com busca, keepPreviousData mantém dados e o input não some. */
+  if (!isParcelamentos && isLoading && data === undefined) {
     return (
       <div className="space-y-6">
         <div>
@@ -1866,14 +1886,20 @@ export default function Emprestimos() {
           </DialogHeader>
           {comprovanteData && (
             <div className="space-y-4 py-2">
+              {comprovanteData.clientId && comprovanteScoreLoading && (
+                <p className="text-xs text-muted-foreground">Atualizando score do cliente…</p>
+              )}
               <div className="rounded-lg border border-border/50 bg-muted/30 p-4 text-sm">
                 <p className="font-medium text-foreground mb-2">Colinha (legenda do PDF + mensagem):</p>
                 <p className="text-muted-foreground whitespace-pre-wrap text-xs">
-                  {`${buildComprovanteMessage(
+                  {buildComprovanteMessage(
                     comprovanteData.clientName,
                     comprovanteData.valorPago,
-                    comprovanteData.proximoVencimento
-                  )}\n\n📎 Comprovante oficial em PDF anexo (marca d'água).`}
+                    comprovanteData.proximoVencimento,
+                    comprovanteScore
+                      ? { score: comprovanteScore.score, label: comprovanteScore.label }
+                      : null,
+                  )}
                 </p>
               </div>
               <DialogFooter>
@@ -1890,11 +1916,25 @@ export default function Emprestimos() {
                     }
                     setComprovanteSending(true);
                     try {
-                      const colinha = `${buildComprovanteMessage(
+                      let scoreForSend = comprovanteScore;
+                      if (comprovanteData.clientId) {
+                        scoreForSend = await queryClient.fetchQuery({
+                          queryKey: ["client-score", comprovanteData.clientId],
+                          queryFn: () => fetchClientScore(comprovanteData.clientId),
+                        });
+                      }
+                      const scoreInfo =
+                        scoreForSend != null
+                          ? { score: scoreForSend.score, label: scoreForSend.label }
+                          : null;
+                      const companyTitle =
+                        [PDF_BRAND.companyName, PDF_BRAND.branch].filter(Boolean).join(" · ").trim() || undefined;
+                      const colinha = buildComprovanteMessage(
                         comprovanteData.clientName,
                         comprovanteData.valorPago,
-                        comprovanteData.proximoVencimento
-                      )}\n\n📎 Comprovante oficial em PDF anexo (marca d'água).`;
+                        comprovanteData.proximoVencimento,
+                        scoreInfo,
+                      );
                       const doc = generateComprovantePagamentoPdf({
                         clientName: comprovanteData.clientName,
                         valorPago: comprovanteData.valorPago,
@@ -1902,6 +1942,9 @@ export default function Emprestimos() {
                         paymentDate: comprovanteData.paymentDate,
                         paymentDescription: comprovanteData.paymentDescription,
                         loanId: comprovanteData.loanId,
+                        score: scoreInfo?.score,
+                        scoreLabel: scoreInfo?.label,
+                        companyTitle,
                       });
                       const fileName = `comprovante-${comprovanteData.loanId.slice(0, 8)}-${comprovanteData.paymentDate}.pdf`;
                       doc.save(fileName);

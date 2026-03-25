@@ -132,6 +132,12 @@ function NovoAgendamentoModal({
     enabled: open,
   });
 
+  const filteredClients = useMemo(() => {
+    const q = clientSearch.trim().toLowerCase();
+    if (!q) return clientsSelect;
+    return clientsSelect.filter((c) => (c.name || "").toLowerCase().includes(q));
+  }, [clientsSelect, clientSearch]);
+
   const { data: modalPreviewLoans = [], isLoading: loadingModalLoans } = useQuery({
     queryKey: ["agendamento-modal-loans-preview"],
     queryFn: () => fetchLoansForAutomation({ requirePhone: false }),
@@ -145,60 +151,53 @@ function NovoAgendamentoModal({
     staleTime: 30_000,
   });
 
-  const eligibleClientIds = useMemo(() => {
-    const set = new Set<string>();
-    if (filtros.includes("vencidos")) {
-      for (const l of modalPreviewLoans) {
-        if (l.type === "cobranca") set.add(l.client_id);
-      }
-    }
-    if (filtros.includes("vencem_hoje")) {
-      for (const l of modalPreviewLoans) {
-        if (l.type === "lembrete_hoje") set.add(l.client_id);
-      }
-    }
-    if (filtros.includes("lembretes")) {
-      for (const l of modalPreviewLoans) {
-        if (l.type === "lembrete_amanha") set.add(l.client_id);
-      }
-    }
-    if (filtros.includes("parcelamentos")) {
-      for (const inst of modalInstallments) {
-        if (nextPendingInstallment(inst)) set.add(String(inst.client_id));
-      }
-    }
-    return set;
-  }, [filtros, modalPreviewLoans, modalInstallments]);
-
-  const eligibleClientIdsKey = useMemo(
-    () => [...eligibleClientIds].sort().join(","),
-    [eligibleClientIds],
+  const modalVencidos = useMemo(
+    () => modalPreviewLoans.filter((l) => l.type === "cobranca"),
+    [modalPreviewLoans],
   );
+  const modalVencemHoje = useMemo(
+    () => modalPreviewLoans.filter((l) => l.type === "lembrete_hoje"),
+    [modalPreviewLoans],
+  );
+  const modalLembretes = useMemo(
+    () => modalPreviewLoans.filter((l) => l.type === "lembrete_amanha"),
+    [modalPreviewLoans],
+  );
+  const modalParcelRows = useMemo(() => {
+    return modalInstallments
+      .map((inst) => {
+        const next = nextPendingInstallment(inst);
+        if (!next) return null;
+        return { inst, next };
+      })
+      .filter(
+        (x): x is {
+          inst: InstallmentRow;
+          next: NonNullable<ReturnType<typeof nextPendingInstallment>>;
+        } => x !== null,
+      );
+  }, [modalInstallments]);
 
-  useEffect(() => {
-    if (filtros.length === 0) {
-      setTargetClientIds([]);
-      return;
-    }
-    if (loadingModalLoans || loadingModalInst) return;
-    setTargetClientIds((prev) => prev.filter((id) => eligibleClientIds.has(id)));
-  }, [
-    filtros.length,
-    eligibleClientIdsKey,
-    loadingModalLoans,
-    loadingModalInst,
-    eligibleClientIds,
-  ]);
-
-  const clientsForPicker = useMemo(() => {
-    if (filtros.length === 0) return [];
-    const q = clientSearch.trim().toLowerCase();
-    return clientsSelect
-      .filter((c) => eligibleClientIds.has(String(c.id)))
-      .filter((c) => !q || (c.name || "").toLowerCase().includes(q));
-  }, [clientsSelect, clientSearch, filtros.length, eligibleClientIds]);
-
-  const loadingEligibleClients = filtros.length > 0 && (loadingModalLoans || loadingModalInst);
+  function renderLoanPreviewRow(item: AutomationLoan) {
+    return (
+      <div
+        key={item.id}
+        className="text-xs border-b border-border/40 pb-2 mb-2 last:border-0 last:pb-0 last:mb-0"
+      >
+        <p className="font-medium text-foreground">{item.loan.client_name}</p>
+        <p className="text-muted-foreground">
+          <span className="text-muted-foreground/80">{labelTipoAutomacao(item.type)}</span>
+          {" · "}
+          Venc. {formatPreviewDate(item.loan.due_date)} · {formatPreviewCurrency(item.loan.amount)}
+        </p>
+        {!item.loan.client_phone?.trim() ? (
+          <p className="text-amber-600 dark:text-amber-500 mt-0.5">Sem telefone</p>
+        ) : (
+          <p className="text-muted-foreground mt-0.5">{item.loan.client_phone}</p>
+        )}
+      </div>
+    );
+  }
 
   const toggleDia = (d: DiaSemana) => {
     if (d === "todos") {
@@ -357,43 +356,122 @@ function NovoAgendamentoModal({
               <p className="text-xs text-destructive mt-2">{erroFiltro}</p>
             )}
           </div>
+          {filtros.length > 0 && (
+            <div className="rounded-md border border-border/60 bg-muted/20 p-3 space-y-3">
+              <p className="text-[11px] text-muted-foreground leading-snug">
+                Prévia conforme os filtros marcados (data de hoje em America/Sao_Paulo, igual ao envio automático).
+                Lembretes = contratos com vencimento amanhã.
+              </p>
+              {loadingModalLoans || loadingModalInst ? (
+                <p className="text-xs text-muted-foreground">Carregando prévia...</p>
+              ) : (
+                <div className="space-y-3">
+                  {filtros.includes("vencidos") && (
+                    <div>
+                      <p className="text-xs font-semibold">Vencidos ({modalVencidos.length})</p>
+                      <ScrollArea className="h-[min(120px,28vh)] mt-1 rounded border bg-background/50 p-2">
+                        <div className="pr-2">
+                          {modalVencidos.length === 0 ? (
+                            <p className="text-xs text-muted-foreground">Nenhum nesta categoria agora.</p>
+                          ) : (
+                            modalVencidos.map(renderLoanPreviewRow)
+                          )}
+                        </div>
+                      </ScrollArea>
+                    </div>
+                  )}
+                  {filtros.includes("vencem_hoje") && (
+                    <div>
+                      <p className="text-xs font-semibold">Vencem hoje ({modalVencemHoje.length})</p>
+                      <ScrollArea className="h-[min(120px,28vh)] mt-1 rounded border bg-background/50 p-2">
+                        <div className="pr-2">
+                          {modalVencemHoje.length === 0 ? (
+                            <p className="text-xs text-muted-foreground">Nenhum nesta categoria agora.</p>
+                          ) : (
+                            modalVencemHoje.map(renderLoanPreviewRow)
+                          )}
+                        </div>
+                      </ScrollArea>
+                    </div>
+                  )}
+                  {filtros.includes("lembretes") && (
+                    <div>
+                      <p className="text-xs font-semibold">Lembretes — vencem amanhã ({modalLembretes.length})</p>
+                      <ScrollArea className="h-[min(120px,28vh)] mt-1 rounded border bg-background/50 p-2">
+                        <div className="pr-2">
+                          {modalLembretes.length === 0 ? (
+                            <p className="text-xs text-muted-foreground">Nenhum nesta categoria agora.</p>
+                          ) : (
+                            modalLembretes.map(renderLoanPreviewRow)
+                          )}
+                        </div>
+                      </ScrollArea>
+                    </div>
+                  )}
+                  {filtros.includes("parcelamentos") && (
+                    <div>
+                      <p className="text-xs font-semibold">
+                        Parcelamentos — próxima parcela pendente ({modalParcelRows.length})
+                      </p>
+                      <ScrollArea className="h-[min(120px,28vh)] mt-1 rounded border bg-background/50 p-2">
+                        <div className="pr-2">
+                          {modalParcelRows.length === 0 ? (
+                            <p className="text-xs text-muted-foreground">Nenhum parcelamento com parcela pendente.</p>
+                          ) : (
+                            modalParcelRows.map(({ inst, next }) => (
+                              <div
+                                key={inst.id}
+                                className="text-xs border-b border-border/40 pb-2 mb-2 last:border-0 last:pb-0 last:mb-0"
+                              >
+                                <p className="font-medium text-foreground">{inst.client_name}</p>
+                                <p className="text-muted-foreground">
+                                  {formatPreviewCurrency(next.amount)} · venc. {formatPreviewDate(next.due_date)}
+                                </p>
+                                {!inst.client_phone?.trim() ? (
+                                  <p className="text-amber-600 dark:text-amber-500 mt-0.5">Sem telefone</p>
+                                ) : (
+                                  <p className="text-muted-foreground mt-0.5">{inst.client_phone}</p>
+                                )}
+                              </div>
+                            ))
+                          )}
+                        </div>
+                      </ScrollArea>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
           <div>
             <Label className="text-xs">Clientes (opcional)</Label>
+            <p className="text-[11px] text-muted-foreground mt-0.5 mb-2">
+              Sem seleção = todos os elegíveis pelos filtros no dia do envio. Marque para limitar a estes clientes (empréstimos e parcelamentos).
+            </p>
             <Input
               placeholder="Buscar cliente..."
               value={clientSearch}
               onChange={(e) => setClientSearch(e.target.value)}
-              disabled={filtros.length === 0}
               className="h-8 text-xs mb-2"
             />
             <ScrollArea className="h-[140px] rounded-md border border-border/60 p-2">
               <div className="space-y-1 pr-3">
-                {filtros.length === 0 ? (
-                  <p className="text-xs text-muted-foreground py-2">
-                    Marque Vencidos, Vencem hoje, Lembretes ou Parcelamentos para listar quem pode entrar no envio.
-                  </p>
-                ) : loadingEligibleClients ? (
-                  <p className="text-xs text-muted-foreground py-2">Carregando lista...</p>
-                ) : clientsForPicker.length === 0 ? (
-                  <p className="text-xs text-muted-foreground py-2">Nenhum cliente nesta combinação de filtros agora.</p>
-                ) : (
-                  clientsForPicker.map((c) => {
-                    const id = String(c.id);
-                    return (
-                      <label key={id} className="flex items-center gap-2 text-xs cursor-pointer py-0.5">
-                        <Checkbox
-                          checked={targetClientIds.includes(id)}
-                          onCheckedChange={() =>
-                            setTargetClientIds((prev) =>
-                              prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id],
-                            )
-                          }
-                        />
-                        <span className="truncate">{c.name}</span>
-                      </label>
-                    );
-                  })
-                )}
+                {filteredClients.map((c) => {
+                  const id = String(c.id);
+                  return (
+                    <label key={id} className="flex items-center gap-2 text-xs cursor-pointer py-0.5">
+                      <Checkbox
+                        checked={targetClientIds.includes(id)}
+                        onCheckedChange={() =>
+                          setTargetClientIds((prev) =>
+                            prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id],
+                          )
+                        }
+                      />
+                      <span className="truncate">{c.name}</span>
+                    </label>
+                  );
+                })}
               </div>
             </ScrollArea>
             <div className="flex flex-wrap gap-2 mt-2">
@@ -402,8 +480,7 @@ function NovoAgendamentoModal({
                 variant="outline"
                 size="sm"
                 className="h-7 text-xs"
-                disabled={filtros.length === 0 || loadingEligibleClients || clientsForPicker.length === 0}
-                onClick={() => setTargetClientIds(clientsForPicker.map((c) => String(c.id)))}
+                onClick={() => setTargetClientIds(filteredClients.map((c) => String(c.id)))}
               >
                 Marcar visíveis
               </Button>

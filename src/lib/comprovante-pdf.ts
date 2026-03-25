@@ -28,6 +28,10 @@ export type ComprovantePdfParams = {
   paymentDate: string;
   paymentDescription?: string;
   loanId?: string;
+  /** Score após o pagamento (opcional) */
+  score?: number;
+  scoreLabel?: string;
+  companyTitle?: string;
 };
 
 /**
@@ -72,7 +76,33 @@ export function generateComprovantePagamentoPdf(params: ComprovantePdfParams): j
     y += 7;
   }
   doc.text(`Próximo vencimento: ${formatDateBR(params.proximoVencimento)}`, m, y);
-  y += 12;
+  y += 10;
+
+  if (params.score != null && params.scoreLabel) {
+    const brand = (params.companyTitle || `${PDF_BRAND.companyName}`.trim() || "Empresa").slice(0, 80);
+    doc.setFontSize(10);
+    doc.setFont("helvetica", "bold");
+    doc.setTextColor(PDF_BRAND.colors.text.r, PDF_BRAND.colors.text.g, PDF_BRAND.colors.text.b);
+    doc.text(`Score com ${brand}: ${params.score}/100 (${params.scoreLabel})`, m, y);
+    y += 6;
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(8);
+    doc.setTextColor(
+      PDF_BRAND.colors.textMuted.r,
+      PDF_BRAND.colors.textMuted.g,
+      PDF_BRAND.colors.textMuted.b,
+    );
+    doc.text(
+      "Pagamentos em dia e na data correta reforçam positivamente o score e auxiliam na aprovação de novos empréstimos.",
+      m,
+      y,
+      { maxWidth: 180 },
+    );
+    y += 14;
+    doc.setTextColor(PDF_BRAND.colors.text.r, PDF_BRAND.colors.text.g, PDF_BRAND.colors.text.b);
+  } else {
+    y += 2;
+  }
 
   doc.setFontSize(9);
   doc.setTextColor(

@@ -2,12 +2,25 @@ import { supabase } from "@/lib/supabase";
 import { PAGE_SIZE } from "@/lib/constants";
 import { calculateClientScore } from "@/api/client-score";
 
-export async function fetchClients(page = 1) {
-  const { data, error, count } = await supabase
+/** `search` filtra no servidor (nome, CPF ou e-mail), com paginação sobre o resultado. */
+export async function fetchClients(page = 1, search = "") {
+  const from = (page - 1) * PAGE_SIZE;
+  const to = from + PAGE_SIZE - 1;
+
+  let query = supabase
     .from("clients")
     .select("id, name, cpf, phone, email, created_at", { count: "exact" })
-    .order("created_at", { ascending: false })
-    .range((page - 1) * PAGE_SIZE, page * PAGE_SIZE - 1);
+    .order("created_at", { ascending: false });
+
+  const q = search.trim();
+  if (q) {
+    const esc = q.replace(/\\/g, "\\\\").replace(/%/g, "\\%").replace(/_/g, "\\_");
+    const pattern = `%${esc}%`;
+    const quoted = `"${pattern.replace(/"/g, '""')}"`;
+    query = query.or(`name.ilike.${quoted},cpf.ilike.${quoted},email.ilike.${quoted}`);
+  }
+
+  const { data, error, count } = await query.range(from, to);
 
   if (error) throw error;
 
