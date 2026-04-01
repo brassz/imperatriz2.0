@@ -38,7 +38,9 @@ function computeRemaining(
 async function attachRemainingAmounts(
   items: Array<Record<string, unknown>>
 ): Promise<void> {
-  const nonPaid = items.filter((r) => r.status !== "paid");
+  const nonPaid = items.filter(
+    (r) => r.status !== "paid" && r.status !== "cancelled" && r.status !== "installments"
+  );
   if (nonPaid.length === 0) return;
   const loanIds = nonPaid.map((r) => String(r.id));
   const { data: paymentsData } = await supabase
@@ -67,6 +69,9 @@ async function attachRemainingAmounts(
   for (const item of items) {
     if (item.status === "paid" || item.status === "cancelled") {
       item.remaining_amount = 0;
+    }
+    if (item.status === "installments") {
+      (item as Record<string, unknown>).remaining_amount = undefined;
     }
   }
 }
@@ -137,6 +142,61 @@ async function hydrateClientsForLoans(rows: Array<Record<string, unknown>>): Pro
   });
 }
 
+/**
+ * Nomes para linhas de paid_loans: usa `paid_loans.client_id` quando existir (registros antigos ou RLS em `loans`),
+ * senão faz fallback pelo empréstimo em `loans`.
+ */
+export async function resolvePaidLoanClientNames(paidRows: Array<Record<string, unknown>>): Promise<{
+  clientNameByLoanId: Record<string, string>;
+  clientIdByLoanId: Record<string, string>;
+}> {
+  const clientIdByLoanId: Record<string, string> = {};
+  const loanIdsNeedingLookup: string[] = [];
+
+  for (const p of paidRows) {
+    const lid = String(p.loan_id ?? "");
+    if (!lid) continue;
+    const fromRow = p.client_id != null && String(p.client_id).trim() !== "" ? String(p.client_id) : "";
+    if (fromRow) {
+      clientIdByLoanId[lid] = fromRow;
+    } else {
+      loanIdsNeedingLookup.push(lid);
+    }
+  }
+
+  const uniqueNeed = [...new Set(loanIdsNeedingLookup)];
+  if (uniqueNeed.length > 0) {
+    const { data: loansData } = await supabase.from("loans").select("id, client_id").in("id", uniqueNeed);
+    for (const l of loansData || []) {
+      const row = l as Record<string, unknown>;
+      const lid = String(row.id);
+      const cid = row.client_id != null && String(row.client_id).trim() !== "" ? String(row.client_id) : "";
+      if (cid && !clientIdByLoanId[lid]) {
+        clientIdByLoanId[lid] = cid;
+      }
+    }
+  }
+
+  const uniqueClientIds = [...new Set(Object.values(clientIdByLoanId).filter(Boolean))];
+  const clientByName: Record<string, string> = {};
+  if (uniqueClientIds.length > 0) {
+    const { data: clientsData } = await supabase.from("clients").select("id, name").in("id", uniqueClientIds);
+    for (const c of clientsData || []) {
+      const row = c as Record<string, unknown>;
+      clientByName[String(row.id)] = String(row.name ?? "—");
+    }
+  }
+
+  const clientNameByLoanId: Record<string, string> = {};
+  for (const p of paidRows) {
+    const lid = String(p.loan_id ?? "");
+    const cid = clientIdByLoanId[lid];
+    clientNameByLoanId[lid] = cid ? (clientByName[cid] ?? "—") : "—";
+  }
+
+  return { clientNameByLoanId, clientIdByLoanId };
+}
+
 export async function fetchLoans(statusFilter?: string, page = 1) {
   const client = (c: unknown) => (c as { name?: string; cpf?: string; phone?: string; email?: string }) || {};
 
@@ -170,40 +230,22 @@ export async function fetchLoans(statusFilter?: string, page = 1) {
   if (statusFilter === "paid") {
     const { data: paidData, error: paidErr } = await supabase
       .from("paid_loans")
-      .select("loan_id, original_amount, interest_rate, loan_date, due_date, paid_date")
+      .select("loan_id, client_id, original_amount, interest_rate, loan_date, due_date, paid_date")
       .order("paid_date", { ascending: false })
       .limit(10000);
 
     if (paidErr) throw paidErr;
 
-    const loanIds = [...new Set((paidData || []).map((p: Record<string, unknown>) => p.loan_id).filter(Boolean))];
-    const clientByName: Record<string, string> = {};
-    const loanToClient: Record<string, string> = {};
-    if (loanIds.length > 0) {
-      const { data: loansData } = await supabase
-        .from("loans")
-        .select("id, client_id")
-        .in("id", loanIds);
-      for (const l of loansData || []) {
-        const row = l as Record<string, unknown>;
-        loanToClient[String(row.id)] = String(row.client_id ?? "");
-      }
-      const cids = [...new Set(Object.values(loanToClient).filter(Boolean))];
-      if (cids.length > 0) {
-        const { data: clientsData } = await supabase.from("clients").select("id, name").in("id", cids);
-        for (const c of clientsData || []) {
-          const row = c as Record<string, unknown>;
-          clientByName[String(row.id)] = String(row.name ?? "—");
-        }
-      }
-    }
+    const paidList = (paidData || []) as Array<Record<string, unknown>>;
+    const { clientNameByLoanId, clientIdByLoanId } = await resolvePaidLoanClientNames(paidList);
 
-    const paidItems = (paidData || []).map((p: Record<string, unknown>) => {
-      const cid = loanToClient[String(p.loan_id ?? "")];
-      const clientName = cid ? (clientByName[cid] ?? "—") : "—";
+    const paidItems = paidList.map((p: Record<string, unknown>) => {
+      const lid = String(p.loan_id ?? "");
+      const cid = clientIdByLoanId[lid] ?? "";
+      const clientName = clientNameByLoanId[lid] ?? "—";
       return {
         id: p.loan_id,
-        client_id: cid ?? "",
+        client_id: cid,
         client_name: clientName,
         client_phone: "",
         client_cpf: "",
@@ -232,6 +274,7 @@ export async function fetchLoans(statusFilter?: string, page = 1) {
         let q = supabase
           .from("loans")
           .select("id, client_id, amount, interest_rate, loan_date, due_date, status, created_at, clients (name, cpf, email, phone)")
+          .neq("status", "installments")
           .order("created_at", { ascending: false });
         if (searchClientIds) q = q.in("client_id", searchClientIds);
         const { data: chunk, error } = await q.range(offsetLoans, offsetLoans + CHUNK - 1);
@@ -244,7 +287,7 @@ export async function fetchLoans(statusFilter?: string, page = 1) {
       if (hasMorePaid) {
         let q = supabase
           .from("paid_loans")
-          .select("loan_id, original_amount, interest_rate, loan_date, due_date, paid_date")
+          .select("loan_id, client_id, original_amount, interest_rate, loan_date, due_date, paid_date")
           .order("paid_date", { ascending: false });
         // paid_loans tem client_id (usado em markLoanAsPaid); filtra para busca por cliente
         if (searchClientIds) q = q.in("client_id", searchClientIds);
@@ -257,27 +300,8 @@ export async function fetchLoans(statusFilter?: string, page = 1) {
       }
     }
 
-    const paidLoanIds = [...new Set(allPaid.map((p: Record<string, unknown>) => p.loan_id).filter(Boolean))];
-    const loanToClient: Record<string, string> = {};
-    const clientByName: Record<string, string> = {};
-    if (paidLoanIds.length > 0) {
-      const { data: loansData } = await supabase
-        .from("loans")
-        .select("id, client_id")
-        .in("id", paidLoanIds);
-      for (const l of loansData || []) {
-        const row = l as Record<string, unknown>;
-        loanToClient[String(row.id)] = String(row.client_id ?? "");
-      }
-      const cids = [...new Set(Object.values(loanToClient).filter(Boolean))];
-      if (cids.length > 0) {
-        const { data: clientsData } = await supabase.from("clients").select("id, name").in("id", cids);
-        for (const c of clientsData || []) {
-          const row = c as Record<string, unknown>;
-          clientByName[String(row.id)] = String(row.name ?? "—");
-        }
-      }
-    }
+    const paidRows = allPaid as Array<Record<string, unknown>>;
+    const { clientNameByLoanId, clientIdByLoanId } = await resolvePaidLoanClientNames(paidRows);
 
     const byId = new Map<string, Record<string, unknown>>();
     const hydratedAllLoans = await hydrateClientsForLoans(allLoans as Array<Record<string, unknown>>);
@@ -288,11 +312,11 @@ export async function fetchLoans(statusFilter?: string, page = 1) {
       const pid = String((p as Record<string, unknown>).loan_id);
       if (byId.has(pid)) continue;
       const rec = p as Record<string, unknown>;
-      const cid = loanToClient[pid];
-      const clientName = cid ? (clientByName[cid] ?? "—") : "—";
+      const cid = clientIdByLoanId[pid] ?? "";
+      const clientName = clientNameByLoanId[pid] ?? "—";
       byId.set(pid, {
         id: rec.loan_id,
-        client_id: cid ?? "",
+        client_id: cid,
         client_name: clientName,
         client_phone: "",
         client_cpf: "",
@@ -372,6 +396,30 @@ export async function fetchLoans(statusFilter?: string, page = 1) {
 
   await attachRemainingAmounts(items);
   return { data: items, total };
+}
+
+/** Empréstimos do cliente elegíveis para vincular a um novo parcelamento (sem quitados/cancelados e sem já vinculados). */
+export async function fetchClientLoansForParcelamentoLink(clientId: string) {
+  const { data: loans, error } = await supabase
+    .from("loans")
+    .select("id, amount, interest_rate, due_date, status, created_at")
+    .eq("client_id", clientId)
+    .in("status", ["active", "overdue", "partial_paid"])
+    .order("created_at", { ascending: false });
+
+  if (error) throw error;
+  const list = (loans || []) as Array<{ id: string }>;
+  if (list.length === 0) return [];
+
+  const ids = list.map((l) => String(l.id));
+  const { data: linkedRows } = await supabase
+    .from("installments")
+    .select("loan_id")
+    .in("loan_id", ids)
+    .eq("status", "active");
+
+  const linked = new Set((linkedRows || []).map((r) => String((r as { loan_id: string }).loan_id)));
+  return list.filter((l) => !linked.has(String(l.id)));
 }
 
 export async function fetchActiveLoansForSelect() {
@@ -563,22 +611,14 @@ export async function fetchPaidLoansByDateRange(dateFrom: string, dateTo: string
 
   if (error) throw error;
 
-  const list = data || [];
-  const clientIds = [...new Set(list.map((p: Record<string, unknown>) => String(p.client_id || "")).filter(Boolean))];
-  const nameById: Record<string, string> = {};
-  if (clientIds.length > 0) {
-    const { data: clientsData } = await supabase.from("clients").select("id, name").in("id", clientIds);
-    for (const c of clientsData || []) {
-      const row = c as Record<string, unknown>;
-      nameById[String(row.id)] = String(row.name || "—");
-    }
-  }
+  const list = (data || []) as Array<Record<string, unknown>>;
+  const { clientNameByLoanId } = await resolvePaidLoanClientNames(list);
 
   return list.map((p: Record<string, unknown>) => {
-    const cid = String(p.client_id || "");
+    const lid = String(p.loan_id ?? "");
     return {
-      id: String(p.loan_id),
-      client_name: nameById[cid] || "—",
+      id: lid,
+      client_name: clientNameByLoanId[lid] ?? "—",
       amount: parseFloat(String(p.original_amount || 0)),
       interest_rate: parseFloat(String(p.interest_rate || 0)),
       loan_date: (p.loan_date as string)?.split("T")[0] ?? "",
@@ -615,7 +655,10 @@ export async function fetchOverdueLoans(): Promise<LoanForPdf[]> {
 
 export async function fetchLoansStats() {
   const [activeRes, paidRes, overdueRes, cancelledRes] = await Promise.all([
-    supabase.from("loans").select("id", { count: "exact", head: true }).in("status", ["active", "partial_paid", "overdue"]),
+    supabase
+      .from("loans")
+      .select("id", { count: "exact", head: true })
+      .in("status", ["active", "partial_paid", "overdue"]),
     supabase.from("loans").select("id", { count: "exact", head: true }).eq("status", "paid"),
     supabase.from("loans").select("id", { count: "exact", head: true }).eq("status", "overdue"),
     supabase.from("loans").select("id", { count: "exact", head: true }).eq("status", "cancelled"),

@@ -28,6 +28,7 @@ const statusLabels: Record<string, string> = {
   active: "Ativo",
   overdue: "Vencido",
   partial_paid: "Pago parcial",
+  installments: "Parcelamento",
   paid: "Quitado",
   cancelled: "Cancelado",
   due_today: "Vence hoje",

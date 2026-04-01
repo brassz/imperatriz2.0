@@ -70,6 +70,7 @@ import { toast } from "sonner";
 import { jsPDF } from "jspdf";
 import { addPdfHeader, addPdfFooter, getPdfMargin, PDF_BRAND } from "@/lib/pdf-utils";
 import { comprovantePdfToBase64, generateComprovantePagamentoPdf } from "@/lib/comprovante-pdf";
+import { generateContratoMutuoPdf } from "@/lib/contrato-mutuo-pdf";
 import { Pagination } from "@/components/Pagination";
 import { PAGE_SIZE } from "@/lib/constants";
 import { useAuth } from "@/contexts/AuthContext";
@@ -450,7 +451,7 @@ export default function Emprestimos() {
     }
     setIsSubmitting(true);
     try {
-      await createLoan({
+      const inserted = await createLoan({
         client_id: newLoanForm.client_id,
         amount: amt,
         interest_rate: rate,
@@ -458,6 +459,45 @@ export default function Emprestimos() {
         due_date: newLoanForm.due_date,
       });
       toast.success("Empréstimo cadastrado");
+
+      try {
+        const full = await fetchLoanById(String(inserted?.id));
+        const guarantorsList = await fetchGuarantors(String(newLoanForm.client_id));
+        const avalista = guarantorsList?.[0] as { name?: unknown; cpf?: unknown; rg?: unknown; address?: unknown } | undefined;
+
+        const doc = generateContratoMutuoPdf({
+          mutuario: {
+            name: String((full as { client_name?: unknown }).client_name || "—"),
+            cpf: String((full as { client_cpf?: unknown }).client_cpf || ""),
+            rg: String((full as { client_rg?: unknown }).client_rg || ""),
+            address: String((full as { client_address?: unknown }).client_address || ""),
+          },
+          avalista: avalista?.name
+            ? {
+                name: String(avalista.name),
+                cpf: String(avalista.cpf || ""),
+                rg: String(avalista.rg || ""),
+                address: String(avalista.address || ""),
+              }
+            : null,
+          valorEmprestado: amt,
+          vencimento: String(newLoanForm.due_date),
+          jurosAoMesPercent: rate,
+          multaPercent: 10,
+          cidadeUf: "Franca",
+          dataAssinatura: String(newLoanForm.loan_date),
+        });
+
+        const clientName = String((full as { client_name?: unknown }).client_name || "cliente")
+          .replace(/[\\/:*?\"<>|]+/g, " ")
+          .replace(/\s+/g, " ")
+          .trim();
+        const fileName = `Contrato_${clientName}_${String(newLoanForm.loan_date)}.pdf`;
+        doc.save(fileName);
+      } catch {
+        // se falhar o contrato, não bloquear o cadastro
+      }
+
       setNewLoanOpen(false);
       invalidateLoanRelated();
     } catch (err) {
@@ -801,26 +841,32 @@ export default function Emprestimos() {
   const handleContract = async (loan: LoanRow) => {
     try {
       const full = loanFull || (await fetchLoanById(String(loan.id)));
-      const doc = new jsPDF();
-      const m = getPdfMargin();
-      let y = addPdfHeader(doc, "Contrato de Mútuo", undefined);
-      y += 8;
-      doc.setFontSize(14);
-      doc.setFont("helvetica", "bold");
-      doc.text("CONTRATO DE MÚTUO", 105, y, { align: "center" });
-      y += 12;
-      doc.setFontSize(11);
-      doc.setFont("helvetica", "normal");
-      const clientName = (full as { client_name?: string }).client_name || String(loan.client_name);
-      const clientCpf = (full as { client_cpf?: string }).client_cpf || "";
-      const addr = (full as { client_address?: string }).client_address || "Endereco nao informado";
-      doc.text(`MUTUARIO: ${clientName}, CPF ${clientCpf}, residente em ${addr}.`, m, y, { maxWidth: 170 });
-      y += 15;
-      const amt = parseFloat(String(loan.amount || 0));
-      doc.text(`Objeto: valor de R$ ${amt.toFixed(2)} com vencimento em ${formatDate(String(loan.due_date))}.`, m, y, { maxWidth: 170 });
-      y += 10;
-      doc.text(`Foro: ${PDF_BRAND.foro}.`, m, y);
-      addPdfFooter(doc, 1);
+      const guarantorsList = loan.client_id ? await fetchGuarantors(String(loan.client_id)) : [];
+      const avalista = guarantorsList?.[0] as { name?: unknown; cpf?: unknown; rg?: unknown; address?: unknown } | undefined;
+
+      const doc = generateContratoMutuoPdf({
+        mutuario: {
+          name: String((full as { client_name?: unknown }).client_name || loan.client_name || "—"),
+          cpf: String((full as { client_cpf?: unknown }).client_cpf || ""),
+          rg: String((full as { client_rg?: unknown }).client_rg || ""),
+          address: String((full as { client_address?: unknown }).client_address || ""),
+        },
+        avalista: avalista?.name
+          ? {
+              name: String(avalista.name),
+              cpf: String(avalista.cpf || ""),
+              rg: String(avalista.rg || ""),
+              address: String(avalista.address || ""),
+            }
+          : null,
+        valorEmprestado: parseFloat(String(loan.amount || 0)),
+        vencimento: String(loan.due_date || ""),
+        jurosAoMesPercent: parseFloat(String(loan.interest_rate || 0)) || 0,
+        multaPercent: 10,
+        cidadeUf: "Franca",
+        dataAssinatura: String(loan.loan_date || ""),
+      });
+
       doc.save(`contrato-emprestimo-${loan.id}.pdf`);
       toast.success("Contrato gerado");
     } catch (err) {
@@ -1468,7 +1514,18 @@ export default function Emprestimos() {
                     return (
                       <>
                         <div><span className="text-muted-foreground">Valor total pago:</span> <span className="font-semibold text-green-600">{formatCurrency(totalPago)}</span></div>
-                        <div><span className="text-muted-foreground">Valor restante:</span> <span className="font-semibold">{selectedLoan.status === "paid" ? formatCurrency(0) : loanRemaining ? formatCurrency(loanRemaining.remainingAmount) : "—"}</span></div>
+                        <div>
+                          <span className="text-muted-foreground">Valor restante:</span>{" "}
+                          <span className="font-semibold">
+                            {selectedLoan.status === "paid"
+                              ? formatCurrency(0)
+                              : selectedLoan.status === "installments"
+                                ? "— (cobrança no parcelamento)"
+                                : loanRemaining
+                                  ? formatCurrency(loanRemaining.remainingAmount)
+                                  : "—"}
+                          </span>
+                        </div>
                       </>
                     );
                   })()}

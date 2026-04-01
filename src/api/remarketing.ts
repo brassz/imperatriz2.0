@@ -1,5 +1,6 @@
 import { supabase } from "@/lib/supabase";
 import { fetchClientScore } from "@/api/clients";
+import { resolvePaidLoanClientNames } from "@/api/loans";
 import type { ClientScoreResult } from "@/api/client-score";
 
 export type RemarketingPaymentRow = {
@@ -62,7 +63,17 @@ export async function fetchRemarketingQuitados(): Promise<RemarketingQuitadoRow[
   if (error) throw error;
 
   const rows = (paidRows || []) as Array<Record<string, unknown>>;
-  const clientIds = [...new Set(rows.map((r) => String(r.client_id || "")).filter(Boolean))];
+  const { clientIdByLoanId } = await resolvePaidLoanClientNames(rows);
+  const clientIds = [
+    ...new Set(
+      rows
+        .map((r) => {
+          const lid = String(r.loan_id ?? "");
+          return (clientIdByLoanId[lid] || String(r.client_id || "")).trim();
+        })
+        .filter(Boolean),
+    ),
+  ];
 
   const clientMap: Record<
     string,
@@ -132,7 +143,8 @@ export async function fetchRemarketingQuitados(): Promise<RemarketingQuitadoRow[
   );
 
   return rows.map((r) => {
-    const cid = String(r.client_id || "");
+    const lid = String(r.loan_id || "");
+    const cid = clientIdByLoanId[lid] || String(r.client_id || "");
     const c = clientMap[cid] || {
       name: "—",
       phone: "",
@@ -140,7 +152,6 @@ export async function fetchRemarketingQuitados(): Promise<RemarketingQuitadoRow[
       email: null as string | null,
       address: null as string | null,
     };
-    const lid = String(r.loan_id || "");
     return {
       paidLoanId: String(r.id || ""),
       loanId: lid,

@@ -1,5 +1,5 @@
 /**
- * Agendamentos de WhatsApp persistidos no Supabase para execução via Edge Function (cron).
+ * Agendamentos de WhatsApp persistidos no Supabase; envio automático pelo worker na VPS (cron/PM2 + scripts/whatsapp-scheduler.mjs).
  */
 
 import { supabase, getSupabaseCompany } from "@/lib/supabase";

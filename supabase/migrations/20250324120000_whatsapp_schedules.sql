@@ -1,4 +1,4 @@
--- Agendamentos de envio WhatsApp executados no servidor (Edge Function + cron).
+-- Agendamentos de envio WhatsApp executados no servidor (ex.: VPS + PM2/cron + whatsapp-scheduler.mjs).
 -- Rode este SQL no SQL Editor de cada projeto Supabase que usar a automação.
 
 create table if not exists public.whatsapp_schedules (

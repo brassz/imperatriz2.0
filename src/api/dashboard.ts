@@ -217,7 +217,7 @@ export async function fetchDashboardMetrics() {
     totalLoaned,
     jurosRestante,
     totalRestante,
-    activeLoans: ativosCount + partialPaidCount,
+    activeLoans: ativosCount + partialPaidCount + installmentsCount,
     ativosCount,
     partialPaidCount,
     vencidosCount,

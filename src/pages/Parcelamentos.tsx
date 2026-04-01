@@ -7,6 +7,7 @@ import {
   Wallet,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
@@ -36,6 +37,7 @@ import {
   type InstallmentRow,
 } from "@/api/installments";
 import { fetchClientsForSelect } from "@/api/clients";
+import { fetchClientLoansForParcelamentoLink } from "@/api/loans";
 import { fetchPixKeys } from "@/api/pix-keys";
 import { sendWhatsAppMessage } from "@/api/evolution";
 import { useState, useMemo } from "react";
@@ -72,6 +74,8 @@ export default function Parcelamentos() {
     interest_rate: "0",
     first_due_date: toInputDate(new Date().toISOString()),
     notes: "",
+    link_loan: false,
+    loan_id: "",
   });
   const [paymentForm, setPaymentForm] = useState({
     paid_amount: "",
@@ -91,6 +95,12 @@ export default function Parcelamentos() {
     queryKey: ["clients-for-select"],
     queryFn: fetchClientsForSelect,
     enabled: newOpen,
+  });
+
+  const { data: loansForLink = [], isLoading: loadingLoansForLink } = useQuery({
+    queryKey: ["client-loans-parcelamento", form.client_id],
+    queryFn: () => fetchClientLoansForParcelamentoLink(form.client_id),
+    enabled: newOpen && !!form.client_id && form.link_loan,
   });
 
   const { data: installmentFull, isLoading: loadingDetails } = useQuery({
@@ -144,6 +154,12 @@ export default function Parcelamentos() {
       toast.error("Preencha cliente, valor total, número de parcelas e primeira data de vencimento");
       return;
     }
+    if (form.link_loan) {
+      if (!form.loan_id) {
+        toast.error("Selecione o empréstimo a vincular ou desmarque a opção");
+        return;
+      }
+    }
     let installmentAmount = amt / n;
     if (rate > 0) {
       const monthlyRate = rate / 100;
@@ -160,6 +176,7 @@ export default function Parcelamentos() {
         first_due_date: form.first_due_date,
         interest_rate: rate,
         notes: form.notes.trim() || undefined,
+        loan_id: form.link_loan && form.loan_id ? form.loan_id : null,
       });
       toast.success("Parcelamento criado");
       setNewOpen(false);
@@ -170,8 +187,11 @@ export default function Parcelamentos() {
         interest_rate: "0",
         first_due_date: toInputDate(new Date().toISOString()),
         notes: "",
+        link_loan: false,
+        loan_id: "",
       });
       queryClient.invalidateQueries({ queryKey: ["installments"] });
+      queryClient.invalidateQueries({ queryKey: ["loans"] });
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Erro ao criar parcelamento");
     } finally {
@@ -240,6 +260,7 @@ export default function Parcelamentos() {
       setDetailsOpen(false);
       setSelectedId(null);
       queryClient.invalidateQueries({ queryKey: ["installments"] });
+      queryClient.invalidateQueries({ queryKey: ["loans"] });
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Erro ao cancelar");
     }
@@ -438,7 +459,7 @@ export default function Parcelamentos() {
               </div>
               <Select
                 value={form.client_id}
-                onValueChange={(v) => setForm((f) => ({ ...f, client_id: v }))}
+                onValueChange={(v) => setForm((f) => ({ ...f, client_id: v, loan_id: "" }))}
                 required
               >
                 <SelectTrigger>
@@ -455,6 +476,57 @@ export default function Parcelamentos() {
                     ))}
                 </SelectContent>
               </Select>
+            </div>
+            <div className="rounded-lg border border-border/50 p-3 space-y-3">
+              <div className="flex items-start gap-3">
+                <Checkbox
+                  id="parcelamento-link-loan"
+                  checked={form.link_loan}
+                  onCheckedChange={(c) =>
+                    setForm((f) => ({
+                      ...f,
+                      link_loan: c === true,
+                      loan_id: c === true ? f.loan_id : "",
+                    }))
+                  }
+                />
+                <div className="space-y-1">
+                  <label htmlFor="parcelamento-link-loan" className="text-sm font-medium leading-none cursor-pointer">
+                    Vincular a um empréstimo deste cliente
+                  </label>
+                  <p className="text-xs text-muted-foreground">
+                    O contrato passa a constar como Parcelamento na aba Empréstimos (pagamentos pelo plano de parcelas).
+                  </p>
+                </div>
+              </div>
+              {form.link_loan && form.client_id ? (
+                loadingLoansForLink ? (
+                  <p className="text-xs text-muted-foreground">Carregando empréstimos...</p>
+                ) : loansForLink.length === 0 ? (
+                  <p className="text-xs text-amber-600 dark:text-amber-500">
+                    Nenhum empréstimo em andamento disponível para vincular (ou já existe parcelamento ativo ligado ao contrato).
+                  </p>
+                ) : (
+                  <div className="space-y-2">
+                    <Label>Empréstimo *</Label>
+                    <Select
+                      value={form.loan_id || undefined}
+                      onValueChange={(v) => setForm((f) => ({ ...f, loan_id: v }))}
+                    >
+                      <SelectTrigger>
+                        <SelectValue placeholder="Selecione o empréstimo" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {(loansForLink as Array<{ id: string; amount: number; due_date: string }>).map((l) => (
+                          <SelectItem key={l.id} value={l.id}>
+                            {formatCurrency(Number(l.amount))} · venc. {formatDate(String(l.due_date))}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                )
+              ) : null}
             </div>
             <div className="grid grid-cols-2 gap-4">
               <div>

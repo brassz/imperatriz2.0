@@ -22,7 +22,7 @@ export type Agendamento = {
   delayMinutos: number;
   ativo: boolean;
   createdAt: string;
-  /** Snapshot para o worker no servidor (Edge Function) */
+  /** Snapshot para o worker no servidor (ex.: whatsapp-scheduler.mjs na VPS) */
   evolutionBaseUrl?: string;
   evolutionApiKey?: string;
   pixTipo?: string;

@@ -115,6 +115,32 @@ export async function createInstallment(params: {
   notes?: string;
   loan_id?: string | null;
 }) {
+  const loanId = params.loan_id?.trim() || null;
+  if (loanId) {
+    const { data: loan, error: loanErr } = await supabase
+      .from("loans")
+      .select("id, client_id, status")
+      .eq("id", loanId)
+      .single();
+    if (loanErr || !loan) throw new Error("Empréstimo não encontrado");
+    if (String(loan.client_id) !== String(params.client_id)) {
+      throw new Error("O empréstimo selecionado não pertence a este cliente");
+    }
+    const st = String(loan.status || "");
+    if (st === "paid" || st === "cancelled" || st === "installments") {
+      throw new Error("Este empréstimo não pode ser vinculado a um parcelamento");
+    }
+    const { data: existingInst } = await supabase
+      .from("installments")
+      .select("id")
+      .eq("loan_id", loanId)
+      .eq("status", "active")
+      .maybeSingle();
+    if (existingInst?.id) {
+      throw new Error("Já existe um parcelamento ativo vinculado a este empréstimo");
+    }
+  }
+
   const { data: installment, error: instErr } = await supabase
     .from("installments")
     .insert([
@@ -126,13 +152,18 @@ export async function createInstallment(params: {
         first_due_date: params.first_due_date,
         interest_rate: params.interest_rate ?? 0,
         notes: params.notes || null,
-        loan_id: params.loan_id ?? null,
+        loan_id: loanId,
       },
     ])
     .select()
     .single();
 
   if (instErr) throw instErr;
+
+  if (loanId) {
+    const { error: upLoanErr } = await supabase.from("loans").update({ status: "installments" }).eq("id", loanId);
+    if (upLoanErr) throw upLoanErr;
+  }
 
   const firstDate = new Date(params.first_due_date);
   const payments: Array<{ installment_id: string; installment_number: number; amount: number; due_date: string }> = [];
@@ -188,6 +219,19 @@ export async function recordInstallmentPayment(
 }
 
 export async function cancelInstallment(id: string) {
+  const { data: row, error: fetchErr } = await supabase
+    .from("installments")
+    .select("loan_id")
+    .eq("id", id)
+    .single();
+  if (fetchErr) throw fetchErr;
+
   const { error } = await supabase.from("installments").update({ status: "cancelled" }).eq("id", id);
   if (error) throw error;
+
+  const lid = row?.loan_id ? String(row.loan_id) : "";
+  if (lid) {
+    const { error: loanErr } = await supabase.from("loans").update({ status: "active" }).eq("id", lid);
+    if (loanErr) throw loanErr;
+  }
 }

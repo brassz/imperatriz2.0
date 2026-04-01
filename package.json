@@ -9,6 +9,7 @@
     "build:dev": "vite build --mode development",
     "lint": "eslint .",
     "preview": "vite preview",
+    "scheduler:whatsapp": "node scripts/whatsapp-scheduler.mjs",
     "test": "vitest run",
     "test:watch": "vitest"
   },
@@ -64,6 +65,8 @@
     "tailwind-merge": "^2.6.0",
     "tailwindcss-animate": "^1.0.7",
     "vaul": "^0.9.9",
+    "xlsx": "^0.18.5",
+    "xlsx-js-style": "^1.2.0",
     "zod": "^3.25.76"
   },
   "devDependencies": {

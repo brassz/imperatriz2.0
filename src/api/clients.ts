@@ -9,7 +9,7 @@ export async function fetchClients(page = 1, search = "") {
 
   let query = supabase
     .from("clients")
-    .select("id, name, cpf, phone, email, created_at", { count: "exact" })
+    .select("id, name, cpf, phone, email, instagram, facebook, created_at", { count: "exact" })
     .order("created_at", { ascending: false });
 
   const q = search.trim();
@@ -28,7 +28,11 @@ export async function fetchClients(page = 1, search = "") {
   const clientIds = clients.map((c: Record<string, unknown>) => c.id).filter(Boolean);
   const { data: loansData } =
     clientIds.length > 0
-      ? await supabase.from("loans").select("client_id, status").in("client_id", clientIds).in("status", ["active", "overdue", "partial_paid"])
+      ? await supabase
+          .from("loans")
+          .select("client_id, status")
+          .in("client_id", clientIds)
+          .in("status", ["active", "overdue", "partial_paid"])
       : { data: [] };
   const loanCountByClient: Record<string, number> = {};
   const overdueByClient: Record<string, boolean> = {};
@@ -44,10 +48,39 @@ export async function fetchClients(page = 1, search = "") {
     cpf: c.cpf,
     phone: c.phone,
     email: c.email,
+    instagram: c.instagram,
+    facebook: c.facebook,
     loans: loanCountByClient[String(c.id)] || 0,
     status: overdueByClient[String(c.id)] ? "overdue" : "active",
   }));
   return { data: items, total: count ?? 0 };
+}
+
+export type CreateClientInput = {
+  name: string;
+  cpf?: string;
+  phone?: string;
+  email?: string;
+  address?: string;
+  rg?: string;
+  instagram?: string;
+  facebook?: string;
+};
+
+export async function createClient(input: CreateClientInput) {
+  const payload = {
+    name: input.name.trim(),
+    cpf: (input.cpf || "").trim() || null,
+    phone: (input.phone || "").trim() || null,
+    email: (input.email || "").trim() || null,
+    address: (input.address || "").trim() || null,
+    rg: (input.rg || "").trim() || null,
+    instagram: (input.instagram || "").trim() || null,
+    facebook: (input.facebook || "").trim() || null,
+  };
+  const { data, error } = await supabase.from("clients").insert(payload).select("*").single();
+  if (error) throw error;
+  return data;
 }
 
 export async function fetchClientsForPdf(dateFrom?: string, dateTo?: string) {
@@ -102,6 +135,30 @@ export async function fetchClientById(id: string) {
   return data;
 }
 
+export async function deleteClient(id: string) {
+  const { error } = await supabase.from("clients").delete().eq("id", id);
+  if (error) throw error;
+  return { ok: true };
+}
+
+export type UpdateClientInput = Partial<CreateClientInput>;
+
+export async function updateClient(id: string, patch: UpdateClientInput) {
+  const payload: Record<string, unknown> = {};
+  if (patch.name !== undefined) payload.name = patch.name.trim();
+  if (patch.cpf !== undefined) payload.cpf = patch.cpf.trim() || null;
+  if (patch.phone !== undefined) payload.phone = patch.phone.trim() || null;
+  if (patch.email !== undefined) payload.email = patch.email.trim() || null;
+  if (patch.address !== undefined) payload.address = patch.address.trim() || null;
+  if (patch.rg !== undefined) payload.rg = patch.rg.trim() || null;
+  if (patch.instagram !== undefined) payload.instagram = patch.instagram.trim() || null;
+  if (patch.facebook !== undefined) payload.facebook = patch.facebook.trim() || null;
+
+  const { error } = await supabase.from("clients").update(payload).eq("id", id);
+  if (error) throw error;
+  return { ok: true };
+}
+
 export async function fetchClientHistory(clientId: string) {
   const { data: client, error: clientErr } = await supabase
     .from("clients")
@@ -115,6 +172,7 @@ export async function fetchClientHistory(clientId: string) {
     .from("loans")
     .select("id, amount, interest_rate, loan_date, due_date, status, created_at")
     .eq("client_id", clientId)
+    .neq("status", "installments")
     .order("created_at", { ascending: false })
     .limit(1000);
 
@@ -217,6 +275,7 @@ export async function fetchClientScore(clientId: string) {
     .from("loans")
     .select("id, amount, interest_rate, due_date, status, created_at")
     .eq("client_id", clientId)
+    .neq("status", "installments")
     .order("created_at", { ascending: false })
     .limit(1000);
 

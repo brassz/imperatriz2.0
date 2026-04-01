@@ -1,4 +1,4 @@
-import { Plus, MessageCircle, Send, KeyRound, FolderOpen, RefreshCw, Clock, Calendar, StopCircle, ListChecks } from "lucide-react";
+import { Plus, MessageCircle, Send, KeyRound, FolderOpen, RefreshCw, Clock, Calendar, StopCircle, ListChecks, Play, Pause, BadgePercent, FileDown } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -20,8 +20,8 @@ import {
 } from "@/components/ui/dialog";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { motion } from "framer-motion";
-import { useQuery } from "@tanstack/react-query";
-import { fetchPixKeys } from "@/api/pix-keys";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { deactivatePixKey, fetchPixKeys, insertPixKey } from "@/api/pix-keys";
 import { fetchExpenseCategories } from "@/api/categories";
 import { getEvolutionConfig, saveEvolutionConfig } from "@/lib/evolution-settings";
 import { getSupabaseCompany } from "@/lib/supabase";
@@ -38,6 +38,7 @@ import { toast } from "sonner";
 import { fetchLoansForAutomation, type AutomationLoan } from "@/api/automation";
 import { fetchInstallments, type InstallmentRow } from "@/api/installments";
 import { fetchClientsForSelect } from "@/api/clients";
+import { fetchCommissionRows, fetchCommissionSummary } from "@/api/commissions";
 import {
   fetchEvolutionQrCode,
   getQrImageUrl,
@@ -53,6 +54,8 @@ import {
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { type Agendamento, type DiaSemana, type FiltroAgendamento } from "@/lib/agendamentos";
 import { PDF_BRAND } from "@/lib/pdf-branding";
+import { jsPDF } from "jspdf";
+import * as XLSX from "xlsx-js-style";
 
 const EMPRESAS = ["FRANCA", "Litoral", "Mogiana", "Imperatriz"];
 const DIAS_LABELS: { value: DiaSemana; label: string }[] = [
@@ -543,6 +546,7 @@ function formatFiltros(f: FiltroAgendamento[]): string {
 export default function Configuracoes() {
   const { user } = useAuth();
   const companyId = getSupabaseCompany();
+  const queryClient = useQueryClient();
   const config = getEvolutionConfig();
   const [evolution, setEvolution] = useState({
     baseUrl: config.baseUrl,
@@ -580,6 +584,35 @@ export default function Configuracoes() {
   const migratedSchedulesRef = useRef(false);
   const [activeTab, setActiveTab] = useState("whatsapp");
   const [modalAgendamento, setModalAgendamento] = useState(false);
+  const [pixModalOpen, setPixModalOpen] = useState(false);
+  const [pixForm, setPixForm] = useState({
+    bank_name: "",
+    account_holder: "",
+    pix_key_type: "CNPJ",
+    pix_key: "",
+  });
+  const [commDateFrom, setCommDateFrom] = useState(() => {
+    const d = new Date();
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, "0");
+    return `${y}-${m}-01`;
+  });
+  const [commDateTo, setCommDateTo] = useState(() => new Date().toISOString().split("T")[0]);
+
+  const {
+    data: commissionSummary,
+    isLoading: loadingCommissions,
+    error: commissionsError,
+  } = useQuery({
+    queryKey: ["commissions", commDateFrom, commDateTo],
+    queryFn: () => fetchCommissionSummary(commDateFrom, commDateTo),
+    enabled:
+      activeTab === "comissoes" &&
+      !!commDateFrom &&
+      !!commDateTo &&
+      commDateFrom <= commDateTo,
+    staleTime: 30_000,
+  });
 
   const {
     data: agendamentos = [],
@@ -946,7 +979,7 @@ export default function Configuracoes() {
       </div>
 
       <Tabs value={activeTab} onValueChange={setActiveTab} className="w-full">
-        <TabsList className="grid w-full max-w-md grid-cols-3">
+        <TabsList className="grid w-full max-w-xl grid-cols-4">
           <TabsTrigger value="whatsapp" className="gap-2">
             <MessageCircle className="h-4 w-4" />
             WhatsApp
@@ -954,6 +987,10 @@ export default function Configuracoes() {
           <TabsTrigger value="pix" className="gap-2">
             <KeyRound className="h-4 w-4" />
             Chaves PIX
+          </TabsTrigger>
+          <TabsTrigger value="comissoes" className="gap-2">
+            <BadgePercent className="h-4 w-4" />
+            Comissões
           </TabsTrigger>
           <TabsTrigger value="categorias" className="gap-2">
             <FolderOpen className="h-4 w-4" />
@@ -1196,7 +1233,7 @@ export default function Configuracoes() {
             </motion.div>
           )}
 
-          {/* Agendamentos — persistidos no Supabase; execução via Edge Function + cron */}
+          {/* Agendamentos — persistidos no Supabase; execução no servidor (PM2/cron + scripts/whatsapp-scheduler.mjs) */}
           <motion.div
             initial={{ opacity: 0, y: 8 }}
             animate={{ opacity: 1, y: 0 }}
@@ -1248,11 +1285,14 @@ export default function Configuracoes() {
                       </div>
                       <div className="flex items-center gap-2">
                         <Button
-                          variant="outline"
-                          size="sm"
+                          type="button"
+                          variant={a.ativo ? "secondary" : "outline"}
+                          size="icon"
+                          className="h-8 w-8"
+                          title={a.ativo ? "Pausar agendamento" : "Iniciar agendamento"}
                           onClick={() => toggleAgendamentoAtivo(a)}
                         >
-                          {a.ativo ? "Desativar" : "Ativar"}
+                          {a.ativo ? <Pause className="h-4 w-4" /> : <Play className="h-4 w-4" />}
                         </Button>
                         <button
                           className="text-xs text-muted-foreground hover:text-destructive"
@@ -1576,6 +1616,385 @@ export default function Configuracoes() {
           </Dialog>
         </TabsContent>
 
+        <TabsContent value="comissoes" className="mt-4">
+          <motion.div
+            initial={{ opacity: 0, y: 8 }}
+            animate={{ opacity: 1, y: 0 }}
+            className="glass-card p-5"
+          >
+            <div className="flex items-center justify-between gap-4 flex-wrap">
+              <div>
+                <h3 className="text-sm font-semibold text-foreground">Comissões</h3>
+                <p className="text-xs text-muted-foreground">
+                  Base = juros dos pagamentos + parcelas pagas dos parcelamentos.
+                </p>
+              </div>
+              <div className="flex items-end gap-2 flex-wrap">
+                <div>
+                  <Label className="text-[11px]">De</Label>
+                  <Input
+                    type="date"
+                    value={commDateFrom}
+                    onChange={(e) => setCommDateFrom(e.target.value)}
+                    className="h-8 text-xs mt-1"
+                  />
+                </div>
+                <div>
+                  <Label className="text-[11px]">Até</Label>
+                  <Input
+                    type="date"
+                    value={commDateTo}
+                    onChange={(e) => setCommDateTo(e.target.value)}
+                    className="h-8 text-xs mt-1"
+                  />
+                </div>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className="h-8 gap-2"
+                  disabled={loadingCommissions || !commissionSummary}
+                  onClick={async () => {
+                    try {
+                      const rows = await fetchCommissionRows(commDateFrom, commDateTo);
+
+                      const formatBR = (ymd: string) => {
+                        const [y, m, d] = String(ymd).split("T")[0].split("-");
+                        return d && m && y ? `${d}/${m}/${y}` : ymd;
+                      };
+                      const title = `ACERTO - ${formatBR(commDateFrom)} / ${formatBR(commDateTo)}`;
+
+                      const sheet = "Extrato Ton";
+                      const aoa: any[][] = [];
+                      aoa.push([title]);
+                      aoa.push(["Vinicius", Number(commissionSummary.vinicius || 0)]);
+                      aoa.push(["Douglas", Number(commissionSummary.douglas || 0)]);
+                      aoa.push(["Tipo", "Valor", "Data", "Situação", "Comissão", "Multa", "Origem"]);
+
+                      // No modelo: "Comissão" é o valor-base da linha.
+                      // Para "Quitado", exibimos o último valor pago em "Valor" e "Comissão" fica "-".
+                      const headerRowIndex = 3; // 0-based row where headers live
+                      for (const r of rows) {
+                        const isQuitado = r.situacao === "Quitado" || r.tipo === "Quitado";
+                        aoa.push([
+                          r.tipo,
+                          isQuitado ? Number(r.valor || 0) : Number(r.valor || 0),
+                          formatBR(r.data),
+                          r.situacao,
+                          isQuitado ? "-" : Number(r.valor || 0),
+                          r.multa || "",
+                          r.origem,
+                        ]);
+                      }
+
+                      const wb = XLSX.utils.book_new();
+                      const ws = XLSX.utils.aoa_to_sheet(aoa);
+                      ws["!merges"] = [{ s: { r: 0, c: 0 }, e: { r: 0, c: 6 } }];
+                      ws["!cols"] = [
+                        { wch: 12 }, // Tipo
+                        { wch: 12 }, // Valor
+                        { wch: 18 }, // Data
+                        { wch: 12 }, // Situação
+                        { wch: 12 }, // Comissão
+                        { wch: 18 }, // Multa
+                        { wch: 55 }, // Origem
+                      ];
+
+                      // Estilos: cabeçalho profissional + tabela
+                      const teal = "14B8A6";
+                      const tealDark = "0D9488";
+                      const softBg = "F8FAFC";
+                      const grid = "E2E8F0";
+                      const red = "C00000";
+
+                      const redFont = { color: { rgb: red }, bold: true };
+                      const headerFont = { bold: true, color: { rgb: "000000" } };
+                      const titleFont = { bold: true, sz: 15, color: { rgb: "FFFFFF" } };
+                      const titleSubFont = { bold: true, color: { rgb: "FFFFFF" } };
+
+                      // Fundo do topo (A1:G3)
+                      for (let r = 0; r <= 2; r++) {
+                        for (let c = 0; c <= 6; c++) {
+                          const addr = XLSX.utils.encode_cell({ r, c });
+                          const cell = ws[addr] || (ws[addr] = { t: "s", v: "" } as any);
+                          cell.s = {
+                            fill: { fgColor: { rgb: r === 0 ? tealDark : teal } },
+                            border: {
+                              top: { style: "thin", color: { rgb: tealDark } },
+                              bottom: { style: "thin", color: { rgb: tealDark } },
+                              left: { style: "thin", color: { rgb: tealDark } },
+                              right: { style: "thin", color: { rgb: tealDark } },
+                            },
+                          };
+                        }
+                      }
+
+                      // Título (A1)
+                      const a1 = ws["A1"];
+                      if (a1) a1.s = { ...(a1.s || {}), font: titleFont, alignment: { horizontal: "center", vertical: "center" } };
+
+                      // Vinicius / Douglas (topo)
+                      const a2 = ws["A2"]; const b2 = ws["B2"];
+                      const a3 = ws["A3"]; const b3 = ws["B3"];
+                      if (a2) a2.s = { ...(a2.s || {}), font: titleSubFont, alignment: { horizontal: "left" } };
+                      if (a3) a3.s = { ...(a3.s || {}), font: titleSubFont, alignment: { horizontal: "left" } };
+                      if (b2) {
+                        b2.z = '"R$" #,##0.00';
+                        b2.s = { ...(b2.s || {}), font: titleSubFont, alignment: { horizontal: "left" } };
+                      }
+                      if (b3) {
+                        b3.z = '"R$" #,##0.00';
+                        b3.s = { ...(b3.s || {}), font: titleSubFont, alignment: { horizontal: "left" } };
+                      }
+
+                      // Header row styles (row 4 in Excel => index 4? Actually aoa header row is row 4 => 1-based 4)
+                      for (let c = 0; c <= 6; c++) {
+                        const addr = XLSX.utils.encode_cell({ r: headerRowIndex, c });
+                        const cell = ws[addr];
+                        if (cell) {
+                          cell.s = {
+                            font: { ...headerFont, color: { rgb: "0F172A" } },
+                            fill: { fgColor: { rgb: softBg } },
+                            border: {
+                              top: { style: "thin", color: { rgb: grid } },
+                              bottom: { style: "thin", color: { rgb: grid } },
+                              left: { style: "thin", color: { rgb: grid } },
+                              right: { style: "thin", color: { rgb: grid } },
+                            },
+                          };
+                        }
+                      }
+
+                      // Apply red style to quitado rows
+                      for (let rIdx = headerRowIndex + 1; rIdx < aoa.length; rIdx++) {
+                        const tipo = aoa[rIdx]?.[0];
+                        const situ = aoa[rIdx]?.[3];
+                        if (tipo === "Quitado" || situ === "Quitado") {
+                          for (let c = 0; c <= 6; c++) {
+                            const addr = XLSX.utils.encode_cell({ r: rIdx, c });
+                            const cell = ws[addr];
+                            if (cell) {
+                              cell.s = {
+                                ...(cell.s || {}),
+                                font: redFont,
+                              };
+                            }
+                          }
+                        }
+                      }
+
+                      XLSX.utils.book_append_sheet(wb, ws, sheet);
+
+                      const fileName = `ACERTO - ${formatBR(commDateFrom)} - ${formatBR(commDateTo)}.xlsx`;
+                      XLSX.writeFile(wb, fileName);
+                    } catch (e) {
+                      toast.error(e instanceof Error ? e.message : "Erro ao gerar Excel");
+                    }
+                  }}
+                >
+                  <FileDown className="h-4 w-4" />
+                  Excel
+                </Button>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className="h-8 gap-2"
+                  disabled={loadingCommissions || !commissionSummary}
+                  onClick={async () => {
+                    try {
+                      const rows = await fetchCommissionRows(commDateFrom, commDateTo);
+                      const fmtMoney = (n: number) =>
+                        n.toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
+                      const formatBR = (ymd: string) => {
+                        const [y, m, d] = String(ymd).split("T")[0].split("-");
+                        return d && m && y ? `${d}/${m}/${y}` : ymd;
+                      };
+
+                      const doc = new jsPDF();
+                      const pageW = doc.internal.pageSize.getWidth();
+                      const pageH = doc.internal.pageSize.getHeight();
+
+                      const teal = PDF_BRAND.colors.primary;
+                      const tealDark = PDF_BRAND.colors.primaryDark;
+                      const line = PDF_BRAND.colors.line;
+
+                      // Fundo suave da página
+                      doc.setFillColor(248, 250, 252);
+                      doc.rect(0, 0, pageW, pageH, "F");
+
+                      // Cabeçalho com cor
+                      doc.setFillColor(tealDark.r, tealDark.g, tealDark.b);
+                      doc.rect(0, 0, pageW, 18, "F");
+                      doc.setFillColor(teal.r, teal.g, teal.b);
+                      doc.rect(0, 18, pageW, 6, "F");
+
+                      doc.setTextColor(255, 255, 255);
+                      doc.setFont("helvetica", "bold");
+                      doc.setFontSize(13);
+                      doc.text("ACERTO (COMISSÕES)", pageW / 2, 12, { align: "center" });
+
+                      doc.setTextColor(255, 255, 255);
+                      doc.setFont("helvetica", "normal");
+                      doc.setFontSize(9);
+                      doc.text(
+                        `${PDF_BRAND.companyName} · ${PDF_BRAND.branch} · ${formatBR(commDateFrom)} a ${formatBR(commDateTo)}`,
+                        pageW / 2,
+                        22,
+                        { align: "center" },
+                      );
+
+                      // Card de resumo
+                      let y = 34;
+                      doc.setDrawColor(line.r, line.g, line.b);
+                      doc.setFillColor(255, 255, 255);
+                      doc.roundedRect(14, y, pageW - 28, 28, 3, 3, "FD");
+                      y += 8;
+                      doc.setTextColor(30, 41, 59);
+                      doc.setFont("helvetica", "bold");
+                      doc.setFontSize(11);
+                      doc.text(`Base total: ${fmtMoney(commissionSummary.baseTotal)}`, 18, y);
+                      y += 7;
+                      doc.setFont("helvetica", "normal");
+                      doc.setFontSize(10);
+                      doc.text(`Vinicius (66,666%): ${fmtMoney(commissionSummary.vinicius)}`, 18, y);
+                      y += 6;
+                      doc.text(`Douglas (33,333%): ${fmtMoney(commissionSummary.douglas)}`, 18, y);
+                      y += 12;
+
+                      doc.setFont("helvetica", "bold");
+                      doc.text(`Base total: ${fmtMoney(commissionSummary.baseTotal)}`, 14, y);
+                      y += 6;
+                      doc.setFont("helvetica", "normal");
+                      doc.text(`Vinicius (66,666%): ${fmtMoney(commissionSummary.vinicius)}`, 14, y);
+                      y += 5;
+                      doc.text(`Douglas (33,333%): ${fmtMoney(commissionSummary.douglas)}`, 14, y);
+                      y += 10;
+
+                      // Cabeçalho da tabela
+                      doc.setFillColor(241, 245, 249);
+                      doc.roundedRect(14, y - 6, pageW - 28, 10, 2, 2, "F");
+                      doc.setTextColor(15, 23, 42);
+                      doc.setFont("helvetica", "bold");
+                      doc.setFontSize(10);
+                      doc.text("Tipo", 16, y);
+                      doc.text("Valor", 56, y);
+                      doc.text("Data", 92, y);
+                      doc.text("Origem", 122, y);
+                      y += 7;
+                      doc.setDrawColor(line.r, line.g, line.b);
+                      doc.line(14, y - 2, pageW - 14, y - 2);
+                      doc.setFont("helvetica", "normal");
+                      doc.setFontSize(9);
+
+                      for (const r of rows) {
+                        if (y > 284) {
+                          doc.addPage();
+                          // Repete cabeçalho simplificado nas páginas seguintes
+                          doc.setFillColor(tealDark.r, tealDark.g, tealDark.b);
+                          doc.rect(0, 0, pageW, 12, "F");
+                          doc.setTextColor(255, 255, 255);
+                          doc.setFont("helvetica", "bold");
+                          doc.setFontSize(10);
+                          doc.text("ACERTO (COMISSÕES)", pageW / 2, 8, { align: "center" });
+                          doc.setTextColor(30, 41, 59);
+                          y = 22;
+
+                          doc.setFillColor(241, 245, 249);
+                          doc.roundedRect(14, y - 6, pageW - 28, 10, 2, 2, "F");
+                          doc.setTextColor(15, 23, 42);
+                          doc.setFont("helvetica", "bold");
+                          doc.setFontSize(10);
+                          doc.text("Tipo", 16, y);
+                          doc.text("Valor", 56, y);
+                          doc.text("Data", 92, y);
+                          doc.text("Origem", 122, y);
+                          y += 7;
+                          doc.setDrawColor(line.r, line.g, line.b);
+                          doc.line(14, y - 2, pageW - 14, y - 2);
+                          doc.setFont("helvetica", "normal");
+                          doc.setFontSize(9);
+                        }
+                        const isQuitado = r.tipo === "Quitado" || r.situacao === "Quitado";
+                        if (isQuitado) doc.setTextColor(192, 0, 0);
+                        doc.text(String(r.tipo).slice(0, 10), 16, y);
+                        doc.text(fmtMoney(r.valor).slice(0, 20), 56, y);
+                        doc.text(formatBR(r.data), 92, y);
+                        const origin = String(r.origem || "").slice(0, 60);
+                        doc.text(origin, 122, y);
+                        if (isQuitado) doc.setTextColor(0, 0, 0);
+                        y += 5;
+                      }
+
+                      doc.save(`ACERTO - ${formatBR(commDateFrom)} - ${formatBR(commDateTo)}.pdf`);
+                    } catch (e) {
+                      toast.error(e instanceof Error ? e.message : "Erro ao gerar PDF");
+                    }
+                  }}
+                >
+                  <FileDown className="h-4 w-4" />
+                  PDF
+                </Button>
+              </div>
+            </div>
+
+            {(() => {
+              const fmt = (n: number) =>
+                n.toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
+
+              if (commissionsError) {
+                return <p className="text-sm text-destructive mt-4">Erro ao calcular comissões.</p>;
+              }
+              if (loadingCommissions || !commissionSummary) {
+                return <p className="text-sm text-muted-foreground mt-4">Calculando...</p>;
+              }
+
+              return (
+                <div className="mt-4 grid grid-cols-1 md:grid-cols-2 gap-3">
+                  <div className="rounded-lg border border-border/50 bg-muted/20 p-4">
+                    <p className="text-xs text-muted-foreground">Base total</p>
+                    <p className="text-lg font-semibold text-foreground mt-1">
+                      {fmt(commissionSummary.baseTotal)}
+                    </p>
+                    <div className="mt-3 space-y-1 text-xs text-muted-foreground">
+                      <div className="flex justify-between gap-4">
+                        <span>Juros (pagamentos)</span>
+                        <span className="font-medium text-foreground">
+                          {fmt(commissionSummary.interestTotal)}
+                        </span>
+                      </div>
+                      <div className="flex justify-between gap-4">
+                        <span>Parcelas (parcelamentos)</span>
+                        <span className="font-medium text-foreground">
+                          {fmt(commissionSummary.installmentsTotal)}
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="rounded-lg border border-border/50 bg-muted/20 p-4">
+                    <p className="text-xs text-muted-foreground">Repartição</p>
+                    <div className="mt-3 space-y-2 text-sm">
+                      <div className="flex items-center justify-between gap-4">
+                        <span className="text-foreground font-medium">Vinicius (66,666%)</span>
+                        <span className="font-semibold text-foreground">
+                          {fmt(commissionSummary.vinicius)}
+                        </span>
+                      </div>
+                      <div className="flex items-center justify-between gap-4">
+                        <span className="text-foreground font-medium">Douglas (33,333%)</span>
+                        <span className="font-semibold text-foreground">
+                          {fmt(commissionSummary.douglas)}
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              );
+            })()}
+          </motion.div>
+        </TabsContent>
+
         <TabsContent value="pix" className="mt-4">
           <motion.div
             initial={{ opacity: 0, y: 8 }}
@@ -1593,16 +2012,113 @@ export default function Configuracoes() {
                       <p className="text-sm font-medium text-foreground">{String(p.bank)} — {String(p.type)}</p>
                       <p className="text-xs text-muted-foreground font-mono">{String(p.key)}</p>
                     </div>
-                    <button className="text-muted-foreground hover:text-destructive transition-colors text-sm">Remover</button>
+                    <button
+                      className="text-muted-foreground hover:text-destructive transition-colors text-sm"
+                      onClick={async () => {
+                        if (!confirm("Remover esta chave PIX?")) return;
+                        try {
+                          await deactivatePixKey(String(p.id));
+                          toast.success("Chave PIX removida");
+                          queryClient.invalidateQueries({ queryKey: ["pix-keys"] });
+                        } catch (e) {
+                          toast.error(e instanceof Error ? e.message : "Erro ao remover chave PIX");
+                        }
+                      }}
+                    >
+                      Remover
+                    </button>
                   </div>
                 ))
               )}
             </div>
-            <Button variant="outline" size="sm" className="mt-4 gap-2 nexus-input">
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="mt-4 gap-2 nexus-input"
+              onClick={() => setPixModalOpen(true)}
+            >
               <Plus className="h-3 w-3" />
               Adicionar Chave PIX
             </Button>
           </motion.div>
+
+          <Dialog open={pixModalOpen} onOpenChange={setPixModalOpen}>
+            <DialogContent className="max-w-md">
+              <DialogHeader>
+                <DialogTitle>Adicionar chave PIX</DialogTitle>
+              </DialogHeader>
+              <div className="space-y-3">
+                <div className="grid gap-1.5">
+                  <Label className="text-xs">Banco</Label>
+                  <Input
+                    value={pixForm.bank_name}
+                    onChange={(e) => setPixForm((p) => ({ ...p, bank_name: e.target.value }))}
+                    placeholder="Ex: Nubank"
+                  />
+                </div>
+                <div className="grid gap-1.5">
+                  <Label className="text-xs">Titular</Label>
+                  <Input
+                    value={pixForm.account_holder}
+                    onChange={(e) => setPixForm((p) => ({ ...p, account_holder: e.target.value }))}
+                    placeholder="Nome do titular"
+                  />
+                </div>
+                <div className="grid gap-1.5">
+                  <Label className="text-xs">Tipo de chave</Label>
+                  <Select
+                    value={pixForm.pix_key_type}
+                    onValueChange={(v) => setPixForm((p) => ({ ...p, pix_key_type: v }))}
+                  >
+                    <SelectTrigger className="h-9">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="CPF">CPF</SelectItem>
+                      <SelectItem value="CNPJ">CNPJ</SelectItem>
+                      <SelectItem value="Email">Email</SelectItem>
+                      <SelectItem value="Telefone">Telefone</SelectItem>
+                      <SelectItem value="Aleatoria">Aleatória</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div className="grid gap-1.5">
+                  <Label className="text-xs">Chave</Label>
+                  <Input
+                    value={pixForm.pix_key}
+                    onChange={(e) => setPixForm((p) => ({ ...p, pix_key: e.target.value }))}
+                    placeholder="Digite a chave PIX"
+                  />
+                </div>
+              </div>
+              <DialogFooter className="mt-4">
+                <Button type="button" variant="outline" onClick={() => setPixModalOpen(false)}>
+                  Cancelar
+                </Button>
+                <Button
+                  type="button"
+                  onClick={async () => {
+                    if (!pixForm.bank_name.trim() || !pixForm.account_holder.trim() || !pixForm.pix_key.trim()) {
+                      toast.error("Preencha banco, titular e chave");
+                      return;
+                    }
+                    try {
+                      await insertPixKey(pixForm);
+                      toast.success("Chave PIX adicionada");
+                      queryClient.invalidateQueries({ queryKey: ["pix-keys"] });
+                      setPixModalOpen(false);
+                      setPixForm({ bank_name: "", account_holder: "", pix_key_type: "CNPJ", pix_key: "" });
+                    } catch (e) {
+                      toast.error(e instanceof Error ? e.message : "Erro ao adicionar chave PIX");
+                    }
+                  }}
+                >
+                  Salvar
+                </Button>
+              </DialogFooter>
+            </DialogContent>
+          </Dialog>
         </TabsContent>
 
         <TabsContent value="categorias" className="mt-4">
