@@ -23,16 +23,14 @@ import { motion } from "framer-motion";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { deactivatePixKey, fetchPixKeys, insertPixKey } from "@/api/pix-keys";
 import { fetchExpenseCategories } from "@/api/categories";
-import { getEvolutionConfig, saveEvolutionConfig } from "@/lib/evolution-settings";
+import {
+  getEvolutionConfig,
+  saveEvolutionConfig,
+  EVOLUTION_INSTANCE_IDS,
+  getApiKeyForEvolutionInstance,
+} from "@/lib/evolution-settings";
 import { getSupabaseCompany } from "@/lib/supabase";
 import { useAuth } from "@/contexts/AuthContext";
-import {
-  fetchWhatsAppSchedules,
-  insertWhatsAppSchedule,
-  updateWhatsAppSchedule,
-  deleteWhatsAppSchedule,
-  migrateLocalSchedulesToSupabase,
-} from "@/api/whatsapp-schedules";
 import { useState, useCallback, useRef, useMemo, useEffect } from "react";
 import { toast } from "sonner";
 import { fetchLoansForAutomation, type AutomationLoan } from "@/api/automation";
@@ -52,28 +50,11 @@ import {
   type PixInfo,
 } from "@/lib/whatsapp-messages";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { type Agendamento, type DiaSemana, type FiltroAgendamento } from "@/lib/agendamentos";
 import { PDF_BRAND } from "@/lib/pdf-branding";
 import { jsPDF } from "jspdf";
 import * as XLSX from "xlsx-js-style";
 
-const EMPRESAS = ["FRANCA", "Litoral", "Mogiana", "Imperatriz"];
-const DIAS_LABELS: { value: DiaSemana; label: string }[] = [
-  { value: "todos", label: "Todos os Dias" },
-  { value: "segunda", label: "Segunda-feira" },
-  { value: "terca", label: "Terça-feira" },
-  { value: "quarta", label: "Quarta-feira" },
-  { value: "quinta", label: "Quinta-feira" },
-  { value: "sexta", label: "Sexta-feira" },
-  { value: "sabado", label: "Sábado" },
-  { value: "domingo", label: "Domingo" },
-];
-const FILTROS_OPCOES: { value: FiltroAgendamento; label: string }[] = [
-  { value: "vencidos", label: "Vencidos" },
-  { value: "vencem_hoje", label: "Vencem hoje" },
-  { value: "lembretes", label: "Lembretes (vencem amanhã)" },
-  { value: "parcelamentos", label: "Parcelamentos" },
-];
+// Agendamentos removidos.
 
 function formatPreviewCurrency(n: number) {
   return n.toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
@@ -103,6 +84,30 @@ function labelTipoAutomacao(t: AutomationLoan["type"]): string {
     default:
       return t;
   }
+}
+
+// Agendamentos/envios automáticos removidos do app.
+// Stubs permissivos para não quebrar o build enquanto removemos a UI antiga por completo.
+type DiaSemana = any;
+type FiltroAgendamento = any;
+type Agendamento = any;
+const EMPRESAS: any[] = [];
+const DIAS_LABELS: any[] = [];
+const FILTROS_OPCOES: any[] = [];
+async function fetchWhatsAppSchedules(..._args: any[]): Promise<any[]> {
+  return [];
+}
+async function insertWhatsAppSchedule(..._args: any[]): Promise<void> {
+  throw new Error("Agendamentos removidos");
+}
+async function updateWhatsAppSchedule(..._args: any[]): Promise<void> {
+  throw new Error("Agendamentos removidos");
+}
+async function deleteWhatsAppSchedule(..._args: any[]): Promise<void> {
+  throw new Error("Agendamentos removidos");
+}
+async function migrateLocalSchedulesToSupabase(..._args: any[]): Promise<number> {
+  return 0;
 }
 
 function NovoAgendamentoModal({
@@ -295,6 +300,9 @@ function NovoAgendamentoModal({
           <div>
             <Label className="text-xs">Instância WhatsApp</Label>
             <Input value={evolution.instance} disabled className="mt-1 bg-muted" />
+            <p className="text-[10px] text-muted-foreground mt-1">
+              Defina a instância na seção Evolution API acima e salve.
+            </p>
           </div>
           <div>
             <Label className="text-xs">Empresa</Label>
@@ -1010,7 +1018,7 @@ export default function Configuracoes() {
               Evolution API
             </h3>
             <p className="text-xs text-muted-foreground mb-4">
-              Configure a conexão com a Evolution API para cobranças via WhatsApp.
+              Escolha a instância; a API key é aplicada automaticamente para cada uma (omnibot2, vinicius, douglas).
             </p>
             <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
               <div>
@@ -1023,22 +1031,35 @@ export default function Configuracoes() {
                 />
               </div>
               <div>
-                <Label className="text-xs">API Key</Label>
-                <Input
-                  type="password"
-                  value={evolution.apiKey}
-                  onChange={(e) => setEvolution((c) => ({ ...c, apiKey: e.target.value }))}
-                  placeholder="Sua API Key"
-                  className="mt-1 h-8 text-xs"
-                />
+                <Label className="text-xs">Instância</Label>
+                <Select
+                  value={evolution.instance}
+                  onValueChange={(v) =>
+                    setEvolution((c) => ({
+                      ...c,
+                      instance: v,
+                      apiKey: getApiKeyForEvolutionInstance(v),
+                    }))
+                  }
+                >
+                  <SelectTrigger className="mt-1 h-8 text-xs">
+                    <SelectValue placeholder="Instância" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {EVOLUTION_INSTANCE_IDS.map((id) => (
+                      <SelectItem key={id} value={id}>
+                        {id}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
               </div>
               <div>
-                <Label className="text-xs">Instância</Label>
+                <Label className="text-xs">API Key</Label>
                 <Input
-                  value={evolution.instance}
-                  onChange={(e) => setEvolution((c) => ({ ...c, instance: e.target.value }))}
-                  placeholder="nexussistema"
-                  className="mt-1 h-8 text-xs"
+                  readOnly
+                  value="Vinculada automaticamente à instância"
+                  className="mt-1 h-8 text-xs bg-muted"
                 />
               </div>
             </div>
@@ -1222,7 +1243,9 @@ export default function Configuracoes() {
                   </>
                 ) : (
                   <div className="text-center py-6">
-                    <p className="text-sm text-destructive mb-2">{qrResult?.error || "Erro ao carregar QR"}</p>
+                    <p className="text-sm text-destructive mb-2">
+                      {("error" in (qrResult as any) && (qrResult as any).error) || "Erro ao carregar QR"}
+                    </p>
                     <Button variant="outline" size="sm" onClick={() => refetchQr()} className="gap-2">
                       <RefreshCw className="h-3 w-3" />
                       Tentar novamente
@@ -1232,80 +1255,6 @@ export default function Configuracoes() {
               </div>
             </motion.div>
           )}
-
-          {/* Agendamentos — persistidos no Supabase; execução no servidor (PM2/cron + scripts/whatsapp-scheduler.mjs) */}
-          <motion.div
-            initial={{ opacity: 0, y: 8 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={{ delay: 0.05 }}
-            className="glass-card p-5"
-          >
-            <div className="flex items-center justify-between mb-4">
-              <div>
-                <h3 className="text-sm font-semibold text-foreground">Agendamentos de envio</h3>
-                <p className="text-xs text-muted-foreground">
-                  Roda no servidor (não depende do seu PC). A Evolution API e o WhatsApp precisam estar online no mesmo horário.
-                </p>
-              </div>
-              <NovoAgendamentoModal
-                evolution={evolution}
-                pixInfo={getPixInfoForAutomation()}
-                onCreated={() => void refetchAgendamentos()}
-                open={modalAgendamento}
-                onOpenChange={setModalAgendamento}
-              />
-            </div>
-            {!user?.id ? (
-              <p className="text-sm text-muted-foreground py-4">Faça login para gerenciar agendamentos na nuvem.</p>
-            ) : loadingAgendamentos ? (
-              <p className="text-sm text-muted-foreground py-6">Carregando agendamentos...</p>
-            ) : agendamentos.length === 0 ? (
-              <p className="text-sm text-muted-foreground py-6">Nenhum agendamento criado. Clique em Novo Agendamento.</p>
-            ) : (
-                <div className="space-y-3">
-                  {agendamentos.map((a) => (
-                    <div
-                      key={a.id}
-                      className="flex items-center justify-between py-3 px-3 rounded-lg border border-border/50 bg-muted/30"
-                    >
-                      <div>
-                        <p className="font-medium text-foreground">{a.nome}</p>
-                        <p className="text-xs text-muted-foreground">
-                          {a.horario} • {formatDias(a.dias)} • {formatFiltros(a.filtros)}
-                        </p>
-                        <p className="text-xs text-muted-foreground mt-0.5">
-                          Empresa: {a.empresa} • Delay: {a.delayMinutos} min
-                        </p>
-                        <p className="text-xs text-muted-foreground mt-0.5">
-                          Clientes:{" "}
-                          {a.targetClientIds?.length
-                            ? `${a.targetClientIds.length} restrito(s)`
-                            : "todos os elegíveis pelos filtros"}
-                        </p>
-                      </div>
-                      <div className="flex items-center gap-2">
-                        <Button
-                          type="button"
-                          variant={a.ativo ? "secondary" : "outline"}
-                          size="icon"
-                          className="h-8 w-8"
-                          title={a.ativo ? "Pausar agendamento" : "Iniciar agendamento"}
-                          onClick={() => toggleAgendamentoAtivo(a)}
-                        >
-                          {a.ativo ? <Pause className="h-4 w-4" /> : <Play className="h-4 w-4" />}
-                        </Button>
-                        <button
-                          className="text-xs text-muted-foreground hover:text-destructive"
-                          onClick={() => handleRemoveAgendamento(a)}
-                        >
-                          Remover
-                        </button>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              )}
-          </motion.div>
 
           {/* Automação manual */}
           <motion.div

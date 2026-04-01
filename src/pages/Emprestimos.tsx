@@ -83,18 +83,26 @@ function isTerm20Days(loanDate: string, dueDate: string): boolean {
   return diff >= 18 && diff <= 22;
 }
 
+function todayInSaoPauloYmd(): string {
+  // Evita bug de fuso (UTC/local) que marca vencimento de hoje como vencido.
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Sao_Paulo",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(new Date());
+}
+
 function getLoanStatusFromDueDate(dueDate: string, dbStatus: string | null): string {
   if (dbStatus === "paid") return "paid";
   if (dbStatus === "cancelled") return "cancelled";
 
-  if (!dueDate) return "active";
-  const due = new Date(String(dueDate).split("T")[0]);
-  const today = new Date();
-  const dueNorm = new Date(due.getFullYear(), due.getMonth(), due.getDate());
-  const todayNorm = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+  const dueYmd = String(dueDate || "").split("T")[0];
+  if (!dueYmd) return "active";
+  const todayYmd = todayInSaoPauloYmd();
 
-  if (dueNorm.getTime() < todayNorm.getTime()) return "overdue";
-  if (dueNorm.getTime() === todayNorm.getTime()) return "due_today";
+  if (dueYmd < todayYmd) return "overdue";
+  if (dueYmd === todayYmd) return "due_today";
   return "active";
 }
 
@@ -172,6 +180,8 @@ function LoanActionButton({
 export default function Emprestimos() {
   const [statusFilter, setStatusFilter] = useState("all");
   const [search, setSearch] = useState("");
+  const [periodFrom, setPeriodFrom] = useState("");
+  const [periodTo, setPeriodTo] = useState("");
   const [editOpen, setEditOpen] = useState(false);
   const [registerPaymentOpen, setRegisterPaymentOpen] = useState(false);
   const [whatsappOpen, setWhatsappOpen] = useState(false);
@@ -232,8 +242,8 @@ export default function Emprestimos() {
   const isParcelamentos = statusFilter === "parcelamentos";
 
   const { data, isLoading, error } = useQuery({
-    queryKey: ["loans", statusFilter, page, search],
-    queryFn: () => fetchLoans(statusFilter, page, search),
+    queryKey: ["loans", statusFilter, page, search, periodFrom, periodTo],
+    queryFn: () => fetchLoans(statusFilter, page, search, { periodFrom, periodTo }),
     enabled: !isParcelamentos,
     /** Evita desmontar a página a cada tecla na busca (queryKey muda e isLoading ficava true). */
     placeholderData: keepPreviousData,
@@ -296,6 +306,7 @@ export default function Emprestimos() {
   const [emergencyContacts, setEmergencyContacts] = useState<Array<{ id: string; name: string; phone: string }>>([]);
 
   // Quando `search` está preenchido, a busca é feita no backend (por CPF ou nome do cliente).
+  const todayYmd = toInputDate(new Date().toISOString());
   const filtered = loans;
 
   const searchLower = search.trim().toLowerCase();
@@ -978,6 +989,46 @@ export default function Emprestimos() {
               <SelectItem value="cancelled">Cancelados</SelectItem>
             </SelectContent>
           </Select>
+          {!isParcelamentos && (
+            <div className="flex items-center gap-2 flex-wrap">
+              <div className="flex items-center gap-2">
+                <Label className="text-[10px] text-muted-foreground">Período</Label>
+                <Input
+                  type="date"
+                  className="h-8 text-xs nexus-input w-[140px]"
+                  value={periodFrom}
+                  onChange={(e) => {
+                    setPeriodFrom(e.target.value);
+                    setPage(1);
+                  }}
+                />
+                <span className="text-xs text-muted-foreground">até</span>
+                <Input
+                  type="date"
+                  className="h-8 text-xs nexus-input w-[140px]"
+                  value={periodTo}
+                  onChange={(e) => {
+                    setPeriodTo(e.target.value);
+                    setPage(1);
+                  }}
+                />
+              </div>
+              {(periodFrom || periodTo) && (
+                <Button
+                  type="button"
+                  variant="outline"
+                  className="h-8 text-xs"
+                  onClick={() => {
+                    setPeriodFrom("");
+                    setPeriodTo("");
+                    setPage(1);
+                  }}
+                >
+                  Limpar
+                </Button>
+              )}
+            </div>
+          )}
         </div>
 
         <div className="overflow-x-auto">

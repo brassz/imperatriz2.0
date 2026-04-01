@@ -2,7 +2,7 @@ import { memo } from "react";
 import {
   LayoutDashboard, Users, Landmark, CalendarCheck, CalendarDays, CreditCard,
   AlertTriangle, Wallet, Receipt, TrendingUp, History, IdCard, Sparkles,
-  BarChart3, FileText, Settings, UserCog, ChevronLeft, LogOut
+  BarChart3, FileText, Settings, UserCog, ChevronLeft, LogOut, Clock
 } from "lucide-react";
 import { NavLink } from "@/components/NavLink";
 import { useAuth } from "@/contexts/AuthContext";
@@ -34,6 +34,7 @@ const financialItems = [
 const systemItems = [
   { title: "Relatórios", url: "/relatorios", icon: BarChart3 },
   { title: "PDFs", url: "/pdfs", icon: FileText },
+  { title: "Envios automáticos", url: "/envios-automaticos", icon: Clock },
   { title: "Configurações", url: "/configuracoes", icon: Settings },
   { title: "Usuários", url: "/usuarios", icon: UserCog },
 ];

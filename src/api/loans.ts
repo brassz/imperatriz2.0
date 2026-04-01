@@ -197,7 +197,12 @@ export async function resolvePaidLoanClientNames(paidRows: Array<Record<string, 
   return { clientNameByLoanId, clientIdByLoanId };
 }
 
-export async function fetchLoans(statusFilter?: string, page = 1) {
+export async function fetchLoans(
+  statusFilter?: string,
+  page = 1,
+  search?: string,
+  opts?: { periodFrom?: string; periodTo?: string }
+) {
   const client = (c: unknown) => (c as { name?: string; cpf?: string; phone?: string; email?: string }) || {};
 
   let items: Array<Record<string, unknown>> = [];
@@ -205,19 +210,39 @@ export async function fetchLoans(statusFilter?: string, page = 1) {
 
   // Lote que respeita limite por requisição do Supabase (ex.: 50); múltiplas requisições até trazer tudo
   const CHUNK = 50;
-  const searchTerm = (arguments.length >= 3 ? (arguments[2] as string | undefined) : undefined) || "";
-  const search = searchTerm.trim();
+  const searchTerm = (search || "").trim();
+  const periodFrom = String(opts?.periodFrom || "").trim();
+  const periodTo = String(opts?.periodTo || "").trim();
+  const todayYmd = new Date().toISOString().split("T")[0];
+  const tomorrowYmd = (() => {
+    const d = new Date(todayYmd + "T12:00:00");
+    d.setDate(d.getDate() + 1);
+    return d.toISOString().split("T")[0];
+  })();
+
+  function applyCommonLoanFilters<T extends ReturnType<typeof supabase.from>>(
+    q: any,
+    extra?: { includeInstallments?: boolean }
+  ) {
+    let query = q;
+    // normal: não listar empréstimos já vinculados a parcelamento
+    if (!extra?.includeInstallments) query = query.neq("status", "installments");
+    if (periodFrom) query = query.gte("loan_date", periodFrom);
+    if (periodTo) query = query.lte("loan_date", periodTo);
+    if (searchClientIds) query = query.in("client_id", searchClientIds);
+    return query;
+  }
 
   async function resolveClientIdsForSearch(): Promise<string[] | null> {
-    if (!search) return null;
-    const digits = search.replace(/\D/g, "");
+    if (!searchTerm) return null;
+    const digits = searchTerm.replace(/\D/g, "");
     const isCpf = digits.length === 11;
 
     let q = supabase.from("clients").select("id");
     if (isCpf) {
       q = q.eq("cpf", digits);
     } else {
-      q = q.ilike("name", `%${search}%`);
+      q = q.ilike("name", `%${searchTerm}%`);
     }
     const { data, error } = await q.limit(500);
     if (error) throw error;
@@ -228,11 +253,16 @@ export async function fetchLoans(statusFilter?: string, page = 1) {
   const searchClientIds = await resolveClientIdsForSearch();
 
   if (statusFilter === "paid") {
-    const { data: paidData, error: paidErr } = await supabase
+    let q = supabase
       .from("paid_loans")
       .select("loan_id, client_id, original_amount, interest_rate, loan_date, due_date, paid_date")
       .order("paid_date", { ascending: false })
       .limit(10000);
+    if (periodFrom) q = q.gte("loan_date", periodFrom);
+    if (periodTo) q = q.lte("loan_date", periodTo);
+    // paid_loans tem client_id (usado em markLoanAsPaid); filtra para busca por cliente
+    if (searchClientIds) q = q.in("client_id", searchClientIds);
+    const { data: paidData, error: paidErr } = await q;
 
     if (paidErr) throw paidErr;
 
@@ -276,6 +306,8 @@ export async function fetchLoans(statusFilter?: string, page = 1) {
           .select("id, client_id, amount, interest_rate, loan_date, due_date, status, created_at, clients (name, cpf, email, phone)")
           .neq("status", "installments")
           .order("created_at", { ascending: false });
+        if (periodFrom) q = q.gte("loan_date", periodFrom);
+        if (periodTo) q = q.lte("loan_date", periodTo);
         if (searchClientIds) q = q.in("client_id", searchClientIds);
         const { data: chunk, error } = await q.range(offsetLoans, offsetLoans + CHUNK - 1);
         if (error) throw error;
@@ -289,6 +321,8 @@ export async function fetchLoans(statusFilter?: string, page = 1) {
           .from("paid_loans")
           .select("loan_id, client_id, original_amount, interest_rate, loan_date, due_date, paid_date")
           .order("paid_date", { ascending: false });
+        if (periodFrom) q = q.gte("loan_date", periodFrom);
+        if (periodTo) q = q.lte("loan_date", periodTo);
         // paid_loans tem client_id (usado em markLoanAsPaid); filtra para busca por cliente
         if (searchClientIds) q = q.in("client_id", searchClientIds);
         const { data: chunk, error } = await q.range(offsetPaid, offsetPaid + CHUNK - 1);
@@ -329,9 +363,42 @@ export async function fetchLoans(statusFilter?: string, page = 1) {
         created_at: rec.paid_date,
       });
     }
+    // Ordem global:
+    // 1) vence hoje (não quitado/cancelado)
+    // 2) próximos vencimentos (due_date >= amanhã)
+    // 3) vencidos (due_date < hoje)
+    // 4) paid/cancelled por created_at desc (paid_date / created_at)
     const merged = Array.from(byId.values()).sort((a, b) => {
-      const dA = new Date(String(a.created_at || "")).getTime();
-      const dB = new Date(String(b.created_at || "")).getTime();
+      const aStatus = String(a.status || "");
+      const bStatus = String(b.status || "");
+      const aDue = String(a.due_date || "").split("T")[0];
+      const bDue = String(b.due_date || "").split("T")[0];
+      const aClosed = aStatus === "paid" || aStatus === "cancelled";
+      const bClosed = bStatus === "paid" || bStatus === "cancelled";
+      const aIsDueToday = !aClosed && aDue === todayYmd;
+      const bIsDueToday = !bClosed && bDue === todayYmd;
+      if (aIsDueToday !== bIsDueToday) return aIsDueToday ? -1 : 1;
+
+      const aIsFuture = !aClosed && aDue >= tomorrowYmd;
+      const bIsFuture = !bClosed && bDue >= tomorrowYmd;
+      if (aIsFuture !== bIsFuture) return aIsFuture ? -1 : 1;
+
+      const aIsPast = !aClosed && aDue !== "" && aDue < todayYmd;
+      const bIsPast = !bClosed && bDue !== "" && bDue < todayYmd;
+      if (aIsPast !== bIsPast) return aIsPast ? -1 : 1;
+
+      // dentro do futuro: por vencimento asc
+      if (aIsFuture && bIsFuture) {
+        if (aDue !== bDue) return aDue.localeCompare(bDue);
+      }
+
+      // dentro do passado: vencimento desc (mais recente primeiro)
+      if (aIsPast && bIsPast) {
+        if (aDue !== bDue) return bDue.localeCompare(aDue);
+      }
+
+      const dA = new Date(String(a.created_at || "")).getTime() || 0;
+      const dB = new Date(String(b.created_at || "")).getTime() || 0;
       return dB - dA;
     });
     total = merged.length;
@@ -351,6 +418,8 @@ export async function fetchLoans(statusFilter?: string, page = 1) {
         .in("status", ["active", "partial_paid", "overdue"])
         .lt("due_date", today)
         .order("due_date", { ascending: true });
+      if (periodFrom) q = q.gte("loan_date", periodFrom);
+      if (periodTo) q = q.lte("loan_date", periodTo);
       if (searchClientIds) q = q.in("client_id", searchClientIds);
       const { data: chunk, error } = await q.range(offset, offset + CHUNK - 1);
       if (error) throw error;
@@ -365,33 +434,126 @@ export async function fetchLoans(statusFilter?: string, page = 1) {
     const start = (page - 1) * PAGE_SIZE;
     items = overdueItems.slice(start, start + PAGE_SIZE);
   } else {
-    let query = supabase
+    // Ordenação global com paginação:
+    // - 1) vence hoje (hoje <= due_date < amanhã)
+    // - 2) próximos vencimentos (due_date >= amanhã) por due_date asc (e created_at desc)
+    // - 3) vencidos (due_date < hoje) por due_date desc (mais recente primeiro)
+    // Para suportar paginação, buscamos buckets separadamente.
+
+    const statusScope =
+      statusFilter === "active"
+        ? ["active", "overdue", "partial_paid"]
+        : statusFilter
+          ? [statusFilter]
+          : null;
+
+    // Bucket 1: vence hoje
+    let dueTodayQ = supabase
       .from("loans")
       .select(
         "id, client_id, amount, interest_rate, loan_date, due_date, status, created_at, clients (name, cpf, email, phone)",
         { count: "exact" }
-      )
-      .order("created_at", { ascending: false })
-      .range((page - 1) * PAGE_SIZE, page * PAGE_SIZE - 1);
+      );
+    dueTodayQ = applyCommonLoanFilters(dueTodayQ);
+    if (statusScope) dueTodayQ = dueTodayQ.in("status", statusScope);
+    dueTodayQ = dueTodayQ
+      .neq("status", "paid")
+      .neq("status", "cancelled")
+      .gte("due_date", todayYmd)
+      .lt("due_date", tomorrowYmd)
+      .order("created_at", { ascending: false });
 
-    if (searchClientIds) {
-      query = query.in("client_id", searchClientIds);
+    const { count: dueTodayCount, error: dueTodayErr } = await dueTodayQ.range(0, 0);
+    if (dueTodayErr) throw dueTodayErr;
+    const totalDueToday = dueTodayCount ?? 0;
+
+    // Bucket 2: próximos vencimentos (>= amanhã)
+    let futureQ = supabase
+      .from("loans")
+      .select(
+        "id, client_id, amount, interest_rate, loan_date, due_date, status, created_at, clients (name, cpf, email, phone)",
+        { count: "exact" }
+      );
+    futureQ = applyCommonLoanFilters(futureQ);
+    if (statusScope) futureQ = futureQ.in("status", statusScope);
+    futureQ = futureQ
+      .neq("status", "paid")
+      .neq("status", "cancelled")
+      .gte("due_date", tomorrowYmd)
+      .order("due_date", { ascending: true })
+      .order("created_at", { ascending: false });
+
+    const { count: futureCount, error: futureErr } = await futureQ.range(0, 0);
+    if (futureErr) throw futureErr;
+    const totalFuture = futureCount ?? 0;
+
+    // Bucket 3: vencidos (< hoje)
+    let pastQ = supabase
+      .from("loans")
+      .select(
+        "id, client_id, amount, interest_rate, loan_date, due_date, status, created_at, clients (name, cpf, email, phone)",
+        { count: "exact" }
+      );
+    pastQ = applyCommonLoanFilters(pastQ);
+    if (statusScope) pastQ = pastQ.in("status", statusScope);
+    pastQ = pastQ
+      .neq("status", "paid")
+      .neq("status", "cancelled")
+      .lt("due_date", todayYmd)
+      .order("due_date", { ascending: false })
+      .order("created_at", { ascending: false });
+
+    const { count: pastCount, error: pastErr } = await pastQ.range(0, 0);
+    if (pastErr) throw pastErr;
+    const totalPast = pastCount ?? 0;
+
+    total = totalDueToday + totalFuture + totalPast;
+
+    const start = (page - 1) * PAGE_SIZE;
+    const end = start + PAGE_SIZE - 1;
+
+    const pageItems: Array<Record<string, unknown>> = [];
+
+    // Puxar do bucket 1
+    if (start < totalDueToday) {
+      const a = start;
+      const b = Math.min(end, totalDueToday - 1);
+      const { data: dueTodayData, error: e1 } = await dueTodayQ.range(a, b);
+      if (e1) throw e1;
+      pageItems.push(...((dueTodayData || []) as Array<Record<string, unknown>>));
     }
 
-    if (statusFilter) {
-      // No sistema, "Ativos" inclui também vencidos e pago parcial (em andamento).
-      if (statusFilter === "active") {
-        query = query.in("status", ["active", "overdue", "partial_paid"]);
-      } else {
-        query = query.eq("status", statusFilter);
+    // Bucket 2 (future)
+    let remainingSlots = PAGE_SIZE - pageItems.length;
+    if (remainingSlots > 0) {
+      const futureStart = Math.max(0, start - totalDueToday);
+      const futureEnd = futureStart + remainingSlots - 1;
+      if (futureStart < totalFuture) {
+        const { data: futureData, error: e2 } = await futureQ.range(
+          futureStart,
+          Math.min(futureEnd, totalFuture - 1),
+        );
+        if (e2) throw e2;
+        pageItems.push(...((futureData || []) as Array<Record<string, unknown>>));
       }
     }
 
-    const { data, error, count } = await query;
-    if (error) throw error;
+    // Bucket 3 (past)
+    remainingSlots = PAGE_SIZE - pageItems.length;
+    if (remainingSlots > 0) {
+      const pastStart = Math.max(0, start - totalDueToday - totalFuture);
+      const pastEnd = pastStart + remainingSlots - 1;
+      if (pastStart < totalPast) {
+        const { data: pastData, error: e3 } = await pastQ.range(
+          pastStart,
+          Math.min(pastEnd, totalPast - 1),
+        );
+        if (e3) throw e3;
+        pageItems.push(...((pastData || []) as Array<Record<string, unknown>>));
+      }
+    }
 
-    items = await hydrateClientsForLoans((data || []) as Array<Record<string, unknown>>);
-    total = count ?? 0;
+    items = await hydrateClientsForLoans(pageItems);
   }
 
   await attachRemainingAmounts(items);

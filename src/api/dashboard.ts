@@ -44,25 +44,52 @@ function computeLoanRemaining(
 }
 
 export async function fetchDashboardMetrics() {
-  const [
-    { count: clientsCount },
-    { data: loansData },
-    { count: activeLoansCount },
-    paidLoansResult,
-    overdueLoansTableResult,
-  ] = await Promise.all([
-    supabase.from("clients").select("id", { count: "exact", head: true }),
-    supabase
-      .from("loans")
-      .select("id, amount, interest_rate, status, due_date")
-      .in("status", ["active", "partial_paid", "overdue"]),
-    supabase
-      .from("loans")
-      .select("id", { count: "exact", head: true })
-      .in("status", ["active", "partial_paid"]),
-    supabase.from("paid_loans").select("loan_id, original_amount"),
-    supabase.from("overdue_loans").select("loan_id, remaining_amount, amount"),
-  ]);
+  // Importante: a dashboard não pode “zerar tudo” só porque UMA tabela não existe em algum ambiente.
+  // Por isso, cada bloco é tolerante a erro e o cálculo segue com o que der para obter.
+
+  const clientsCount = await (async () => {
+    try {
+      const { count } = await supabase.from("clients").select("id", { count: "exact", head: true });
+      return count ?? 0;
+    } catch {
+      return 0;
+    }
+  })();
+
+  const loansData = await (async () => {
+    try {
+      const { data, error } = await supabase
+        .from("loans")
+        .select("id, amount, interest_rate, status, due_date")
+        .in("status", ["active", "partial_paid", "overdue"]);
+      if (error) throw error;
+      return (data || []) as Array<Record<string, unknown>>;
+    } catch {
+      return [] as Array<Record<string, unknown>>;
+    }
+  })();
+
+  const activeLoansCount = await (async () => {
+    try {
+      const { count } = await supabase
+        .from("loans")
+        .select("id", { count: "exact", head: true })
+        .in("status", ["active", "partial_paid"]);
+      return count ?? 0;
+    } catch {
+      return 0;
+    }
+  })();
+
+  const paidLoansData = await (async () => {
+    try {
+      const { data, error } = await supabase.from("paid_loans").select("loan_id, original_amount");
+      if (error) throw error;
+      return (data || []) as Array<Record<string, unknown>>;
+    } catch {
+      return [] as Array<Record<string, unknown>>;
+    }
+  })();
 
   const activeLoans = (loansData || []) as Array<{
     id: string;
@@ -71,7 +98,6 @@ export async function fetchDashboardMetrics() {
     status: string;
     due_date?: string;
   }>;
-  const paidLoansData = (paidLoansResult as { data?: Array<{ loan_id: string }> }).data || [];
   const paidLoanIds = new Set(paidLoansData.map((p) => String(p.loan_id)).filter(Boolean));
   const paidLoansCount = paidLoanIds.size;
 
@@ -92,11 +118,18 @@ export async function fetchDashboardMetrics() {
 
   if (activeLoans.length > 0) {
     const loanIds = activeLoans.map((l) => l.id);
-    const { data: paymentsData } = await supabase
-      .from("payments")
-      .select("loan_id, amount, payment_type, fine_amount")
-      .in("loan_id", loanIds)
-      .order("created_at", { ascending: true });
+    // Evita erro/performance ruim com `.in("loan_id", [...muitos])` (pode estourar limites).
+    const paymentsData: Array<Record<string, unknown>> = [];
+    const CHUNK = 200;
+    for (let i = 0; i < loanIds.length; i += CHUNK) {
+      const chunk = loanIds.slice(i, i + CHUNK);
+      const { data } = await supabase
+        .from("payments")
+        .select("loan_id, amount, payment_type, fine_amount")
+        .in("loan_id", chunk)
+        .order("created_at", { ascending: true });
+      if (data?.length) paymentsData.push(...(data as Array<Record<string, unknown>>));
+    }
 
     const paymentsByLoan: Record<string, Array<{ amount: number; payment_type: string; fine_amount: number }>> = {};
     for (const p of paymentsData || []) {
@@ -127,11 +160,7 @@ export async function fetchDashboardMetrics() {
     }
   }
 
-  // Também buscar vencidos da tabela overdue_loans (pode não existir em alguns ambientes)
-  const overdueLoansTable = (overdueLoansTableResult as { data?: Array<Record<string, unknown>>; error?: unknown })?.data ?? [];
-  for (const row of overdueLoansTable) {
-    vencidosValor += parseFloat(String(row.remaining_amount ?? row.amount ?? 0)) || 0;
-  }
+  // OBS: não usar view `overdue_loans` aqui. Em alguns ambientes ela não existe/colunas divergem e gera 400 no PostgREST.
 
   // Empréstimos Quitados (valor): soma do capital original dos quitados
   const totalQuitadosValor = (paidLoansData || []).reduce(
@@ -186,20 +215,34 @@ export async function fetchDashboardMetrics() {
     // tabela pode não existir
   }
 
-  let totalReceived = 0;
-  const { data: paymentsData } = await supabase.from("payments").select("amount");
-  if (paymentsData) {
-    totalReceived = paymentsData.reduce((s, p) => s + parseFloat(String(p.amount || 0)), 0);
-  }
+  // Totais via views (1 linha) — PostgREST aceita bem e é rápido.
+  const totalReceived = await (async () => {
+    try {
+      const { data, error } = await supabase
+        .from("dashboard_payments_totals")
+        .select("total_received")
+        .limit(1)
+        .maybeSingle();
+      if (error) throw error;
+      return parseFloat(String((data as { total_received?: unknown } | null)?.total_received || 0)) || 0;
+    } catch {
+      return 0;
+    }
+  })();
 
-  let expensesTotal = 0;
-  const { data: expensesData } = await supabase
-    .from("expenses")
-    .select("amount")
-    .neq("status", "cancelled");
-  if (expensesData) {
-    expensesTotal = expensesData.reduce((s, e) => s + parseFloat(String(e.amount || 0)), 0);
-  }
+  const expensesTotal = await (async () => {
+    try {
+      const { data, error } = await supabase
+        .from("dashboard_expenses_totals")
+        .select("expenses_total")
+        .limit(1)
+        .maybeSingle();
+      if (error) throw error;
+      return parseFloat(String((data as { expenses_total?: unknown } | null)?.expenses_total || 0)) || 0;
+    } catch {
+      return 0;
+    }
+  })();
 
   // Contagens por status (excluindo paid_loans)
   const activeLoansFiltered = (loansData || []).filter(
@@ -217,7 +260,7 @@ export async function fetchDashboardMetrics() {
     totalLoaned,
     jurosRestante,
     totalRestante,
-    activeLoans: ativosCount + partialPaidCount + installmentsCount,
+    activeLoans: ativosCount + partialPaidCount + parcelamentosCount,
     ativosCount,
     partialPaidCount,
     vencidosCount,
@@ -258,7 +301,7 @@ export async function fetchDashboardChartData(months = 6): Promise<ChartDataPoin
   const firstDate = new Date(today.getFullYear(), today.getMonth() - months, 1);
   const firstDateStr = firstDate.toISOString().split("T")[0];
 
-  const [loansRes, paymentsRes, expensesRes, finesRes] = await Promise.all([
+  const [loansRes, paymentsRes, finesRes] = await Promise.all([
     supabase
       .from("loans")
       .select("id, amount, interest_rate, loan_date")
@@ -268,19 +311,42 @@ export async function fetchDashboardChartData(months = 6): Promise<ChartDataPoin
       .select("loan_id, amount, payment_date, payment_type, fine_amount, created_at")
       .limit(10000),
     supabase
-      .from("expenses")
-      .select("amount, expense_date")
-      .gte("expense_date", firstDateStr)
-      .neq("status", "cancelled"),
-    supabase
       .from("client_fines")
       .select("amount, created_at")
       .gte("created_at", `${firstDateStr}T00:00:00`),
   ]);
 
+  const expenses = await (async () => {
+    const filterCancelled = (rows: Array<{ expense_date?: string; status?: string }>) =>
+      rows.filter((e) => {
+        const d = String(e.expense_date || "").split("T")[0];
+        if (d < firstDateStr) return false;
+        return String(e.status || "") !== "cancelled";
+      });
+
+    let { data, error } = await supabase
+      .from("expenses")
+      .select("amount, expense_date, status")
+      .gte("expense_date", firstDateStr);
+    if (!error && data) return filterCancelled(data);
+
+    ({ data, error } = await supabase
+      .from("expenses")
+      .select("amount, expense_date")
+      .gte("expense_date", firstDateStr));
+    if (!error && data) return data;
+
+    ({ data, error } = await supabase.from("expenses").select("amount, expense_date, status").limit(10000));
+    if (!error && data) return filterCancelled(data);
+
+    ({ data, error } = await supabase.from("expenses").select("amount, expense_date").limit(10000));
+    if (!error && data) return filterCancelled(data);
+
+    return [];
+  })();
+
   const loans = loansRes.data || [];
   const payments = paymentsRes.data || [];
-  const expenses = expensesRes.data || [];
   const fines = finesRes.data || [];
 
   const loanIdsWithPaymentsInRange = new Set<string>();
