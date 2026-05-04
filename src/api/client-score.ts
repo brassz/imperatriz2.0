@@ -1,5 +1,20 @@
 /** Score do cliente 1–100 baseado em pagamentos, vencimentos e valores pagos */
 
+/** Dias em atraso até o contrato em aberto atingir penalidade máxima de pontualidade (antes disso o impacto sobe gradualmente). */
+const OVERDUE_FULL_PENALTY_DAYS = 30;
+
+function calendarDaysBetween(startYmd: string, endYmd: string): number {
+  const parse = (s: string) => {
+    const [y, m, d] = s.split("-").map(Number);
+    if (!y || !m || !d) return NaN;
+    return Date.UTC(y, m - 1, d);
+  };
+  const a = parse(startYmd);
+  const b = parse(endYmd);
+  if (Number.isNaN(a) || Number.isNaN(b)) return 0;
+  return Math.max(0, Math.floor((b - a) / 86_400_000));
+}
+
 export type ClientScoreResult = {
   score: number;
   label: "Excelente" | "Bom" | "Razoável" | "Risco";
@@ -52,6 +67,8 @@ export function calculateClientScore(history: HistoryForScore): ClientScoreResul
   let overdueCount = 0;
   let onTimeCount = 0;
   let totalExpected = 0;
+  /** Soma 0–1 por contrato: atraso em aberto sobe com os dias; quitado com atraso conta 1. */
+  let punctualityPenaltySum = 0;
 
   for (const loan of loans) {
     const amt = parseFloat(String(loan.amount || 0));
@@ -67,13 +84,17 @@ export function calculateClientScore(history: HistoryForScore): ClientScoreResul
         onTimeCount++;
       } else if (paidDate && dueDate && paidDate > dueDate) {
         overdueCount++;
+        punctualityPenaltySum += 1;
       }
-    } else if (loan.status === "cancelled") {
-      // não conta como pagamento nem vencido
+    } else if (loan.status === "cancelled" || loan.status === "finalized") {
+      // não conta como pagamento nem vencido em aberto
     } else {
       const dueDate = String(loan.due_date || "").split("T")[0];
       if (dueDate < todayStr) {
         overdueCount++;
+        const daysOver = calendarDaysBetween(dueDate, todayStr);
+        const gradual = Math.min(1, daysOver / OVERDUE_FULL_PENALTY_DAYS);
+        punctualityPenaltySum += gradual;
       } else {
         onTimeCount++;
       }
@@ -81,7 +102,10 @@ export function calculateClientScore(history: HistoryForScore): ClientScoreResul
   }
 
   const completionRatio = paidLoans / totalLoans;
-  const punctualityRatio = (totalLoans - overdueCount) / totalLoans;
+  const punctualityRatio = Math.max(
+    0,
+    Math.min(1, (totalLoans - punctualityPenaltySum) / totalLoans)
+  );
   const repaymentRatio = totalExpected > 0 ? Math.min(1, totalPaid / totalExpected) : 1;
 
   const completionScore = completionRatio * 40;

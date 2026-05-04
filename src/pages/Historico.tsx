@@ -9,6 +9,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { motion } from "framer-motion";
+import { paymentTypeLabel } from "@/lib/payment-type-label";
 import { useQuery } from "@tanstack/react-query";
 import { fetchClientsForSelect, fetchClientHistory } from "@/api/clients";
 import { fetchClientTags, type ClientTagRow } from "@/api/client-tags";
@@ -31,6 +32,7 @@ const statusLabels: Record<string, string> = {
   installments: "Parcelamento",
   paid: "Quitado",
   cancelled: "Cancelado",
+  finalized: "Finalizado",
   due_today: "Vence hoje",
 };
 
@@ -293,6 +295,7 @@ export default function Historico() {
                       <th className="text-left p-3 text-xs font-semibold text-muted-foreground uppercase">Valor</th>
                       <th className="text-left p-3 text-xs font-semibold text-muted-foreground uppercase">Multa</th>
                       <th className="text-left p-3 text-xs font-semibold text-muted-foreground uppercase">Tipo</th>
+                      <th className="text-left p-3 text-xs font-semibold text-muted-foreground uppercase">Observações</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -301,7 +304,12 @@ export default function Historico() {
                         <td className="p-3">{formatDate(String(p.payment_date || p.created_at || ""))}</td>
                         <td className="p-3 font-medium">{formatCurrency(parseFloat(String(p.amount || 0)))}</td>
                         <td className="p-3">{(p as { fine_amount?: number }).fine_amount ? formatCurrency(parseFloat(String((p as { fine_amount?: number }).fine_amount))) : "—"}</td>
-                        <td className="p-3 text-muted-foreground">{String(p.payment_type || "—")}</td>
+                        <td className="p-3 text-muted-foreground">{paymentTypeLabel(String(p.payment_type || ""))}</td>
+                        <td className="p-3 text-muted-foreground max-w-[420px]">
+                          <span className="block truncate">
+                            {String((p as { notes?: unknown }).notes || "").trim() || "—"}
+                          </span>
+                        </td>
                       </tr>
                     ))}
                   </tbody>

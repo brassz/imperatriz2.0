@@ -131,6 +131,8 @@ export async function fetchPaymentsByLoanId(loanId: string) {
     amount: parseFloat(String(p.amount || 0)),
     fine_amount: parseFloat(String((p as { fine_amount?: number }).fine_amount || 0)),
     payment_date: (p.payment_date || p.created_at || "").toString().split("T")[0],
+    /** ISO completo do servidor (data e hora do registro). */
+    created_at: String(p.created_at || ""),
     payment_type: p.payment_type || "—",
     notes: p.notes || "",
   }));

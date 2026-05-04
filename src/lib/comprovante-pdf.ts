@@ -6,13 +6,24 @@ import { jsPDF } from "jspdf";
 import { PDF_BRAND } from "./pdf-branding";
 import { addPdfFooter, addPdfHeader, formatCurrency, formatDateBR, getPdfMargin } from "./pdf-utils";
 
-function drawDiagonalWatermark(doc: jsPDF) {
+function slugifyTitlePart(s: string): string {
+  const out = String(s || "")
+    .trim()
+    .normalize("NFD")
+    .replace(/\p{M}/gu, "")
+    .replace(/[^a-zA-Z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .toLowerCase();
+  return out || "cliente";
+}
+
+function drawDiagonalWatermark(doc: jsPDF, companyDisplayName: string) {
   const w = doc.internal.pageSize.getWidth();
   const h = doc.internal.pageSize.getHeight();
   doc.setFont("helvetica", "bold");
   doc.setTextColor(238, 238, 238);
   doc.setFontSize(24);
-  const line = `${PDF_BRAND.companyName} · ${PDF_BRAND.branch} · ORIGINAL`;
+  const line = `${companyDisplayName} · ORIGINAL`;
   for (let row = 0; row < 12; row++) {
     for (let col = 0; col < 6; col++) {
       doc.text(line, col * 48 - 15, 18 + row * 28, { angle: 32 });
@@ -32,6 +43,7 @@ export type ComprovantePdfParams = {
   score?: number;
   scoreLabel?: string;
   companyTitle?: string;
+  quitado?: boolean;
 };
 
 /**
@@ -39,10 +51,19 @@ export type ComprovantePdfParams = {
  */
 export function generateComprovantePagamentoPdf(params: ComprovantePdfParams): jsPDF {
   const doc = new jsPDF();
-  drawDiagonalWatermark(doc);
+  const companyDisplayName =
+    String(params.companyTitle || "").trim() || String(PDF_BRAND.companyDisplayName || "").trim() || "EMPRESA";
+  drawDiagonalWatermark(doc, companyDisplayName);
 
   const m = getPdfMargin();
-  let y = addPdfHeader(doc, "Comprovante de pagamento", "Documento gerado pelo sistema — não válido sem registro no sistema");
+  const paymentDateRaw = String(params.paymentDate || "").trim() || "data";
+  const title = `comprovante-${slugifyTitlePart(params.clientName)}-${paymentDateRaw}`;
+  let y = addPdfHeader(
+    doc,
+    title,
+    "Documento gerado pelo sistema — não válido sem registro no sistema",
+    { companyName: companyDisplayName, companyDisplayName },
+  );
 
   doc.setFontSize(11);
   doc.setFont("helvetica", "normal");
@@ -75,11 +96,18 @@ export function generateComprovantePagamentoPdf(params: ComprovantePdfParams): j
     doc.text(`Operação: ${params.paymentDescription}`, m, y);
     y += 7;
   }
-  doc.text(`Próximo vencimento: ${formatDateBR(params.proximoVencimento)}`, m, y);
-  y += 10;
+  if (params.quitado) {
+    doc.setFont("helvetica", "bold");
+    doc.text("Situação: QUITADO", m, y);
+    doc.setFont("helvetica", "normal");
+    y += 10;
+  } else {
+    doc.text(`Próximo vencimento: ${formatDateBR(params.proximoVencimento)}`, m, y);
+    y += 10;
+  }
 
   if (params.score != null && params.scoreLabel) {
-    const brand = (params.companyTitle || `${PDF_BRAND.companyName}`.trim() || "Empresa").slice(0, 80);
+    const brand = (params.companyTitle || `${PDF_BRAND.companyDisplayName}`.trim() || "Empresa").slice(0, 80);
     doc.setFontSize(10);
     doc.setFont("helvetica", "bold");
     doc.setTextColor(PDF_BRAND.colors.text.r, PDF_BRAND.colors.text.g, PDF_BRAND.colors.text.b);
@@ -117,7 +145,7 @@ export function generateComprovantePagamentoPdf(params: ComprovantePdfParams): j
     { maxWidth: 180 },
   );
 
-  addPdfFooter(doc, 1);
+  addPdfFooter(doc, 1, undefined, { companyName: companyDisplayName, companyDisplayName });
   return doc;
 }
 

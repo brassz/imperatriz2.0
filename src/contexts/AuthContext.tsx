@@ -1,7 +1,7 @@
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import type { User } from "@/api/auth";
-import { getStoredUser, setStoredUser } from "@/api/auth";
+import { getStoredUser } from "@/api/auth";
 import { fetchEmployeesWithPaymentToday } from "@/api/employees";
 import { toast } from "@/hooks/use-toast";
 
@@ -9,7 +9,8 @@ interface AuthContextValue {
   user: User | null;
   isAuthenticated: boolean;
   isLoading: boolean;
-  login: (companyId: string, email: string, password: string) => Promise<void>;
+  requestToken: (companyId: string, email: string) => Promise<void>;
+  verifyToken: (companyId: string, email: string, token: string) => Promise<void>;
   logout: () => void;
 }
 
@@ -25,10 +26,37 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setIsLoading(false);
   }, []);
 
-  const login = useCallback(
-    async (companyId: string, email: string, password: string) => {
-      const { login: doLogin } = await import("@/api/auth");
-      const loggedUser = await doLogin(companyId, email, password);
+  // Ao fechar a aba/navegador, forçar novo login: limpa a sessão local.
+  useEffect(() => {
+    const clearOnClose = () => {
+      try {
+        localStorage.removeItem("nexus-auth-user");
+      } catch {
+        // ignore
+      }
+    };
+    window.addEventListener("pagehide", clearOnClose);
+    window.addEventListener("beforeunload", clearOnClose);
+    return () => {
+      window.removeEventListener("pagehide", clearOnClose);
+      window.removeEventListener("beforeunload", clearOnClose);
+    };
+  }, []);
+
+  const requestToken = useCallback(async (companyId: string, email: string) => {
+    const { requestWhatsappLoginToken } = await import("@/api/whatsapp-token-login");
+    const res = await requestWhatsappLoginToken(companyId, email);
+    if (!res.ok) throw new Error(res.error);
+  }, []);
+
+  const verifyToken = useCallback(
+    async (companyId: string, email: string, token: string) => {
+      const { verifyWhatsappLoginToken } = await import("@/api/whatsapp-token-login");
+      const res = await verifyWhatsappLoginToken(companyId, email, token);
+      if (!res.ok) throw new Error(res.error);
+      const loggedUser = res.user;
+      const { setStoredUser } = await import("@/api/auth");
+      setStoredUser(loggedUser);
       setUser(loggedUser);
       try {
         const today = new Date();
@@ -65,10 +93,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       user,
       isAuthenticated: !!user,
       isLoading,
-      login,
+      requestToken,
+      verifyToken,
       logout,
     }),
-    [user, isLoading, login, logout]
+    [user, isLoading, requestToken, verifyToken, logout]
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

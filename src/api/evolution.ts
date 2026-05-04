@@ -68,10 +68,67 @@ export async function fetchConnectionState(): Promise<ConnectionStateResult> {
   }
 }
 
+/**
+ * Mesmo endpoint do `fetchConnectionState`, mas para uma instância específica.
+ * Útil para mostrar ✓/✕ no seletor sem depender da instância atualmente selecionada.
+ */
+export async function fetchConnectionStateForInstance(opts: {
+  instance: string;
+  apiKey: string;
+  baseUrl?: string;
+}): Promise<ConnectionStateResult> {
+  const { baseUrl: cfgBase } = getEvolutionConfig();
+  const instance = String(opts.instance || "").trim();
+  const apiKey = String(opts.apiKey || "").trim();
+  if (!instance) return { ok: false, error: "Instância não informada" };
+  if (!apiKey) return { ok: false, error: "API key não informada" };
+  const base = normalizeBaseUrl(opts.baseUrl || cfgBase);
+  try {
+    assertNoMixedContent(base);
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : "Configuração inválida" };
+  }
+  const url = `${base}/instance/connectionState/${encodeURIComponent(instance)}`;
+  try {
+    const res = await fetch(url, {
+      method: "GET",
+      headers: { apikey: apiKey },
+    });
+
+    if (res.status === 404) return { ok: false, error: "Instância não encontrada" };
+    if (!res.ok) {
+      const err = await res.text();
+      return { ok: false, error: err || `HTTP ${res.status}` };
+    }
+
+    const data = (await parseJsonSafe(res)) as { instance?: { state?: string } };
+    const state = data?.instance?.state;
+    return { ok: true, connected: state === "open" };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : "Erro de conexão" };
+  }
+}
+
 export async function fetchEvolutionQrCode(): Promise<EvolutionQrResult> {
   const { baseUrl, apiKey, instance } = getEvolutionConfig();
-  if (!instance?.trim()) return { ok: false, error: "Instância não configurada" };
-  const base = normalizeBaseUrl(baseUrl);
+  return fetchEvolutionQrCodeForInstance({ instance, apiKey, baseUrl });
+}
+
+/**
+ * Busca QR para uma instância específica (usa a seleção atual da UI).
+ * Evita desencontro quando o usuário troca instância na tela e ainda não clicou em salvar.
+ */
+export async function fetchEvolutionQrCodeForInstance(opts: {
+  instance: string;
+  apiKey: string;
+  baseUrl?: string;
+}): Promise<EvolutionQrResult> {
+  const { baseUrl: cfgBase } = getEvolutionConfig();
+  const instance = String(opts.instance || "").trim();
+  const apiKey = String(opts.apiKey || "").trim();
+  if (!instance) return { ok: false, error: "Instância não informada" };
+  if (!apiKey) return { ok: false, error: "API key não informada" };
+  const base = normalizeBaseUrl(opts.baseUrl || cfgBase);
   try {
     assertNoMixedContent(base);
   } catch (e) {
@@ -234,6 +291,47 @@ export async function sendWhatsAppText(number: string, text: string): Promise<{ 
       body: JSON.stringify({ number: num, text }),
     });
 
+    if (!res.ok) {
+      const err = await res.text();
+      return { ok: false, error: err || `HTTP ${res.status}` };
+    }
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : "Erro de conexão" };
+  }
+}
+
+/**
+ * Envia texto pela Evolution usando instância + apiKey informados (bypassa config do usuário).
+ * Usado para login via token (instância "nexuslogin").
+ */
+export async function sendWhatsAppTextWithInstance(
+  number: string,
+  text: string,
+  opts: { instance: string; apiKey: string; baseUrl?: string }
+): Promise<{ ok: boolean; error?: string }> {
+  const num = normalizePhone(number);
+  const base = normalizeBaseUrl(opts.baseUrl || getEvolutionConfig().baseUrl);
+  try {
+    assertNoMixedContent(base);
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : "Configuração inválida" };
+  }
+  const instance = String(opts.instance || "").trim();
+  const apiKey = String(opts.apiKey || "").trim();
+  if (!instance) return { ok: false, error: "Instância não informada" };
+  if (!apiKey) return { ok: false, error: "API key não informada" };
+  const url = `${base}/message/sendText/${encodeURIComponent(instance)}`;
+
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        apikey: apiKey,
+      },
+      body: JSON.stringify({ number: num, text }),
+    });
     if (!res.ok) {
       const err = await res.text();
       return { ok: false, error: err || `HTTP ${res.status}` };

@@ -1,0 +1,9 @@
+# Use este arquivo se o repositório Git for SÓ esta pasta (raiz = nexus-fintech-hub-main).
+# Build no Render: Static Site → Root Directory vazio ou "."
+
+services:
+  - type: web
+    name: nexus-fintech-frontend
+    runtime: static
+    buildCommand: npm install && NODE_OPTIONS=--max-old-space-size=4096 npm run build
+    staticPublishPath: dist

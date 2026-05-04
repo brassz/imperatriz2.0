@@ -23,6 +23,7 @@ import {
 import { addPdfHeader, addPdfFooter, formatCurrency, formatDateBR } from "@/lib/pdf-utils";
 import { jsPDF } from "jspdf";
 import { toast } from "sonner";
+import { paymentTypeLabel } from "@/lib/payment-type-label";
 import {
   fetchLoansByDateRange,
   fetchPaidLoansByDateRange,
@@ -296,7 +297,7 @@ function addTablePayments(
     doc.text(String(p.client_name).slice(0, 18), m, y);
     doc.text(formatCurrency(amt), 70, y);
     doc.text(formatDateBR(p.payment_date), 100, y);
-    doc.text(String(p.payment_type).slice(0, 10), 130, y);
+    doc.text(String(paymentTypeLabel(p.payment_type)).slice(0, 10), 130, y);
     doc.text(String(p.notes || "").slice(0, 12), 160, y);
     y += 6;
   }

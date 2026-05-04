@@ -32,7 +32,6 @@ export default function Dashboard() {
   const { data: chartData = [] } = useQuery({
     queryKey: ["dashboard-chart-data"],
     queryFn: () => fetchDashboardChartData(6),
-    enabled: !isLoading && !error,
   });
 
   const [recentActivity, setRecentActivity] = useState<{ text: string; time: string; color: string }[]>([]);

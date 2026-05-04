@@ -1,4 +1,22 @@
-import { Plus, MessageCircle, Send, KeyRound, FolderOpen, RefreshCw, Clock, Calendar, StopCircle, ListChecks, Play, Pause, BadgePercent, FileDown } from "lucide-react";
+import {
+  Plus,
+  MessageCircle,
+  Send,
+  KeyRound,
+  FolderOpen,
+  RefreshCw,
+  Clock,
+  Calendar,
+  StopCircle,
+  ListChecks,
+  Play,
+  Pause,
+  BadgePercent,
+  FileDown,
+  CircleCheck,
+  CircleX,
+} from "lucide-react";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -20,7 +38,7 @@ import {
 } from "@/components/ui/dialog";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { motion } from "framer-motion";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { deactivatePixKey, fetchPixKeys, insertPixKey } from "@/api/pix-keys";
 import { fetchExpenseCategories } from "@/api/categories";
 import {
@@ -31,20 +49,27 @@ import {
 } from "@/lib/evolution-settings";
 import { getSupabaseCompany } from "@/lib/supabase";
 import { useAuth } from "@/contexts/AuthContext";
+import { useAutomationQueue } from "@/contexts/AutomationQueueContext";
 import { useState, useCallback, useRef, useMemo, useEffect } from "react";
 import { toast } from "sonner";
 import { fetchLoansForAutomation, type AutomationLoan } from "@/api/automation";
 import { fetchInstallments, type InstallmentRow } from "@/api/installments";
 import { fetchClientsForSelect } from "@/api/clients";
-import { fetchCommissionRows, fetchCommissionSummary } from "@/api/commissions";
 import {
-  fetchEvolutionQrCode,
+  COMMISSION_ROW_CATEGORY_META,
+  type CommissionRowCategory,
+  fetchCommissionRows,
+  fetchCommissionSummary,
+} from "@/api/commissions";
+import {
+  fetchEvolutionQrCodeForInstance,
   getQrImageUrl,
-  sendWhatsAppText,
   fetchConnectionState,
+  fetchConnectionStateForInstance,
 } from "@/api/evolution";
 import {
   buildCobrancaMessage,
+  buildCobrancaParcelamentoMessage,
   buildLembreteHojeMessage,
   buildLembreteMessage,
   type PixInfo,
@@ -65,6 +90,15 @@ function formatPreviewDate(iso: string) {
   const [y, m, d] = String(iso).split("T")[0].split("-");
   return d && m && y ? `${d}/${m}/${y}` : iso;
 }
+
+/** Fundo neutro na tela; só a barra lateral indica a categoria (evita bege/âmbar no texto inteiro). */
+const COMMISSION_TABLE_ROW_CLASS: Record<CommissionRowCategory, string> = {
+  installment: "bg-card border-l-[5px] border-l-sky-600",
+  renewal: "bg-card border-l-[5px] border-l-amber-600",
+  loan_finalized: "bg-card border-l-[5px] border-l-emerald-600",
+  loan_other: "bg-card border-l-[5px] border-l-slate-500",
+  fine_payment: "bg-card border-l-[5px] border-l-pink-600",
+};
 
 function nextPendingInstallment(inst: InstallmentRow) {
   const pending = inst.installment_payments
@@ -555,6 +589,7 @@ export default function Configuracoes() {
   const { user } = useAuth();
   const companyId = getSupabaseCompany();
   const queryClient = useQueryClient();
+  const queue = useAutomationQueue();
   const config = getEvolutionConfig();
   const [evolution, setEvolution] = useState({
     baseUrl: config.baseUrl,
@@ -562,33 +597,24 @@ export default function Configuracoes() {
     instance: config.instance,
   });
   const [selectedPixId, setSelectedPixId] = useState<string>("");
-  const [isSending, setIsSending] = useState(false);
   const [delayModalOpen, setDelayModalOpen] = useState(false);
+  const [delayModalTab, setDelayModalTab] = useState<"emprestimos" | "parcelamentos">("emprestimos");
+  const [manualQueueSelectionParcel, setManualQueueSelectionParcel] = useState<string[]>([]);
   /** IDs dos empréstimos (fila manual) marcados para envio */
   const [manualQueueSelection, setManualQueueSelection] = useState<string[]>([]);
   const [delayMinutes, setDelayMinutes] = useState("2");
   const [automationLoans, setAutomationLoans] = useState<AutomationLoan[] | null>(null);
   const [loadingAutomationLoans, setLoadingAutomationLoans] = useState(false);
+  const [recipientFilters, setRecipientFilters] = useState({
+    vencidos: true,
+    venceHoje: true,
+  });
+  const [recipientSearch, setRecipientSearch] = useState("");
   const [sendTypes, setSendTypes] = useState({
     cobranca: true,
     lembrete_hoje: true,
     lembrete_amanha: true,
   });
-  const [queueModalOpen, setQueueModalOpen] = useState(false);
-  const [queuePhase, setQueuePhase] = useState<"loading" | "sending" | "waiting" | "done">("loading");
-  const [queueStats, setQueueStats] = useState({ total: 0, done: 0, sent: 0, failed: 0 });
-  const [queueLogs, setQueueLogs] = useState<
-    Array<{
-      idx: number;
-      clientName: string;
-      type: AutomationLoan["type"];
-      status: "sent" | "failed";
-      error?: string;
-    }>
-  >([]);
-  const [queueCurrentName, setQueueCurrentName] = useState("");
-  const [queueNextName, setQueueNextName] = useState("");
-  const abortQueueRef = useRef(false);
   const migratedSchedulesRef = useRef(false);
   const [activeTab, setActiveTab] = useState("whatsapp");
   const [modalAgendamento, setModalAgendamento] = useState(false);
@@ -614,6 +640,20 @@ export default function Configuracoes() {
   } = useQuery({
     queryKey: ["commissions", commDateFrom, commDateTo],
     queryFn: () => fetchCommissionSummary(commDateFrom, commDateTo),
+    enabled:
+      activeTab === "comissoes" &&
+      !!commDateFrom &&
+      !!commDateTo &&
+      commDateFrom <= commDateTo,
+    staleTime: 30_000,
+  });
+
+  const {
+    data: commissionRows = [],
+    isLoading: loadingCommissionRows,
+  } = useQuery({
+    queryKey: ["commission-rows", commDateFrom, commDateTo],
+    queryFn: () => fetchCommissionRows(commDateFrom, commDateTo),
     enabled:
       activeTab === "comissoes" &&
       !!commDateFrom &&
@@ -679,6 +719,33 @@ export default function Configuracoes() {
       .filter((x): x is { inst: InstallmentRow; next: NonNullable<ReturnType<typeof nextPendingInstallment>> } => x !== null);
   }, [installmentPreview]);
 
+  // Estado de conexão por instância (para mostrar ✓/✕ dentro do seletor).
+  const instanceConnectionQueries = useQueries({
+    queries: EVOLUTION_INSTANCE_IDS.map((id) => ({
+      queryKey: ["evolution-connection-option", companyId, id],
+      queryFn: async () => {
+        const r = await fetchConnectionStateForInstance({
+          instance: id,
+          apiKey: getApiKeyForEvolutionInstance(id),
+          baseUrl: evolution.baseUrl,
+        });
+        if (!r.ok) return { connected: false };
+        return { connected: r.connected };
+      },
+      enabled: activeTab === "whatsapp",
+      staleTime: 30_000,
+      retry: false,
+    })),
+  });
+
+  const connectionByInstance = useMemo(() => {
+    const map: Record<string, boolean> = {};
+    EVOLUTION_INSTANCE_IDS.forEach((id, idx) => {
+      map[id] = instanceConnectionQueries[idx]?.data?.connected ?? false;
+    });
+    return map;
+  }, [instanceConnectionQueries]);
+
   const { data: connectionState, refetch: refetchConnection } = useQuery({
     queryKey: ["evolution-connection", activeTab, evolution.instance],
     queryFn: async () => {
@@ -694,10 +761,19 @@ export default function Configuracoes() {
 
   const { data: qrResult, isLoading: loadingQr, refetch: refetchQr } = useQuery({
     queryKey: ["evolution-qr", activeTab, evolution.instance, isConnected],
-    queryFn: fetchEvolutionQrCode,
+    queryFn: () =>
+      fetchEvolutionQrCodeForInstance({
+        instance: evolution.instance,
+        apiKey: getApiKeyForEvolutionInstance(evolution.instance),
+        baseUrl: evolution.baseUrl,
+      }),
     enabled: activeTab === "whatsapp" && !!evolution.instance?.trim() && !isConnected,
     staleTime: 0,
     retry: false,
+    // Mantém o QR sempre atualizado enquanto estiver desconectado.
+    // O Evolution normalmente expira/rotaciona o QR; esse polling evita QR "velho".
+    refetchInterval: 10_000,
+    refetchIntervalInBackground: true,
   });
 
   const { data: pixKeys = [], isLoading: loadingPix } = useQuery({
@@ -780,9 +856,15 @@ export default function Configuracoes() {
     setLoadingAutomationLoans(true);
     setAutomationLoans(null);
     try {
-      const loans = await fetchLoansForAutomation();
+      const loans = await fetchLoansForAutomation({ includeInstallments: true });
       setAutomationLoans(loans);
-      setManualQueueSelection(loans.map((l) => l.id));
+      const loanIds = loans.filter((l) => l.source !== "installment").map((l) => l.id);
+      const parcIds = loans.filter((l) => l.source === "installment").map((l) => l.id);
+      setManualQueueSelection(loanIds);
+      setManualQueueSelectionParcel(parcIds);
+      setDelayModalTab("emprestimos");
+      setRecipientSearch("");
+      setRecipientFilters({ vencidos: true, venceHoje: true });
     } catch (e) {
       toast.error(e instanceof Error ? e.message : "Erro ao carregar clientes para automação");
     } finally {
@@ -790,11 +872,47 @@ export default function Configuracoes() {
     }
   };
 
+  const filteredEmprestimosFila = useMemo(() => {
+    const list = automationLoans || [];
+    const q = recipientSearch.trim().toLowerCase();
+    return list.filter((item) => {
+      if (item.source === "installment") return false;
+      if (!recipientFilters.vencidos && item.type === "cobranca") return false;
+      if (!recipientFilters.venceHoje && item.type === "lembrete_hoje") return false;
+      if (q) {
+        const name = String(item.loan?.client_name || "").toLowerCase();
+        const phone = String(item.loan?.client_phone || "").toLowerCase();
+        if (!name.includes(q) && !phone.includes(q)) return false;
+      }
+      return true;
+    });
+  }, [automationLoans, recipientFilters, recipientSearch]);
+
+  const filteredParcelamentosFila = useMemo(() => {
+    const list = automationLoans || [];
+    const q = recipientSearch.trim().toLowerCase();
+    return list.filter((item) => {
+      if (item.source !== "installment") return false;
+      if (!recipientFilters.vencidos && item.type === "cobranca") return false;
+      if (!recipientFilters.venceHoje && item.type === "lembrete_hoje") return false;
+      if (q) {
+        const name = String(item.loan?.client_name || "").toLowerCase();
+        const phone = String(item.loan?.client_phone || "").toLowerCase();
+        if (!name.includes(q) && !phone.includes(q)) return false;
+      }
+      return true;
+    });
+  }, [automationLoans, recipientFilters, recipientSearch]);
+
   const buildAutomationMessage = (item: AutomationLoan, pixInfo: PixInfo): string => {
-    if (item.type === "cobranca") return buildCobrancaMessage(item.loan, pixInfo, 50);
+    const cobranca =
+      item.source === "installment"
+        ? buildCobrancaParcelamentoMessage(item.loan, pixInfo, 50)
+        : buildCobrancaMessage(item.loan, pixInfo, 50);
+    if (item.type === "cobranca") return cobranca;
     if (item.type === "lembrete_hoje") {
       // Vencem hoje também são tratados como cobrança
-      return buildCobrancaMessage(item.loan, pixInfo, 50);
+      return cobranca;
     }
     return buildLembreteMessage(item.loan, pixInfo);
   };
@@ -813,21 +931,9 @@ export default function Configuracoes() {
     const delayMs = Math.round(min * 60_000);
 
     setDelayModalOpen(false);
-    abortQueueRef.current = false;
-    setIsSending(true);
-    setQueueModalOpen(true);
-    setQueuePhase("loading");
-    setQueueStats({ total: 0, done: 0, sent: 0, failed: 0 });
-    setQueueLogs([]);
-    setQueueCurrentName("Carregando fila...");
-    setQueueNextName("—");
 
     try {
       const loans = automationLoans;
-      if (abortQueueRef.current) {
-        toast.message("Envio cancelado");
-        return;
-      }
 
       const withoutPhone = loans.filter((l) => !l.loan.client_phone?.trim());
       if (withoutPhone.length > 0) {
@@ -843,17 +949,17 @@ export default function Configuracoes() {
 
       if (activeTypes.size === 0) {
         toast.error("Selecione ao menos um tipo de envio (vencidos, vencem hoje ou lembretes).");
-        setQueuePhase("done");
-        setQueueCurrentName("—");
-        setQueueNextName("—");
         return;
       }
 
+      const isParcelTab = delayModalTab === "parcelamentos";
+      const selection = isParcelTab ? manualQueueSelectionParcel : manualQueueSelection;
       const toSend = loans.filter(
         (l) =>
-          manualQueueSelection.includes(l.id) &&
+          selection.includes(l.id) &&
           l.loan.client_phone?.trim() &&
-          activeTypes.has(l.type),
+          activeTypes.has(l.type) &&
+          (isParcelTab ? l.source === "installment" : l.source !== "installment"),
       );
 
       if (toSend.length === 0) {
@@ -862,84 +968,23 @@ export default function Configuracoes() {
         } else {
           toast.info("Nenhum destinatário selecionado com telefone e tipo de envio compatível.");
         }
-        setQueuePhase("done");
-        setQueueCurrentName("—");
-        setQueueNextName("—");
         return;
       }
 
-      setQueueStats({ total: toSend.length, done: 0, sent: 0, failed: 0 });
+      await queue.start({
+        items: toSend,
+        delayMs,
+        pixInfo,
+        sendTypes,
+        buildMessage: buildAutomationMessage,
+      });
 
-      let sent = 0;
-      let failed = 0;
-
-      for (let i = 0; i < toSend.length; i++) {
-        if (abortQueueRef.current) break;
-
-        const item = toSend[i];
-        const nextItem = toSend[i + 1];
-
-        setQueuePhase("sending");
-        setQueueCurrentName(item.loan.client_name);
-        setQueueNextName(nextItem ? nextItem.loan.client_name : "—");
-
-        const text = buildAutomationMessage(item, pixInfo);
-        const { ok, error } = await sendWhatsAppText(item.loan.client_phone, text);
-        if (ok) sent++;
-        else {
-          failed++;
-          console.error(`Erro ao enviar para ${item.loan.client_name}:`, error);
-        }
-
-        setQueueLogs((prev) => [
-          ...prev,
-          {
-            idx: i,
-            clientName: item.loan.client_name,
-            type: item.type,
-            status: ok ? "sent" : "failed",
-            error: ok ? undefined : error ?? "Erro desconhecido",
-          },
-        ]);
-
-        setQueueStats({ total: toSend.length, done: i + 1, sent, failed });
-
-        if (abortQueueRef.current) break;
-
-        if (i < toSend.length - 1 && delayMs > 0) {
-          setQueuePhase("waiting");
-          setQueueCurrentName("Aguardando intervalo...");
-          setQueueNextName(nextItem ? nextItem.loan.client_name : "—");
-          await interruptibleDelay(delayMs);
-        }
-      }
-
-      if (abortQueueRef.current) {
-        toast.warning(`Interrompido. Enviados: ${sent}${failed > 0 ? ` | Falhas: ${failed}` : ""}`);
-      } else {
-        toast.success(`Enviados: ${sent}${failed > 0 ? ` | Falhas: ${failed}` : ""}`);
-      }
+      const sent = queue.stats.sent;
+      const failed = queue.stats.failed;
+      toast.success(`Fila finalizada. Enviados: ${sent}${failed > 0 ? ` | Falhas: ${failed}` : ""}`);
     } catch (e) {
       toast.error(e instanceof Error ? e.message : "Erro ao executar automação");
-    } finally {
-      setIsSending(false);
-      setQueuePhase("done");
-      if (!abortQueueRef.current) {
-        setQueueCurrentName("—");
-        setQueueNextName("—");
-      }
     }
-  };
-
-  const handleInterruptQueue = () => {
-    abortQueueRef.current = true;
-  };
-
-  const handleQueueModalOpenChange = (open: boolean) => {
-    if (!open && isSending) {
-      abortQueueRef.current = true;
-    }
-    setQueueModalOpen(open);
   };
 
   const toggleAgendamentoAtivo = async (a: Agendamento) => {
@@ -1018,15 +1063,15 @@ export default function Configuracoes() {
               Evolution API
             </h3>
             <p className="text-xs text-muted-foreground mb-4">
-              Escolha a instância; a API key é aplicada automaticamente para cada uma (omnibot2, vinicius, douglas).
+              Escolha a instância; a API key é aplicada automaticamente para cada uma.
+              O seletor mostra ✓ quando a instância está conectada e ✕ quando não está.
             </p>
             <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
               <div>
                 <Label className="text-xs">URL da API</Label>
                 <Input
                   value={evolution.baseUrl}
-                  onChange={(e) => setEvolution((c) => ({ ...c, baseUrl: e.target.value }))}
-                  placeholder="http://ip:3000"
+                  readOnly
                   className="mt-1 h-8 text-xs"
                 />
               </div>
@@ -1048,7 +1093,14 @@ export default function Configuracoes() {
                   <SelectContent>
                     {EVOLUTION_INSTANCE_IDS.map((id) => (
                       <SelectItem key={id} value={id}>
-                        {id}
+                        <span className="flex items-center justify-between gap-3 w-full">
+                          <span className="truncate">{id}</span>
+                          {connectionByInstance[id] ? (
+                            <CircleCheck className="h-4 w-4 text-emerald-600" />
+                          ) : (
+                            <CircleX className="h-4 w-4 text-muted-foreground" />
+                          )}
+                        </span>
                       </SelectItem>
                     ))}
                   </SelectContent>
@@ -1068,7 +1120,7 @@ export default function Configuracoes() {
             </Button>
           </motion.div>
 
-          {/* Prévia: mesmas bases usadas no envio manual / agendamentos */}
+          {/* Prévia: mesmas bases usadas no envio manual */}
           <motion.div
             initial={{ opacity: 0, y: 8 }}
             animate={{ opacity: 1, y: 0 }}
@@ -1082,8 +1134,9 @@ export default function Configuracoes() {
                   Prévia para cobrança (empréstimos e parcelamentos)
                 </h3>
                 <p className="text-xs text-muted-foreground mt-1 max-w-xl">
-                  Vencidos, vencem hoje e Lembretes (vencem amanhã) vêm dos empréstimos com vencimento até amanhã. Parcelamentos: contratos ativos com próxima parcela pendente.
-                  Clientes sem telefone aparecem aqui, mas não entram na fila de envio até cadastrar o número.
+                  Vencidos, vencem hoje e lembretes vêm dos empréstimos com vencimento até amanhã. Parcelamentos: contratos
+                  ativos com próxima parcela pendente. O envio em massa usa a subaba Parcelamentos no modal «Enviar
+                  cobranças — fila». Clientes sem telefone aparecem aqui, mas não entram na fila até cadastrar o número.
                 </p>
                 {previewLoansError ? (
                   <p className="text-xs text-destructive mt-2">
@@ -1203,8 +1256,8 @@ export default function Configuracoes() {
             </div>
           </motion.div>
 
-          {/* QR Code - só exibido quando NÃO conectado */}
-          {!isConnected && (
+          {/* QR só com aba WhatsApp ativa: o painel fica montado ao mudar de aba; a query do QR desliga e qrResult fica indefinido. */}
+          {activeTab === "whatsapp" && !isConnected && (
             <motion.div
               initial={{ opacity: 0, y: 8 }}
               animate={{ opacity: 1, y: 0 }}
@@ -1244,7 +1297,12 @@ export default function Configuracoes() {
                 ) : (
                   <div className="text-center py-6">
                     <p className="text-sm text-destructive mb-2">
-                      {("error" in (qrResult as any) && (qrResult as any).error) || "Erro ao carregar QR"}
+                      {qrResult != null &&
+                      typeof qrResult === "object" &&
+                      "error" in qrResult &&
+                      String((qrResult as { error?: unknown }).error || "").trim()
+                        ? String((qrResult as { error: unknown }).error)
+                        : "Erro ao carregar QR"}
                     </p>
                     <Button variant="outline" size="sm" onClick={() => refetchQr()} className="gap-2">
                       <RefreshCw className="h-3 w-3" />
@@ -1288,31 +1346,39 @@ export default function Configuracoes() {
               </div>
               <Button
                 onClick={handleOpenCobrancaDelayModal}
-                disabled={isSending || !selectedPixId}
+                disabled={queue.isRunning || !selectedPixId}
                 className="gap-2"
               >
                 <Send className="h-4 w-4" />
-                {isSending ? "Enviando..." : "Enviar cobranças agora"}
+                {queue.isRunning ? "Enviando..." : "Enviar cobranças agora"}
               </Button>
             </div>
           </motion.div>
 
           {/* Modal: intervalo + seleção de destinatários */}
-          <Dialog open={delayModalOpen} onOpenChange={setDelayModalOpen}>
-            <DialogContent className="sm:max-w-lg max-h-[90vh] overflow-y-auto">
+          <Dialog
+            open={delayModalOpen}
+            onOpenChange={(open) => {
+              setDelayModalOpen(open);
+              if (!open) setDelayModalTab("emprestimos");
+            }}
+          >
+            <DialogContent className="sm:max-w-xl max-h-[90vh] overflow-y-auto">
               <DialogHeader>
                 <DialogTitle>Enviar cobranças — fila</DialogTitle>
               </DialogHeader>
               {loadingAutomationLoans ? (
-                <p className="text-sm text-muted-foreground py-4">Carregando lista de empréstimos...</p>
+                <p className="text-sm text-muted-foreground py-4">Carregando lista...</p>
               ) : !automationLoans?.length ? (
                 <p className="text-sm text-muted-foreground py-4">
-                  Nenhum empréstimo elegível (vencidos, hoje ou amanhã) no momento.
+                  Nenhum empréstimo ou parcelamento elegível (vencidos, hoje ou amanhã) no momento.
                 </p>
               ) : (
                 <>
                   <p className="text-sm text-muted-foreground">
-                    Marque quem entra na fila. Defina o intervalo entre mensagens (0 = sem pausa).
+                    Escolha a subaba <span className="font-medium text-foreground">Empréstimos</span> ou{" "}
+                    <span className="font-medium text-foreground">Parcelamentos</span>, marque os destinatários e
+                    inicie a fila. Delay e tipos de envio valem para a aba ativa.
                   </p>
                   <div className="space-y-4 mt-3">
                     <div className="space-y-2">
@@ -1363,67 +1429,222 @@ export default function Configuracoes() {
                       </div>
                     </div>
 
-                    <div className="space-y-2">
-                      <div className="flex flex-wrap items-center justify-between gap-2">
-                        <Label className="text-xs">Destinatários (empréstimos)</Label>
-                        <div className="flex gap-2">
-                          <Button
-                            type="button"
-                            variant="outline"
-                            size="sm"
-                            className="h-7 text-xs"
-                            onClick={() =>
-                              setManualQueueSelection(automationLoans.map((l) => l.id))
-                            }
-                          >
-                            Marcar todos
-                          </Button>
-                          <Button
-                            type="button"
-                            variant="outline"
-                            size="sm"
-                            className="h-7 text-xs"
-                            onClick={() => setManualQueueSelection([])}
-                          >
-                            Desmarcar todos
-                          </Button>
-                        </div>
-                      </div>
-                      <ScrollArea className="h-[220px] rounded-md border border-border/60 p-2">
-                        <div className="space-y-2 pr-3">
-                          {automationLoans.map((item) => (
-                            <label
-                              key={item.id}
-                              className="flex items-start gap-2 text-xs cursor-pointer rounded-md p-1.5 hover:bg-muted/40"
+                    <Tabs value={delayModalTab} onValueChange={(v) => setDelayModalTab(v as "emprestimos" | "parcelamentos")}>
+                      <TabsList className="grid w-full grid-cols-2 h-9">
+                        <TabsTrigger value="emprestimos" className="text-xs">
+                          Empréstimos
+                        </TabsTrigger>
+                        <TabsTrigger value="parcelamentos" className="text-xs">
+                          Parcelamentos
+                        </TabsTrigger>
+                      </TabsList>
+
+                      <TabsContent value="emprestimos" className="space-y-3 mt-3 outline-none">
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <Label className="text-xs">Destinatários</Label>
+                          <div className="flex gap-2">
+                            <Button
+                              type="button"
+                              variant="outline"
+                              size="sm"
+                              className="h-7 text-xs"
+                              onClick={() =>
+                                setManualQueueSelection(filteredEmprestimosFila.map((l) => l.id))
+                              }
                             >
-                              <Checkbox
-                                className="mt-0.5"
-                                checked={manualQueueSelection.includes(item.id)}
-                                onCheckedChange={(checked) => {
-                                  setManualQueueSelection((prev) => {
-                                    if (checked) {
-                                      return prev.includes(item.id) ? prev : [...prev, item.id];
-                                    }
-                                    return prev.filter((x) => x !== item.id);
-                                  });
-                                }}
-                              />
-                              <span className="min-w-0 flex-1">
-                                <span className="font-medium text-foreground">{item.loan.client_name}</span>
-                                <span className="text-muted-foreground"> · {labelTipoAutomacao(item.type)}</span>
-                                <span className="block text-muted-foreground mt-0.5">
-                                  Venc. {formatPreviewDate(item.loan.due_date)} ·{" "}
-                                  {formatPreviewCurrency(item.loan.amount)}
-                                  {!item.loan.client_phone?.trim() ? (
-                                    <span className="text-amber-600 dark:text-amber-500"> · sem telefone</span>
-                                  ) : null}
-                                </span>
-                              </span>
-                            </label>
-                          ))}
+                              Marcar todos
+                            </Button>
+                            <Button
+                              type="button"
+                              variant="outline"
+                              size="sm"
+                              className="h-7 text-xs"
+                              onClick={() => setManualQueueSelection([])}
+                            >
+                              Desmarcar todos
+                            </Button>
+                          </div>
                         </div>
-                      </ScrollArea>
-                    </div>
+                        <div className="flex flex-wrap items-end gap-3">
+                          <div className="min-w-[220px] flex-1">
+                            <Label className="text-[11px] text-muted-foreground">Buscar (nome/telefone)</Label>
+                            <Input
+                              value={recipientSearch}
+                              onChange={(e) => setRecipientSearch(e.target.value)}
+                              placeholder="Ex.: Maria, 16..."
+                              className="mt-1 h-9"
+                            />
+                          </div>
+                          <div className="flex flex-wrap gap-3">
+                            <label className="flex items-center gap-2 text-xs">
+                              <Checkbox
+                                checked={recipientFilters.vencidos}
+                                onCheckedChange={(checked) =>
+                                  setRecipientFilters((p) => ({ ...p, vencidos: Boolean(checked) }))
+                                }
+                              />
+                              <span>Vencidos</span>
+                            </label>
+                            <label className="flex items-center gap-2 text-xs">
+                              <Checkbox
+                                checked={recipientFilters.venceHoje}
+                                onCheckedChange={(checked) =>
+                                  setRecipientFilters((p) => ({ ...p, venceHoje: Boolean(checked) }))
+                                }
+                              />
+                              <span>Vencem hoje</span>
+                            </label>
+                          </div>
+                        </div>
+                        <ScrollArea className="h-[220px] rounded-md border border-border/60 p-2">
+                          <div className="space-y-2 pr-3">
+                            {filteredEmprestimosFila.length === 0 ? (
+                              <p className="text-xs text-muted-foreground p-2">Nenhum empréstimo com os filtros atuais.</p>
+                            ) : (
+                              filteredEmprestimosFila.map((item) => (
+                                <label
+                                  key={item.id}
+                                  className="flex items-start gap-2 text-xs cursor-pointer rounded-md p-1.5 hover:bg-muted/40"
+                                >
+                                  <Checkbox
+                                    className="mt-0.5"
+                                    checked={manualQueueSelection.includes(item.id)}
+                                    onCheckedChange={(checked) => {
+                                      setManualQueueSelection((prev) => {
+                                        if (checked) {
+                                          return prev.includes(item.id) ? prev : [...prev, item.id];
+                                        }
+                                        return prev.filter((x) => x !== item.id);
+                                      });
+                                    }}
+                                  />
+                                  <span className="min-w-0 flex-1">
+                                    <span className="font-medium text-foreground">{item.loan.client_name}</span>
+                                    <span className="text-muted-foreground">
+                                      {" "}
+                                      · Empréstimo · {labelTipoAutomacao(item.type)}
+                                    </span>
+                                    <span className="block text-muted-foreground mt-0.5">
+                                      Venc. {formatPreviewDate(item.loan.due_date)} ·{" "}
+                                      {formatPreviewCurrency(item.loan.amount)}
+                                      {!item.loan.client_phone?.trim() ? (
+                                        <span className="text-amber-600 dark:text-amber-500"> · sem telefone</span>
+                                      ) : null}
+                                    </span>
+                                  </span>
+                                </label>
+                              ))
+                            )}
+                          </div>
+                        </ScrollArea>
+                      </TabsContent>
+
+                      <TabsContent value="parcelamentos" className="space-y-3 mt-3 outline-none">
+                        <p className="text-[11px] text-muted-foreground leading-snug">
+                          Lista só contratos com parcela pendente nos mesmos critérios de data. A mensagem de WhatsApp
+                          usa parcela e multa (sem linha de juros).
+                        </p>
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <Label className="text-xs">Destinatários</Label>
+                          <div className="flex gap-2">
+                            <Button
+                              type="button"
+                              variant="outline"
+                              size="sm"
+                              className="h-7 text-xs"
+                              onClick={() =>
+                                setManualQueueSelectionParcel(filteredParcelamentosFila.map((l) => l.id))
+                              }
+                            >
+                              Marcar todos
+                            </Button>
+                            <Button
+                              type="button"
+                              variant="outline"
+                              size="sm"
+                              className="h-7 text-xs"
+                              onClick={() => setManualQueueSelectionParcel([])}
+                            >
+                              Desmarcar todos
+                            </Button>
+                          </div>
+                        </div>
+                        <div className="flex flex-wrap items-end gap-3">
+                          <div className="min-w-[220px] flex-1">
+                            <Label className="text-[11px] text-muted-foreground">Buscar (nome/telefone)</Label>
+                            <Input
+                              value={recipientSearch}
+                              onChange={(e) => setRecipientSearch(e.target.value)}
+                              placeholder="Ex.: Maria, 16..."
+                              className="mt-1 h-9"
+                            />
+                          </div>
+                          <div className="flex flex-wrap gap-3">
+                            <label className="flex items-center gap-2 text-xs">
+                              <Checkbox
+                                checked={recipientFilters.vencidos}
+                                onCheckedChange={(checked) =>
+                                  setRecipientFilters((p) => ({ ...p, vencidos: Boolean(checked) }))
+                                }
+                              />
+                              <span>Vencidos</span>
+                            </label>
+                            <label className="flex items-center gap-2 text-xs">
+                              <Checkbox
+                                checked={recipientFilters.venceHoje}
+                                onCheckedChange={(checked) =>
+                                  setRecipientFilters((p) => ({ ...p, venceHoje: Boolean(checked) }))
+                                }
+                              />
+                              <span>Vencem hoje</span>
+                            </label>
+                          </div>
+                        </div>
+                        <ScrollArea className="h-[220px] rounded-md border border-border/60 p-2">
+                          <div className="space-y-2 pr-3">
+                            {filteredParcelamentosFila.length === 0 ? (
+                              <p className="text-xs text-muted-foreground p-2">
+                                Nenhum parcelamento com os filtros atuais.
+                              </p>
+                            ) : (
+                              filteredParcelamentosFila.map((item) => (
+                                <label
+                                  key={item.id}
+                                  className="flex items-start gap-2 text-xs cursor-pointer rounded-md p-1.5 hover:bg-muted/40"
+                                >
+                                  <Checkbox
+                                    className="mt-0.5"
+                                    checked={manualQueueSelectionParcel.includes(item.id)}
+                                    onCheckedChange={(checked) => {
+                                      setManualQueueSelectionParcel((prev) => {
+                                        if (checked) {
+                                          return prev.includes(item.id) ? prev : [...prev, item.id];
+                                        }
+                                        return prev.filter((x) => x !== item.id);
+                                      });
+                                    }}
+                                  />
+                                  <span className="min-w-0 flex-1">
+                                    <span className="font-medium text-foreground">{item.loan.client_name}</span>
+                                    <span className="text-muted-foreground">
+                                      {" "}
+                                      · Parcelamento · {labelTipoAutomacao(item.type)}
+                                    </span>
+                                    <span className="block text-muted-foreground mt-0.5">
+                                      Parcela {formatPreviewCurrency(item.loan.capital)} · venc.{" "}
+                                      {formatPreviewDate(item.loan.due_date)}
+                                      {!item.loan.client_phone?.trim() ? (
+                                        <span className="text-amber-600 dark:text-amber-500"> · sem telefone</span>
+                                      ) : null}
+                                    </span>
+                                  </span>
+                                </label>
+                              ))
+                            )}
+                          </div>
+                        </ScrollArea>
+                      </TabsContent>
+                    </Tabs>
                   </div>
                 </>
               )}
@@ -1437,7 +1658,9 @@ export default function Configuracoes() {
                   disabled={
                     loadingAutomationLoans ||
                     !automationLoans?.length ||
-                    manualQueueSelection.length === 0
+                    (delayModalTab === "emprestimos"
+                      ? manualQueueSelection.length === 0
+                      : manualQueueSelectionParcel.length === 0)
                   }
                 >
                   <Send className="h-4 w-4" />
@@ -1447,122 +1670,7 @@ export default function Configuracoes() {
             </DialogContent>
           </Dialog>
 
-          {/* Modal: fila de envio (atual, próximo, interromper) */}
-          <Dialog open={queueModalOpen} onOpenChange={handleQueueModalOpenChange}>
-            <DialogContent className="sm:max-w-md">
-              <DialogHeader>
-                <DialogTitle>Fila de cobranças</DialogTitle>
-              </DialogHeader>
-
-              {queuePhase === "loading" ? (
-                <p className="text-sm text-muted-foreground">Montando a lista de clientes...</p>
-              ) : (
-                <div className="space-y-3 text-sm">
-                  <div className="rounded-lg border border-border/60 bg-muted/30 p-3">
-                    <p className="text-xs text-muted-foreground uppercase tracking-wide">Enviando agora</p>
-                    <p className="font-medium text-foreground mt-1">{queueCurrentName || "—"}</p>
-                  </div>
-                  <div className="rounded-lg border border-border/60 bg-muted/20 p-3">
-                    <p className="text-xs text-muted-foreground uppercase tracking-wide">Próximo na fila</p>
-                    <p className="font-medium text-foreground mt-1">{queueNextName || "—"}</p>
-                  </div>
-                  <p className="text-xs text-muted-foreground">
-                    Progresso: {queueStats.total ? `${queueStats.done} / ${queueStats.total}` : "—"} · Sucesso:{" "}
-                    {queueStats.sent} · Falhas: {queueStats.failed}
-                    {queuePhase === "waiting" ? " · aguardando intervalo" : ""}
-                  </p>
-
-                  <div className="space-y-2">
-                    <p className="text-xs font-medium text-muted-foreground">Log de mensagens</p>
-                    <ScrollArea className="h-44 rounded-lg border border-border/40">
-                      <div className="p-3 space-y-2">
-                        {queueLogs.length === 0 ? (
-                          <p className="text-xs text-muted-foreground">Nenhuma mensagem enviada ainda.</p>
-                        ) : (
-                          queueLogs.map((l) => (
-                            <div
-                              key={`${l.idx}-${l.clientName}`}
-                              className="rounded-md border border-border/30 bg-muted/10 p-2"
-                            >
-                              <p className="text-xs font-medium text-foreground">
-                                {l.clientName}{" "}
-                                <span className="text-muted-foreground font-normal">
-                                  ·{" "}
-                                  {l.type === "cobranca"
-                                    ? "Cobrança"
-                                    : l.type === "lembrete_hoje"
-                                      ? "Cobrança (vencem hoje)"
-                                      : "Lembrete (vencem amanhã)"}
-                                </span>
-                              </p>
-                              {l.status === "sent" ? (
-                                <p className="text-xs text-emerald-600 dark:text-emerald-400 mt-0.5">Enviado com sucesso</p>
-                              ) : (
-                                <p className="text-xs text-destructive mt-0.5 break-words">
-                                  Falhou: {l.error || "Motivo não informado"}
-                                </p>
-                              )}
-                            </div>
-                          ))
-                        )}
-                      </div>
-                    </ScrollArea>
-                  </div>
-
-                  {queuePhase === "done" ? (
-                    <div className="rounded-lg border border-border/60 bg-muted/20 p-3">
-                      <p className="text-xs text-muted-foreground">Relatório final</p>
-                      <p className="text-sm font-medium text-foreground mt-1">
-                        Sucesso: {queueStats.sent} · Falhas: {queueStats.failed}
-                      </p>
-                      {queueStats.failed > 0 ? (
-                        <div className="mt-2 space-y-2">
-                          {queueLogs
-                            .filter((l) => l.status === "failed")
-                            .map((l) => (
-                              <div key={`fail-${l.idx}-${l.clientName}`} className="text-xs">
-                                <p className="font-medium text-destructive">{l.clientName}</p>
-                                <p className="text-muted-foreground break-words">{l.error || "Motivo não informado"}</p>
-                              </div>
-                            ))}
-                        </div>
-                      ) : (
-                        <p className="text-xs text-muted-foreground mt-2">Nenhuma falha registrada.</p>
-                      )}
-                    </div>
-                  ) : null}
-                </div>
-              )}
-
-              <DialogFooter className="flex-col-reverse gap-2 sm:flex-row sm:justify-between">
-                {queuePhase === "loading" ? (
-                  <Button
-                    variant="outline"
-                    className="gap-2 w-full sm:w-auto"
-                    onClick={() => {
-                      abortQueueRef.current = true;
-                      setQueueModalOpen(false);
-                    }}
-                  >
-                    <StopCircle className="h-4 w-4" />
-                    Cancelar
-                  </Button>
-                ) : queuePhase !== "done" && isSending ? (
-                  <Button variant="destructive" className="gap-2 w-full sm:w-auto" onClick={handleInterruptQueue}>
-                    <StopCircle className="h-4 w-4" />
-                    Interromper
-                  </Button>
-                ) : (
-                  <span />
-                )}
-                {queuePhase === "done" ? (
-                  <Button className="w-full sm:w-auto" onClick={() => setQueueModalOpen(false)}>
-                    Fechar
-                  </Button>
-                ) : null}
-              </DialogFooter>
-            </DialogContent>
-          </Dialog>
+          {/* Fila de envio agora é global (card flutuante no canto inferior direito) */}
         </TabsContent>
 
         <TabsContent value="comissoes" className="mt-4">
@@ -1575,7 +1683,8 @@ export default function Configuracoes() {
               <div>
                 <h3 className="text-sm font-semibold text-foreground">Comissões</h3>
                 <p className="text-xs text-muted-foreground">
-                  Base = juros dos pagamentos + parcelas pagas dos parcelamentos.
+                  Base = soma apenas da parcela de <strong>juros</strong> de cada pagamento de empréstimo no período
+                  (mesma regra de rateio juros/capital do sistema). Parcelamentos não entram nesta base.
                 </p>
               </div>
               <div className="flex items-end gap-2 flex-wrap">
@@ -1602,10 +1711,11 @@ export default function Configuracoes() {
                   variant="outline"
                   size="sm"
                   className="h-8 gap-2"
-                  disabled={loadingCommissions || !commissionSummary}
+                  disabled={loadingCommissions || loadingCommissionRows || !commissionSummary}
                   onClick={async () => {
                     try {
                       const rows = await fetchCommissionRows(commDateFrom, commDateTo);
+                      const COL_LAST = 10;
 
                       const formatBR = (ymd: string) => {
                         const [y, m, d] = String(ymd).split("T")[0].split("-");
@@ -1615,55 +1725,85 @@ export default function Configuracoes() {
 
                       const sheet = "Extrato Ton";
                       const aoa: any[][] = [];
-                      aoa.push([title]);
-                      aoa.push(["Vinicius", Number(commissionSummary.vinicius || 0)]);
-                      aoa.push(["Douglas", Number(commissionSummary.douglas || 0)]);
-                      aoa.push(["Tipo", "Valor", "Data", "Situação", "Comissão", "Multa", "Origem"]);
+                      const padRow = (cells: any[]) => {
+                        const x = [...cells];
+                        while (x.length < COL_LAST + 1) x.push("");
+                        return x.slice(0, COL_LAST + 1);
+                      };
+                      aoa.push(padRow([title]));
+                      aoa.push(padRow(["Vinicius", Number(commissionSummary.vinicius || 0)]));
+                      aoa.push(padRow(["Douglas", Number(commissionSummary.douglas || 0)]));
+                      aoa.push(padRow(["Total juros (comissão)", Number(commissionSummary.baseTotal || 0)]));
+                      aoa.push(padRow(["Total multas (período)", Number(commissionSummary.fineTotal || 0)]));
+                      aoa.push(
+                        padRow([
+                          "Cores: âmbar = renovação (juros) | verde = finalizado/quitado | cinza = demais | rosa = multa. Colunas Juros/Capital = rateio do pagamento; Vinícius/Douglas = só sobre juros; multa não entra na base de comissão.",
+                        ]),
+                      );
+                      aoa.push([
+                        "Tipo",
+                        "Juros (com.)",
+                        "Capital",
+                        "Multa",
+                        "Valor pgto",
+                        "Data",
+                        "Vinicius",
+                        "Douglas",
+                        "Situação",
+                        "Prazo",
+                        "Origem",
+                      ]);
 
-                      // No modelo: "Comissão" é o valor-base da linha.
-                      // Para "Quitado", exibimos o último valor pago em "Valor" e "Comissão" fica "-".
-                      const headerRowIndex = 3; // 0-based row where headers live
+                      const legendRowIndex = 5;
+                      const headerRowIndex = 6;
                       for (const r of rows) {
-                        const isQuitado = r.situacao === "Quitado" || r.tipo === "Quitado";
+                        const prazo =
+                          r.termoContrato === "20" ? "20 dias" : r.termoContrato === "30" ? "30 dias" : "—";
                         aoa.push([
                           r.tipo,
-                          isQuitado ? Number(r.valor || 0) : Number(r.valor || 0),
+                          Number(r.juros || 0),
+                          Number(r.capital || 0),
+                          Number(r.valorMulta || 0),
+                          Number(r.valorPagamento || 0),
                           formatBR(r.data),
+                          Number(r.vinicius || 0),
+                          Number(r.douglas || 0),
                           r.situacao,
-                          isQuitado ? "-" : Number(r.valor || 0),
-                          r.multa || "",
+                          prazo,
                           r.origem,
                         ]);
                       }
 
                       const wb = XLSX.utils.book_new();
                       const ws = XLSX.utils.aoa_to_sheet(aoa);
-                      ws["!merges"] = [{ s: { r: 0, c: 0 }, e: { r: 0, c: 6 } }];
+                      ws["!merges"] = [
+                        { s: { r: 0, c: 0 }, e: { r: 0, c: COL_LAST } },
+                        { s: { r: legendRowIndex, c: 0 }, e: { r: legendRowIndex, c: COL_LAST } },
+                      ];
                       ws["!cols"] = [
-                        { wch: 12 }, // Tipo
-                        { wch: 12 }, // Valor
-                        { wch: 18 }, // Data
-                        { wch: 12 }, // Situação
-                        { wch: 12 }, // Comissão
-                        { wch: 18 }, // Multa
-                        { wch: 55 }, // Origem
+                        { wch: 11 },
+                        { wch: 12 },
+                        { wch: 11 },
+                        { wch: 10 },
+                        { wch: 11 },
+                        { wch: 11 },
+                        { wch: 11 },
+                        { wch: 11 },
+                        { wch: 11 },
+                        { wch: 9 },
+                        { wch: 48 },
                       ];
 
-                      // Estilos: cabeçalho profissional + tabela
                       const teal = "14B8A6";
                       const tealDark = "0D9488";
                       const softBg = "F8FAFC";
                       const grid = "E2E8F0";
-                      const red = "C00000";
-
-                      const redFont = { color: { rgb: red }, bold: true };
                       const headerFont = { bold: true, color: { rgb: "000000" } };
                       const titleFont = { bold: true, sz: 15, color: { rgb: "FFFFFF" } };
                       const titleSubFont = { bold: true, color: { rgb: "FFFFFF" } };
 
-                      // Fundo do topo (A1:G3)
-                      for (let r = 0; r <= 2; r++) {
-                        for (let c = 0; c <= 6; c++) {
+                      for (let r = 0; r <= 4; r++) {
+                        for (let c = 0; c <= COL_LAST; c++) {
                           const addr = XLSX.utils.encode_cell({ r, c });
                           const cell = ws[addr] || (ws[addr] = { t: "s", v: "" } as any);
                           cell.s = {
@@ -1678,26 +1818,46 @@ export default function Configuracoes() {
                         }
                       }
 
-                      // Título (A1)
                       const a1 = ws["A1"];
                       if (a1) a1.s = { ...(a1.s || {}), font: titleFont, alignment: { horizontal: "center", vertical: "center" } };
 
-                      // Vinicius / Douglas (topo)
-                      const a2 = ws["A2"]; const b2 = ws["B2"];
-                      const a3 = ws["A3"]; const b3 = ws["B3"];
-                      if (a2) a2.s = { ...(a2.s || {}), font: titleSubFont, alignment: { horizontal: "left" } };
-                      if (a3) a3.s = { ...(a3.s || {}), font: titleSubFont, alignment: { horizontal: "left" } };
-                      if (b2) {
-                        b2.z = '"R$" #,##0.00';
-                        b2.s = { ...(b2.s || {}), font: titleSubFont, alignment: { horizontal: "left" } };
+                      const moneyCells = ["B2", "B3", "B4", "B5"];
+                      for (const addr of ["A2", "A3", "A4", "A5"]) {
+                        const cell = ws[addr];
+                        if (cell) cell.s = { ...(cell.s || {}), font: titleSubFont, alignment: { horizontal: "left" } };
                       }
-                      if (b3) {
-                        b3.z = '"R$" #,##0.00';
-                        b3.s = { ...(b3.s || {}), font: titleSubFont, alignment: { horizontal: "left" } };
+                      for (const addr of moneyCells) {
+                        const cell = ws[addr];
+                        if (cell) {
+                          cell.z = '"R$" #,##0.00';
+                          cell.s = { ...(cell.s || {}), font: titleSubFont, alignment: { horizontal: "left" } };
+                        }
                       }
 
-                      // Header row styles (row 4 in Excel => index 4? Actually aoa header row is row 4 => 1-based 4)
-                      for (let c = 0; c <= 6; c++) {
+                      for (let c = 0; c <= COL_LAST; c++) {
+                        const addr = XLSX.utils.encode_cell({ r: legendRowIndex, c });
+                        const cell = ws[addr] || (ws[addr] = { t: "s", v: "" } as any);
+                        cell.s = {
+                          ...(cell.s || {}),
+                          font: { sz: 9, color: { rgb: "334155" }, italic: true },
+                          fill: { fgColor: { rgb: "F8FAFC" } },
+                          alignment: { horizontal: "left", vertical: "center", wrapText: true },
+                          border: {
+                            top: { style: "thin", color: { rgb: grid } },
+                            bottom: { style: "thin", color: { rgb: grid } },
+                            left: { style: "thin", color: { rgb: grid } },
+                            right: { style: "thin", color: { rgb: grid } },
+                          },
+                        };
+                      }
+                      const legendAddr = XLSX.utils.encode_cell({ r: legendRowIndex, c: 0 });
+                      const legendCell = ws[legendAddr];
+                      if (legendCell) {
+                        legendCell.v = aoa[legendRowIndex]?.[0] ?? legendCell.v;
+                        legendCell.t = "s";
+                      }
+
+                      for (let c = 0; c <= COL_LAST; c++) {
                         const addr = XLSX.utils.encode_cell({ r: headerRowIndex, c });
                         const cell = ws[addr];
                         if (cell) {
@@ -1714,20 +1874,24 @@ export default function Configuracoes() {
                         }
                       }
 
-                      // Apply red style to quitado rows
-                      for (let rIdx = headerRowIndex + 1; rIdx < aoa.length; rIdx++) {
-                        const tipo = aoa[rIdx]?.[0];
-                        const situ = aoa[rIdx]?.[3];
-                        if (tipo === "Quitado" || situ === "Quitado") {
-                          for (let c = 0; c <= 6; c++) {
-                            const addr = XLSX.utils.encode_cell({ r: rIdx, c });
-                            const cell = ws[addr];
-                            if (cell) {
-                              cell.s = {
-                                ...(cell.s || {}),
-                                font: redFont,
-                              };
-                            }
+                      for (let i = 0; i < rows.length; i++) {
+                        const r = rows[i];
+                        const rIdx = headerRowIndex + 1 + i;
+                        const fill = COMMISSION_ROW_CATEGORY_META[r.category].excelFill;
+                        for (let c = 0; c <= COL_LAST; c++) {
+                          const addr = XLSX.utils.encode_cell({ r: rIdx, c });
+                          const cell = ws[addr];
+                          if (cell) {
+                            cell.s = {
+                              ...(cell.s || {}),
+                              fill: { fgColor: { rgb: fill } },
+                              border: {
+                                top: { style: "thin", color: { rgb: grid } },
+                                bottom: { style: "thin", color: { rgb: grid } },
+                                left: { style: "thin", color: { rgb: grid } },
+                                right: { style: "thin", color: { rgb: grid } },
+                              },
+                            };
                           }
                         }
                       }
@@ -1749,7 +1913,7 @@ export default function Configuracoes() {
                   variant="outline"
                   size="sm"
                   className="h-8 gap-2"
-                  disabled={loadingCommissions || !commissionSummary}
+                  disabled={loadingCommissions || loadingCommissionRows || !commissionSummary}
                   onClick={async () => {
                     try {
                       const rows = await fetchCommissionRows(commDateFrom, commDateTo);
@@ -1760,119 +1924,130 @@ export default function Configuracoes() {
                         return d && m && y ? `${d}/${m}/${y}` : ymd;
                       };
 
-                      const doc = new jsPDF();
+                      const title = `ACERTO - ${formatBR(commDateFrom)} / ${formatBR(commDateTo)}`;
+                      const doc = new jsPDF({ unit: "mm", format: "a4", orientation: "landscape" });
                       const pageW = doc.internal.pageSize.getWidth();
                       const pageH = doc.internal.pageSize.getHeight();
+                      const M = 8;
+                      const tableW = pageW - 2 * M;
 
                       const teal = PDF_BRAND.colors.primary;
                       const tealDark = PDF_BRAND.colors.primaryDark;
                       const line = PDF_BRAND.colors.line;
 
-                      // Fundo suave da página
-                      doc.setFillColor(248, 250, 252);
-                      doc.rect(0, 0, pageW, pageH, "F");
+                      const X = {
+                        tipo: M,
+                        juros: 24,
+                        capital: 46,
+                        multa: 66,
+                        pgto: 86,
+                        data: 106,
+                        vin: 128,
+                        doug: 154,
+                        sit: 182,
+                        prazo: 200,
+                        origem: 218,
+                      };
+                      const origemMaxW = pageW - M - X.origem;
+                      const lineH = 3.2;
 
-                      // Cabeçalho com cor
-                      doc.setFillColor(tealDark.r, tealDark.g, tealDark.b);
-                      doc.rect(0, 0, pageW, 18, "F");
-                      doc.setFillColor(teal.r, teal.g, teal.b);
-                      doc.rect(0, 18, pageW, 6, "F");
+                      const drawTealHeaderBlock = () => {
+                        doc.setFillColor(248, 250, 252);
+                        doc.rect(0, 0, pageW, pageH, "F");
+                        doc.setFillColor(tealDark.r, tealDark.g, tealDark.b);
+                        doc.rect(0, 0, pageW, 10, "F");
+                        doc.setFillColor(teal.r, teal.g, teal.b);
+                        doc.rect(0, 10, pageW, 22, "F");
+                        doc.setTextColor(255, 255, 255);
+                        doc.setFont("helvetica", "bold");
+                        doc.setFontSize(12);
+                        doc.text(title, pageW / 2, 6.5, { align: "center" });
+                        doc.setFontSize(9);
+                        doc.text("Vinicius", M, 14);
+                        doc.text(fmtMoney(commissionSummary.vinicius), 52, 14);
+                        doc.text("Douglas", M, 19);
+                        doc.text(fmtMoney(commissionSummary.douglas), 52, 19);
+                        doc.text("Total juros (comissão)", M, 24);
+                        doc.text(fmtMoney(commissionSummary.baseTotal), 52, 24);
+                        doc.text("Total multas", M, 29);
+                        doc.text(fmtMoney(commissionSummary.fineTotal), 52, 29);
+                        doc.setTextColor(30, 41, 59);
+                      };
 
-                      doc.setTextColor(255, 255, 255);
-                      doc.setFont("helvetica", "bold");
-                      doc.setFontSize(13);
-                      doc.text("ACERTO (COMISSÕES)", pageW / 2, 12, { align: "center" });
+                      const drawTableHeaderRow = (yy: number) => {
+                        doc.setFillColor(241, 245, 249);
+                        doc.rect(M, yy - 4.5, tableW, 7, "F");
+                        doc.setDrawColor(line.r, line.g, line.b);
+                        doc.rect(M, yy - 4.5, tableW, 7, "S");
+                        doc.setTextColor(15, 23, 42);
+                        doc.setFont("helvetica", "bold");
+                        doc.setFontSize(6.5);
+                        doc.text("Tipo", X.tipo, yy);
+                        doc.text("Juros", X.juros, yy);
+                        doc.text("Capital", X.capital, yy);
+                        doc.text("Multa", X.multa, yy);
+                        doc.text("Pgto", X.pgto, yy);
+                        doc.text("Data", X.data, yy);
+                        doc.text("Vin.", X.vin, yy);
+                        doc.text("Doug.", X.doug, yy);
+                        doc.text("Sit.", X.sit, yy);
+                        doc.text("Prazo", X.prazo, yy);
+                        doc.text("Origem", X.origem, yy);
+                        doc.setFont("helvetica", "normal");
+                        doc.setFontSize(6);
+                        doc.setDrawColor(line.r, line.g, line.b);
+                        doc.line(M, yy + 3, pageW - M, yy + 3);
+                        return yy + 5.5;
+                      };
 
-                      doc.setTextColor(255, 255, 255);
-                      doc.setFont("helvetica", "normal");
-                      doc.setFontSize(9);
-                      doc.text(
-                        `${PDF_BRAND.companyName} · ${PDF_BRAND.branch} · ${formatBR(commDateFrom)} a ${formatBR(commDateTo)}`,
-                        pageW / 2,
-                        22,
-                        { align: "center" },
-                      );
+                      const drawContinuationBanner = () => {
+                        doc.setFillColor(tealDark.r, tealDark.g, tealDark.b);
+                        doc.rect(0, 0, pageW, 8, "F");
+                        doc.setTextColor(255, 255, 255);
+                        doc.setFont("helvetica", "bold");
+                        doc.setFontSize(8);
+                        doc.text(title, pageW / 2, 5.2, { align: "center" });
+                        doc.setTextColor(30, 41, 59);
+                      };
 
-                      // Card de resumo
-                      let y = 34;
-                      doc.setDrawColor(line.r, line.g, line.b);
-                      doc.setFillColor(255, 255, 255);
-                      doc.roundedRect(14, y, pageW - 28, 28, 3, 3, "FD");
-                      y += 8;
-                      doc.setTextColor(30, 41, 59);
-                      doc.setFont("helvetica", "bold");
-                      doc.setFontSize(11);
-                      doc.text(`Base total: ${fmtMoney(commissionSummary.baseTotal)}`, 18, y);
-                      y += 7;
-                      doc.setFont("helvetica", "normal");
-                      doc.setFontSize(10);
-                      doc.text(`Vinicius (66,666%): ${fmtMoney(commissionSummary.vinicius)}`, 18, y);
-                      y += 6;
-                      doc.text(`Douglas (33,333%): ${fmtMoney(commissionSummary.douglas)}`, 18, y);
-                      y += 12;
-
-                      doc.setFont("helvetica", "bold");
-                      doc.text(`Base total: ${fmtMoney(commissionSummary.baseTotal)}`, 14, y);
-                      y += 6;
-                      doc.setFont("helvetica", "normal");
-                      doc.text(`Vinicius (66,666%): ${fmtMoney(commissionSummary.vinicius)}`, 14, y);
-                      y += 5;
-                      doc.text(`Douglas (33,333%): ${fmtMoney(commissionSummary.douglas)}`, 14, y);
-                      y += 10;
-
-                      // Cabeçalho da tabela
-                      doc.setFillColor(241, 245, 249);
-                      doc.roundedRect(14, y - 6, pageW - 28, 10, 2, 2, "F");
-                      doc.setTextColor(15, 23, 42);
-                      doc.setFont("helvetica", "bold");
-                      doc.setFontSize(10);
-                      doc.text("Tipo", 16, y);
-                      doc.text("Valor", 56, y);
-                      doc.text("Data", 92, y);
-                      doc.text("Origem", 122, y);
-                      y += 7;
-                      doc.setDrawColor(line.r, line.g, line.b);
-                      doc.line(14, y - 2, pageW - 14, y - 2);
-                      doc.setFont("helvetica", "normal");
-                      doc.setFontSize(9);
+                      drawTealHeaderBlock();
+                      let y = drawTableHeaderRow(38);
 
                       for (const r of rows) {
-                        if (y > 284) {
-                          doc.addPage();
-                          // Repete cabeçalho simplificado nas páginas seguintes
-                          doc.setFillColor(tealDark.r, tealDark.g, tealDark.b);
-                          doc.rect(0, 0, pageW, 12, "F");
-                          doc.setTextColor(255, 255, 255);
-                          doc.setFont("helvetica", "bold");
-                          doc.setFontSize(10);
-                          doc.text("ACERTO (COMISSÕES)", pageW / 2, 8, { align: "center" });
-                          doc.setTextColor(30, 41, 59);
-                          y = 22;
+                        const isQuitado = r.situacao === "Quitado" || r.tipo === "Quitado";
+                        const prazo =
+                          r.termoContrato === "20" ? "20d" : r.termoContrato === "30" ? "30d" : "—";
+                        const origemLines = doc.splitTextToSize(String(r.origem || ""), origemMaxW);
+                        const rowH = Math.max(4.8, origemLines.length * lineH + 1);
 
-                          doc.setFillColor(241, 245, 249);
-                          doc.roundedRect(14, y - 6, pageW - 28, 10, 2, 2, "F");
-                          doc.setTextColor(15, 23, 42);
-                          doc.setFont("helvetica", "bold");
-                          doc.setFontSize(10);
-                          doc.text("Tipo", 16, y);
-                          doc.text("Valor", 56, y);
-                          doc.text("Data", 92, y);
-                          doc.text("Origem", 122, y);
-                          y += 7;
-                          doc.setDrawColor(line.r, line.g, line.b);
-                          doc.line(14, y - 2, pageW - 14, y - 2);
-                          doc.setFont("helvetica", "normal");
-                          doc.setFontSize(9);
+                        if (y + rowH > pageH - 10) {
+                          doc.addPage();
+                          drawContinuationBanner();
+                          y = drawTableHeaderRow(14);
                         }
-                        const isQuitado = r.tipo === "Quitado" || r.situacao === "Quitado";
+
+                        const [br, bg, bb] = COMMISSION_ROW_CATEGORY_META[r.category].pdfRgb;
+                        doc.setFillColor(br, bg, bb);
+                        doc.setDrawColor(226, 232, 240);
+                        doc.rect(M, y - 3.2, tableW, rowH, "FD");
+
+                        doc.setTextColor(30, 41, 59);
+                        doc.setFont("helvetica", "normal");
+                        doc.setFontSize(6);
                         if (isQuitado) doc.setTextColor(192, 0, 0);
-                        doc.text(String(r.tipo).slice(0, 10), 16, y);
-                        doc.text(fmtMoney(r.valor).slice(0, 20), 56, y);
-                        doc.text(formatBR(r.data), 92, y);
-                        const origin = String(r.origem || "").slice(0, 60);
-                        doc.text(origin, 122, y);
-                        if (isQuitado) doc.setTextColor(0, 0, 0);
-                        y += 5;
+                        doc.text(String(r.tipo).slice(0, 12), X.tipo, y);
+                        if (isQuitado) doc.setTextColor(30, 41, 59);
+                        doc.text(fmtMoney(r.juros).slice(0, 12), X.juros, y);
+                        doc.text(fmtMoney(r.capital).slice(0, 12), X.capital, y);
+                        doc.text(fmtMoney(r.valorMulta).slice(0, 11), X.multa, y);
+                        doc.text(fmtMoney(r.valorPagamento).slice(0, 11), X.pgto, y);
+                        doc.text(formatBR(r.data), X.data, y);
+                        doc.text(fmtMoney(r.vinicius).slice(0, 11), X.vin, y);
+                        doc.text(fmtMoney(r.douglas).slice(0, 11), X.doug, y);
+                        doc.text(String(r.situacao || "").slice(0, 10), X.sit, y);
+                        doc.text(prazo, X.prazo, y);
+                        doc.text(origemLines, X.origem, y);
+                        y += rowH;
                       }
 
                       doc.save(`ACERTO - ${formatBR(commDateFrom)} - ${formatBR(commDateTo)}.pdf`);
@@ -1899,45 +2074,143 @@ export default function Configuracoes() {
               }
 
               return (
-                <div className="mt-4 grid grid-cols-1 md:grid-cols-2 gap-3">
-                  <div className="rounded-lg border border-border/50 bg-muted/20 p-4">
-                    <p className="text-xs text-muted-foreground">Base total</p>
-                    <p className="text-lg font-semibold text-foreground mt-1">
-                      {fmt(commissionSummary.baseTotal)}
-                    </p>
-                    <div className="mt-3 space-y-1 text-xs text-muted-foreground">
-                      <div className="flex justify-between gap-4">
-                        <span>Juros (pagamentos)</span>
-                        <span className="font-medium text-foreground">
-                          {fmt(commissionSummary.interestTotal)}
-                        </span>
+                <div className="mt-4 space-y-4">
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                    <div className="rounded-lg border border-border/50 bg-muted/20 p-4">
+                      <p className="text-xs text-muted-foreground">Total de juros no período (base de comissão)</p>
+                      <p className="text-lg font-semibold text-foreground mt-1">
+                        {fmt(commissionSummary.baseTotal)}
+                      </p>
+                      <div className="mt-3 space-y-1 text-xs text-muted-foreground">
+                        <div className="flex justify-between gap-4">
+                          <span>Juros (pagamentos de empréstimos)</span>
+                          <span className="font-medium text-foreground">
+                            {fmt(commissionSummary.interestTotal)}
+                          </span>
+                        </div>
                       </div>
-                      <div className="flex justify-between gap-4">
-                        <span>Parcelas (parcelamentos)</span>
-                        <span className="font-medium text-foreground">
-                          {fmt(commissionSummary.installmentsTotal)}
-                        </span>
+                    </div>
+
+                    <div className="rounded-lg border border-border/50 bg-muted/20 p-4">
+                      <p className="text-xs text-muted-foreground">Repartição (só sobre juros)</p>
+                      <div className="mt-3 space-y-2 text-sm">
+                        <div className="flex items-center justify-between gap-4">
+                          <span className="text-foreground font-medium">Vinicius (66,666%)</span>
+                          <span className="font-semibold text-foreground">
+                            {fmt(commissionSummary.vinicius)}
+                          </span>
+                        </div>
+                        <div className="flex items-center justify-between gap-4">
+                          <span className="text-foreground font-medium">Douglas (33,333%)</span>
+                          <span className="font-semibold text-foreground">
+                            {fmt(commissionSummary.douglas)}
+                          </span>
+                        </div>
                       </div>
+                    </div>
+
+                    <div className="rounded-lg border border-border/50 bg-muted/20 p-4">
+                      <p className="text-xs text-muted-foreground">Multas no período</p>
+                      <p className="text-lg font-semibold text-foreground mt-1">
+                        {fmt(commissionSummary.fineTotal)}
+                      </p>
+                      <p className="mt-2 text-[11px] text-muted-foreground leading-snug">
+                        Soma de multas recebidas no intervalo. Não entra na base de comissão de juros; aparece na tabela
+                        para conferência.
+                      </p>
                     </div>
                   </div>
 
-                  <div className="rounded-lg border border-border/50 bg-muted/20 p-4">
-                    <p className="text-xs text-muted-foreground">Repartição</p>
-                    <div className="mt-3 space-y-2 text-sm">
-                      <div className="flex items-center justify-between gap-4">
-                        <span className="text-foreground font-medium">Vinicius (66,666%)</span>
-                        <span className="font-semibold text-foreground">
-                          {fmt(commissionSummary.vinicius)}
-                        </span>
-                      </div>
-                      <div className="flex items-center justify-between gap-4">
-                        <span className="text-foreground font-medium">Douglas (33,333%)</span>
-                        <span className="font-semibold text-foreground">
-                          {fmt(commissionSummary.douglas)}
-                        </span>
-                      </div>
-                    </div>
-                  </div>
+                  {loadingCommissionRows ? (
+                    <p className="text-sm text-muted-foreground">Carregando linhas do período...</p>
+                  ) : (
+                    <ScrollArea className="h-[min(440px,52vh)] rounded-md border border-border/60">
+                        <table className="w-full text-[11px] border-collapse min-w-[56rem]">
+                          <thead className="sticky top-0 z-10 bg-background/95 backdrop-blur border-b shadow-sm">
+                            <tr className="text-left text-muted-foreground">
+                              <th className="p-2 font-medium whitespace-nowrap">Tipo</th>
+                              <th className="p-2 font-medium whitespace-nowrap bg-muted/50 border-l-2 border-amber-600 text-foreground">
+                                Juros
+                              </th>
+                              <th className="p-2 font-medium whitespace-nowrap bg-muted/50 border-l-2 border-sky-600 text-foreground">
+                                Capital
+                              </th>
+                              <th className="p-2 font-medium whitespace-nowrap bg-muted/50 border-l-2 border-pink-600 text-foreground">
+                                Multa
+                              </th>
+                              <th className="p-2 font-medium whitespace-nowrap">Valor pgto</th>
+                              <th className="p-2 font-medium whitespace-nowrap">Data</th>
+                              <th className="p-2 font-medium whitespace-nowrap bg-muted/50 border-l-2 border-violet-600 text-foreground">
+                                Vinícius
+                              </th>
+                              <th className="p-2 font-medium whitespace-nowrap bg-muted/50 border-l-2 border-emerald-600 text-foreground">
+                                Douglas
+                              </th>
+                              <th className="p-2 font-medium whitespace-nowrap">Situação</th>
+                              <th className="p-2 font-medium whitespace-nowrap">Prazo</th>
+                              <th className="p-2 font-medium min-w-[9rem]">Origem</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {commissionRows.length === 0 ? (
+                              <tr>
+                                <td colSpan={11} className="p-6 text-center text-muted-foreground">
+                                  Nenhum registro no período.
+                                </td>
+                              </tr>
+                            ) : (
+                              commissionRows.map((r) => {
+                                const prazo =
+                                  r.termoContrato === "20" ? (
+                                    <Badge className="h-5 px-1.5 text-[10px] font-semibold bg-amber-600 hover:bg-amber-600 text-white border-0">
+                                      20 dias
+                                    </Badge>
+                                  ) : r.termoContrato === "30" ? (
+                                    <Badge
+                                      variant="secondary"
+                                      className="h-5 px-1.5 text-[10px] font-medium border border-border/60"
+                                    >
+                                      30 dias
+                                    </Badge>
+                                  ) : (
+                                    <span className="text-muted-foreground">—</span>
+                                  );
+                                return (
+                                  <tr
+                                    key={r.paymentId}
+                                    className={`border-b border-border/50 align-top ${COMMISSION_TABLE_ROW_CLASS[r.category]}`}
+                                  >
+                                    <td className="p-2 text-foreground">{r.tipo}</td>
+                                    <td className="p-2 font-medium tabular-nums text-foreground border-l-2 border-amber-600/70">
+                                      {fmt(r.juros)}
+                                    </td>
+                                    <td className="p-2 font-medium tabular-nums text-foreground border-l-2 border-sky-600/70">
+                                      {fmt(r.capital)}
+                                    </td>
+                                    <td className="p-2 font-medium tabular-nums text-foreground border-l-2 border-pink-600/70">
+                                      {fmt(r.valorMulta)}
+                                    </td>
+                                    <td className="p-2 tabular-nums text-foreground">{fmt(r.valorPagamento)}</td>
+                                    <td className="p-2 whitespace-nowrap text-foreground">
+                                      {formatPreviewDate(r.data)}
+                                    </td>
+                                    <td className="p-2 font-medium tabular-nums text-foreground border-l-2 border-violet-600/70">
+                                      {fmt(r.vinicius)}
+                                    </td>
+                                    <td className="p-2 font-medium tabular-nums text-foreground border-l-2 border-emerald-600/70">
+                                      {fmt(r.douglas)}
+                                    </td>
+                                    <td className="p-2 text-foreground">{r.situacao}</td>
+                                    <td className="p-2">{prazo}</td>
+                                    <td className="p-2 text-foreground max-w-[14rem] break-words">{r.origem}</td>
+                                  </tr>
+                                );
+                              })
+                            )}
+                          </tbody>
+                        </table>
+                    </ScrollArea>
+                  )}
                 </div>
               );
             })()}

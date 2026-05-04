@@ -1,46 +1,37 @@
-import { supabase } from "@/lib/supabase";
+import { getSupabaseCompany, supabase } from "@/lib/supabase";
+import { amortizationWaterfall, effectiveLoanPrincipal, INTEREST_ONLY_TYPES } from "@/api/loan-calc";
 
-const INTEREST_ONLY_TYPES = [
-  "renewal",
-  "interest_renewal",
-  "early_payment_partial_interest",
-  "early_payment_interest_renewal",
-  "partial_interest",
-];
+/** PostgREST no Supabase limita `limit` ao máximo do projeto (ex.: 1000) — acima disso retorna 400. */
+// PostgREST/Supabase pode ter `max-rows` menor que 1000 dependendo do projeto.
+// Se pedirmos um range maior que o permitido, o servidor retorna 400.
+const REST_MAX_ROW_CANDIDATES = [1000, 500, 250, 100] as const;
 
-function computeLoanRemaining(
-  originalCapital: number,
-  interestRate: number,
-  payments: Array<{ amount: number; payment_type: string; fine_amount: number }>
-) {
-  let interestRateNorm = interestRate;
-  if (interestRateNorm > 100) interestRateNorm = interestRateNorm / 100;
+function dashboardSkipKey(name: string): string {
+  return `nfh_skip_${getSupabaseCompany()}_${name}`;
+}
 
-  const realPayments = payments.filter((p) => p.amount > 0);
-  let capitalPaid = 0;
-  let currentCapital = originalCapital;
+function shouldSkipOptionalResource(name: string): boolean {
+  if (typeof sessionStorage === "undefined") return false;
+  return sessionStorage.getItem(dashboardSkipKey(name)) === "1";
+}
 
-  for (const payment of realPayments) {
-    const amt = payment.amount;
-    const type = String(payment.payment_type || "");
+function markSkipOptionalResource(name: string): void {
+  if (typeof sessionStorage === "undefined") return;
+  sessionStorage.setItem(dashboardSkipKey(name), "1");
+}
 
-    if (INTEREST_ONLY_TYPES.includes(type)) {
-      // interest only
-    } else {
-      const currentInterest = currentCapital * (interestRateNorm / 100);
-      if (amt > currentInterest) {
-        const capitalReduction = amt - currentInterest;
-        capitalPaid += capitalReduction;
-        currentCapital = Math.max(0, currentCapital - capitalReduction);
-      }
-    }
-  }
-
-  const remainingCapital = Math.max(0, originalCapital - capitalPaid);
-  const remainingInterest = remainingCapital * (interestRateNorm / 100);
-  const remainingAmount = remainingCapital + remainingInterest;
-
-  return { remainingCapital, remainingInterest, remainingAmount };
+/** View/tabela ausente no projeto ou não exposta no schema cache do PostgREST. */
+function isMissingRestResource(error: { code?: string; message?: string } | null): boolean {
+  if (!error) return false;
+  const code = String(error.code || "");
+  if (code === "PGRST205" || code === "PGRST302") return true;
+  const m = String(error.message || "").toLowerCase();
+  return (
+    m.includes("does not exist") ||
+    m.includes("schema cache") ||
+    m.includes("could not find the table") ||
+    m.includes("requested resource wasn't found")
+  );
 }
 
 export async function fetchDashboardMetrics() {
@@ -60,7 +51,7 @@ export async function fetchDashboardMetrics() {
     try {
       const { data, error } = await supabase
         .from("loans")
-        .select("id, amount, interest_rate, status, due_date")
+        .select("id, amount, original_amount, interest_rate, status, due_date")
         .in("status", ["active", "partial_paid", "overdue"]);
       if (error) throw error;
       return (data || []) as Array<Record<string, unknown>>;
@@ -94,6 +85,7 @@ export async function fetchDashboardMetrics() {
   const activeLoans = (loansData || []) as Array<{
     id: string;
     amount: number;
+    original_amount?: number;
     interest_rate: number;
     status: string;
     due_date?: string;
@@ -143,14 +135,10 @@ export async function fetchDashboardMetrics() {
     }
 
     for (const loan of activeLoans) {
-      const originalCapital = parseFloat(String(loan.amount || 0));
+      const originalCapital = effectiveLoanPrincipal(loan as { original_amount?: unknown; amount?: unknown });
       const rate = parseFloat(String(loan.interest_rate || 0));
       const payments = paymentsByLoan[loan.id] || [];
-      const { remainingInterest, remainingAmount } = computeLoanRemaining(
-        originalCapital,
-        rate,
-        payments
-      );
+      const { remainingInterest, remainingAmount } = amortizationWaterfall(originalCapital, rate, payments);
       jurosRestante += remainingInterest;
       totalRestante += remainingAmount;
       // Vencido: por status OU por due_date (igual ao sistema antigo - getLoanStatusFromDueDate)
@@ -217,13 +205,17 @@ export async function fetchDashboardMetrics() {
 
   // Totais via views (1 linha) — PostgREST aceita bem e é rápido.
   const totalReceived = await (async () => {
+    if (shouldSkipOptionalResource("dash_pay_totals")) return 0;
     try {
       const { data, error } = await supabase
         .from("dashboard_payments_totals")
         .select("total_received")
         .limit(1)
         .maybeSingle();
-      if (error) throw error;
+      if (error) {
+        if (isMissingRestResource(error)) markSkipOptionalResource("dash_pay_totals");
+        throw error;
+      }
       return parseFloat(String((data as { total_received?: unknown } | null)?.total_received || 0)) || 0;
     } catch {
       return 0;
@@ -231,13 +223,17 @@ export async function fetchDashboardMetrics() {
   })();
 
   const expensesTotal = await (async () => {
+    if (shouldSkipOptionalResource("dash_exp_totals")) return 0;
     try {
       const { data, error } = await supabase
         .from("dashboard_expenses_totals")
         .select("expenses_total")
         .limit(1)
         .maybeSingle();
-      if (error) throw error;
+      if (error) {
+        if (isMissingRestResource(error)) markSkipOptionalResource("dash_exp_totals");
+        throw error;
+      }
       return parseFloat(String((data as { expenses_total?: unknown } | null)?.expenses_total || 0)) || 0;
     } catch {
       return 0;
@@ -288,6 +284,90 @@ export type ChartDataPoint = {
   juros: number; // lucro por juros (interesse recebido)
 };
 
+function toLocalYyyyMmDd(d: Date): string {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+/** `new Date("YYYY-MM-DD")` é UTC em muitos engines → mês errado no BR; usar meio-dia local. */
+function chartDayLocal(isoDay: string): Date | null {
+  const s = String(isoDay).split("T")[0];
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return null;
+  const d = new Date(`${s}T12:00:00`);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+const CHART_PAYMENT_SELECT = "id, loan_id, amount, payment_date, payment_type, fine_amount, created_at";
+const CHART_PAYMENTS_PAGE = 1000;
+
+/**
+ * Todos os pagamentos com data efetiva ≥ firstDateStr (igual filtro da tela Pagamentos).
+ * Substitui `.limit(10000)` sem ordem, que no Postgres retorna linhas arbitrárias e subconta meses recentes.
+ */
+async function fetchPaymentsForChart(firstDateStr: string): Promise<Array<Record<string, unknown>>> {
+  const byId = new Map<string, Record<string, unknown>>();
+
+  const addRows = (rows: Array<Record<string, unknown>> | null | undefined) => {
+    for (const r of rows || []) {
+      const id = String(r.id ?? "");
+      if (id) byId.set(id, r);
+    }
+  };
+
+  let offset = 0;
+  while (offset < 400_000) {
+    const { data, error } = await supabase
+      .from("payments")
+      .select(CHART_PAYMENT_SELECT)
+      .gte("payment_date", firstDateStr)
+      .order("payment_date", { ascending: true })
+      .range(offset, offset + CHART_PAYMENTS_PAGE - 1);
+    if (error) break;
+    const batch = data || [];
+    addRows(batch as Array<Record<string, unknown>>);
+    if (batch.length < CHART_PAYMENTS_PAGE) break;
+    offset += CHART_PAYMENTS_PAGE;
+  }
+
+  if (byId.size === 0) {
+    offset = 0;
+    while (offset < 400_000) {
+      const { data, error } = await supabase
+        .from("payments")
+        .select(CHART_PAYMENT_SELECT)
+        .order("payment_date", { ascending: false })
+        .range(offset, offset + CHART_PAYMENTS_PAGE - 1);
+      if (error) break;
+      const batch = (data || []) as Array<Record<string, unknown>>;
+      if (!batch.length) break;
+      for (const p of batch) {
+        const ds = String(p.payment_date || p.created_at || "").split("T")[0];
+        if (ds && ds >= firstDateStr) {
+          const key = String(p.id || `${p.loan_id}|${p.created_at}|${p.amount}`);
+          byId.set(key, p);
+        }
+      }
+      const last = batch[batch.length - 1];
+      const lastDay = String(last?.payment_date || "").split("T")[0];
+      if (lastDay && lastDay < firstDateStr) break;
+      if (batch.length < CHART_PAYMENTS_PAGE) break;
+      offset += CHART_PAYMENTS_PAGE;
+    }
+  }
+
+  const { data: nullDateRows } = await supabase
+    .from("payments")
+    .select(CHART_PAYMENT_SELECT)
+    .is("payment_date", null)
+    .gte("created_at", `${firstDateStr}T00:00:00`);
+
+  addRows((nullDateRows || []) as Array<Record<string, unknown>>);
+
+  return Array.from(byId.values());
+}
+
 export async function fetchDashboardChartData(months = 6): Promise<ChartDataPoint[]> {
   const today = new Date();
   const points: ChartDataPoint[] = [];
@@ -299,54 +379,97 @@ export async function fetchDashboardChartData(months = 6): Promise<ChartDataPoin
   }
 
   const firstDate = new Date(today.getFullYear(), today.getMonth() - months, 1);
-  const firstDateStr = firstDate.toISOString().split("T")[0];
+  /** Data local (evita deslocar o corte do mês com `toISOString()` em UTC). */
+  const firstDateStr = toLocalYyyyMmDd(firstDate);
 
-  const [loansRes, paymentsRes, finesRes] = await Promise.all([
+  const [loansRes, finesRes] = await Promise.all([
     supabase
       .from("loans")
       .select("id, amount, interest_rate, loan_date")
       .gte("loan_date", firstDateStr),
-    supabase
-      .from("payments")
-      .select("loan_id, amount, payment_date, payment_type, fine_amount, created_at")
-      .limit(10000),
-    supabase
-      .from("client_fines")
-      .select("amount, created_at")
-      .gte("created_at", `${firstDateStr}T00:00:00`),
+    (async () => {
+      if (shouldSkipOptionalResource("client_fines")) return { data: [] as Record<string, unknown>[] };
+      const { data, error } = await supabase
+        .from("client_fines")
+        .select("amount, created_at")
+        .gte("created_at", `${firstDateStr}T00:00:00`);
+      if (error) {
+        if (isMissingRestResource(error)) markSkipOptionalResource("client_fines");
+        return { data: [] as Record<string, unknown>[] };
+      }
+      return { data: (data || []) as Record<string, unknown>[] };
+    })(),
   ]);
 
+  const payments = await fetchPaymentsForChart(firstDateStr);
+
   const expenses = await (async () => {
-    const filterCancelled = (rows: Array<{ expense_date?: string; status?: string }>) =>
+    type ExpRow = {
+      amount?: unknown;
+      expense_date?: string;
+      date?: string;
+      created_at?: string;
+      status?: string;
+    };
+
+    const expenseDateStr = (e: ExpRow) =>
+      String(e.expense_date ?? e.date ?? e.created_at ?? "").split("T")[0];
+
+    const filterCancelled = (rows: ExpRow[]) =>
       rows.filter((e) => {
-        const d = String(e.expense_date || "").split("T")[0];
-        if (d < firstDateStr) return false;
+        const d = expenseDateStr(e);
+        if (d && d < firstDateStr) return false;
         return String(e.status || "") !== "cancelled";
       });
 
-    let { data, error } = await supabase
-      .from("expenses")
-      .select("amount, expense_date, status")
-      .gte("expense_date", firstDateStr);
-    if (!error && data) return filterCancelled(data);
+    const finishRows = (rows: ExpRow[]) => {
+      const withDate = rows.filter((e) => expenseDateStr(e));
+      const base = withDate.length ? filterCancelled(withDate) : rows;
+      return base.length ? base : rows;
+    };
 
-    ({ data, error } = await supabase
-      .from("expenses")
-      .select("amount, expense_date")
-      .gte("expense_date", firstDateStr));
-    if (!error && data) return data;
+    // Sem `.gte` no servidor: em alguns projetos PostgREST retorna 400 ao filtrar `expense_date`.
+    // `limit` acima do máximo do PostgREST (ex. 1000 no Supabase) também retorna 400 — usar `.range` paginado.
+    const selectVariants = [
+      "amount, expense_date",
+      "amount, expense_date, status",
+      "amount, date",
+      "amount, date, status",
+      "amount, created_at",
+      "amount, created_at, status",
+      "amount",
+    ] as const;
 
-    ({ data, error } = await supabase.from("expenses").select("amount, expense_date, status").limit(10000));
-    if (!error && data) return filterCancelled(data);
+    for (const selectStr of selectVariants) {
+      let picked: (typeof REST_MAX_ROW_CANDIDATES)[number] | null = null;
+      for (const pageSize of REST_MAX_ROW_CANDIDATES) {
+        const { error } = await supabase.from("expenses").select(selectStr).range(0, pageSize - 1);
+        if (!error) {
+          picked = pageSize;
+          break;
+        }
+      }
+      if (!picked) continue;
 
-    ({ data, error } = await supabase.from("expenses").select("amount, expense_date").limit(10000));
-    if (!error && data) return filterCancelled(data);
-
+      const acc: ExpRow[] = [];
+      let offset = 0;
+      for (;;) {
+        const { data, error } = await supabase.from("expenses").select(selectStr).range(offset, offset + picked - 1);
+        if (error) {
+          if (offset === 0) break;
+          return finishRows(acc);
+        }
+        const batch = (data || []) as ExpRow[];
+        acc.push(...batch);
+        if (batch.length < picked) return finishRows(acc);
+        offset += picked;
+        if (offset > 400_000) return finishRows(acc);
+      }
+    }
     return [];
   })();
 
   const loans = loansRes.data || [];
-  const payments = paymentsRes.data || [];
   const fines = finesRes.data || [];
 
   const loanIdsWithPaymentsInRange = new Set<string>();
@@ -355,25 +478,41 @@ export async function fetchDashboardChartData(months = 6): Promise<ChartDataPoin
     if (dateStr && dateStr >= firstDateStr) loanIdsWithPaymentsInRange.add(String((p as { loan_id?: string }).loan_id || ""));
   }
 
+  const LOAN_IN_CHUNK = 150;
+
   const allLoansForJuros = await (async () => {
-    if (loanIdsWithPaymentsInRange.size === 0) return [];
-    const { data } = await supabase.from("loans").select("id, amount, interest_rate").in("id", Array.from(loanIdsWithPaymentsInRange));
-    return data || [];
+    const idList = Array.from(loanIdsWithPaymentsInRange).filter(Boolean);
+    if (idList.length === 0) return [];
+    const acc: Array<Record<string, unknown>> = [];
+    for (let i = 0; i < idList.length; i += LOAN_IN_CHUNK) {
+      const { data } = await supabase
+        .from("loans")
+        .select("id, amount, interest_rate")
+        .in("id", idList.slice(i, i + LOAN_IN_CHUNK));
+      if (data?.length) acc.push(...(data as Array<Record<string, unknown>>));
+    }
+    return acc;
   })();
 
   const allPaymentsForJuros = await (async () => {
     if (allLoansForJuros.length === 0) return [];
-    const ids = allLoansForJuros.map((l: Record<string, unknown>) => l.id);
-    const { data } = await supabase
-      .from("payments")
-      .select("loan_id, amount, payment_type, payment_date, created_at")
-      .in("loan_id", ids)
-      .order("created_at", { ascending: true });
-    return data || [];
+    const ids = allLoansForJuros.map((l: Record<string, unknown>) => String(l.id)).filter(Boolean);
+    const acc: Array<Record<string, unknown>> = [];
+    for (let i = 0; i < ids.length; i += LOAN_IN_CHUNK) {
+      const { data } = await supabase
+        .from("payments")
+        .select("loan_id, amount, payment_type, payment_date, created_at")
+        .in("loan_id", ids.slice(i, i + LOAN_IN_CHUNK))
+        .order("created_at", { ascending: true });
+      if (data?.length) acc.push(...(data as Array<Record<string, unknown>>));
+    }
+    acc.sort((a, b) => String(a.created_at || "").localeCompare(String(b.created_at || "")));
+    return acc;
   })();
 
   const getMonthIndex = (dateStr: string) => {
-    const d = new Date(String(dateStr).split("T")[0]);
+    const d = chartDayLocal(dateStr);
+    if (!d) return -1;
     const y = d.getFullYear();
     const m = d.getMonth();
     for (let i = 0; i < points.length; i++) {
@@ -395,22 +534,17 @@ export async function fetchDashboardChartData(months = 6): Promise<ChartDataPoin
     const amt = parseFloat(String(p.amount || 0)) + parseFloat(String((p as { fine_amount?: number }).fine_amount || 0));
     const dateStr = String((p as { payment_date?: string }).payment_date || (p as { created_at?: string }).created_at || "").split("T")[0];
     if (!dateStr) continue;
-    const d = new Date(dateStr + "T12:00:00");
-    if (d.getTime() < cutoffTime) continue;
-    const y = d.getFullYear();
-    const m = d.getMonth();
-    for (let i = 0; i < points.length; i++) {
-      const pd = new Date(today.getFullYear(), today.getMonth() - (months - 1 - i), 1);
-      if (pd.getFullYear() === y && pd.getMonth() === m) {
-        points[i].pagamentos += amt;
-        break;
-      }
-    }
+    const d = chartDayLocal(dateStr);
+    if (!d || d.getTime() < cutoffTime) continue;
+    const idx = getMonthIndex(dateStr);
+    if (idx >= 0) points[idx].pagamentos += amt;
   }
 
   for (const e of expenses) {
-    const amt = parseFloat(String(e.amount || 0));
-    const dateStr = String((e as { expense_date?: string }).expense_date || "").split("T")[0];
+    const amt = parseFloat(String((e as { amount?: unknown }).amount || 0));
+    const ex = e as { expense_date?: string; date?: string; created_at?: string };
+    const dateStr = String(ex.expense_date ?? ex.date ?? ex.created_at ?? "").split("T")[0];
+    if (!dateStr) continue;
     const idx = getMonthIndex(dateStr);
     if (idx >= 0) points[idx].despesas += amt;
   }

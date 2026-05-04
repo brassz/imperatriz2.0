@@ -4,6 +4,7 @@ import { useQuery } from "@tanstack/react-query";
 import { fetchPayments, fetchPaymentsByDateRange, fetchPaymentsTotalForPeriod } from "@/api/payments";
 import { Pagination } from "@/components/Pagination";
 import { PAGE_SIZE } from "@/lib/constants";
+import { paymentTypeLabel } from "@/lib/payment-type-label";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -17,6 +18,8 @@ import {
   formatDateBR as pdfFormatDateBR,
   formatCurrency as pdfFormatCurrency,
 } from "@/lib/pdf-utils";
+import { supabase } from "@/lib/supabase";
+import { effectiveLoanPrincipal, INTEREST_ONLY_TYPES } from "@/api/loan-calc";
 
 function formatCurrency(n: number) {
   return "R$ " + n.toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -87,10 +90,88 @@ export default function Pagamentos() {
         toast.error("Nenhum pagamento no período selecionado");
         return;
       }
+
+      // Rateio por pagamento (capital x juros) com base no saldo devedor do empréstimo.
+      // Regras são as mesmas do cálculo do sistema (ver `amortizationWaterfall`).
+      const loanIds = Array.from(new Set(list.map((p: { loan_id: string }) => String(p.loan_id || "")).filter(Boolean)));
+      const { data: loansData, error: loansErr } = await supabase
+        .from("loans")
+        .select("id, amount, original_amount, interest_rate")
+        .in("id", loanIds);
+      if (loansErr) throw loansErr;
+
+      const loanById = new Map<string, { amount?: unknown; original_amount?: unknown; interest_rate?: unknown }>();
+      (loansData || []).forEach((l: any) => loanById.set(String(l.id), l));
+
+      // Pagamentos que abatem só capital.
+      const PRINCIPAL_ONLY_TYPES = new Set(["capital_renewal"]);
+
+      const splitByPaymentId = new Map<string, { juros: number; capital: number }>();
+      for (const loanId of loanIds) {
+        const loan = loanById.get(loanId);
+        const originalCapital = effectiveLoanPrincipal(loan || {});
+        let rate = parseFloat(String(loan?.interest_rate ?? 0));
+        if (rate > 100) rate = rate / 100;
+
+        let currentCapital = Math.max(0, originalCapital);
+        const paymentsForLoan = (list as any[])
+          .filter((p) => String(p.loan_id || "") === loanId)
+          .slice()
+          .sort((a, b) => {
+            const da = String(a.payment_date || "");
+            const db = String(b.payment_date || "");
+            if (da !== db) return da.localeCompare(db);
+            return String(a.id || "").localeCompare(String(b.id || ""));
+          });
+
+        for (const p of paymentsForLoan) {
+          const pid = String(p.id || "");
+          const amt = parseFloat(String(p.amount || 0));
+          const type = String(p.payment_type || "");
+
+          if (!pid) continue;
+          if (!(amt > 0)) {
+            splitByPaymentId.set(pid, { juros: 0, capital: 0 });
+            continue;
+          }
+
+          // Só juros
+          if (INTEREST_ONLY_TYPES.includes(type)) {
+            splitByPaymentId.set(pid, { juros: amt, capital: 0 });
+            continue;
+          }
+          // Só capital
+          if (PRINCIPAL_ONLY_TYPES.has(type)) {
+            splitByPaymentId.set(pid, { juros: 0, capital: amt });
+            currentCapital = Math.max(0, currentCapital - amt);
+            continue;
+          }
+
+          // Regra padrão: paga juros do saldo e o restante abate capital
+          const currentInterest = currentCapital * (rate / 100);
+          if (amt > currentInterest) {
+            const juros = currentInterest;
+            const capital = amt - currentInterest;
+            splitByPaymentId.set(pid, { juros, capital });
+            currentCapital = Math.max(0, currentCapital - capital);
+          } else {
+            splitByPaymentId.set(pid, { juros: amt, capital: 0 });
+          }
+        }
+      }
+
       const doc = new jsPDF();
       const m = getPdfMargin();
-      const totalAmount = list.reduce((s: number, p: { amount: number; fine_amount?: number }) => s + (p.amount || 0) + ((p as { fine_amount?: number }).fine_amount || 0), 0);
-      const subtitle = `Período: ${pdfFormatDateBR(from)} a ${pdfFormatDateBR(to)} | Total: ${pdfFormatCurrency(totalAmount)} | ${list.length} pagamento(s)`;
+      const totalAmount = list.reduce(
+        (s: number, p: { amount: number; fine_amount?: number }) =>
+          s + (p.amount || 0) + ((p as { fine_amount?: number }).fine_amount || 0),
+        0
+      );
+      const totalFine = list.reduce((s: number, p: { fine_amount?: number }) => s + (p.fine_amount || 0), 0);
+      const totalJuros = list.reduce((s: number, p: any) => s + (splitByPaymentId.get(String(p.id))?.juros || 0), 0);
+      const totalCapital = list.reduce((s: number, p: any) => s + (splitByPaymentId.get(String(p.id))?.capital || 0), 0);
+
+      const subtitle = `Período: ${pdfFormatDateBR(from)} a ${pdfFormatDateBR(to)} | Total: ${pdfFormatCurrency(totalAmount)} | Capital: ${pdfFormatCurrency(totalCapital)} | Juros: ${pdfFormatCurrency(totalJuros)} | Multas: ${pdfFormatCurrency(totalFine)} | ${list.length} pagamento(s)`;
 
       let y = addPdfHeader(doc, "Relatório de Pagamentos", subtitle);
       y += 4;
@@ -98,10 +179,11 @@ export default function Pagamentos() {
       doc.setFontSize(9);
       doc.setFont("helvetica", "bold");
       doc.text("Cliente", m, y);
-      doc.text("Valor", 70, y);
-      doc.text("Data", 100, y);
-      doc.text("Tipo", 130, y);
-      doc.text("Observações", 160, y);
+      doc.text("Total", 70, y);
+      doc.text("Capital", 95, y);
+      doc.text("Juros", 120, y);
+      doc.text("Multa", 142, y);
+      doc.text("Data", 160, y);
       y += 6;
 
       doc.setDrawColor(226, 232, 240);
@@ -110,7 +192,7 @@ export default function Pagamentos() {
 
       let pageNum = 1;
       doc.setFont("helvetica", "normal");
-      for (const p of list as Array<{ client_name: string; amount: number; fine_amount?: number; payment_date: string; payment_type: string; notes: string }>) {
+      for (const p of list as Array<{ id: string; client_name: string; amount: number; fine_amount?: number; payment_date: string; payment_type: string; notes: string }>) {
         if (y > 265) {
           addPdfFooter(doc, pageNum);
           doc.addPage();
@@ -118,20 +200,23 @@ export default function Pagamentos() {
           y = 20;
           doc.setFont("helvetica", "bold");
           doc.text("Cliente", m, y);
-          doc.text("Valor", 70, y);
-          doc.text("Data", 100, y);
-          doc.text("Tipo", 130, y);
-          doc.text("Observações", 160, y);
+          doc.text("Total", 70, y);
+          doc.text("Capital", 95, y);
+          doc.text("Juros", 120, y);
+          doc.text("Multa", 142, y);
+          doc.text("Data", 160, y);
           y = 28;
           doc.setFont("helvetica", "normal");
         }
-        const amt = p.amount + ((p.fine_amount as number) || 0);
-        const notes = String(p.notes || "").slice(0, 25);
+        const fine = (p.fine_amount as number) || 0;
+        const amt = p.amount + fine;
+        const split = splitByPaymentId.get(String(p.id)) || { juros: 0, capital: 0 };
         doc.text(String(p.client_name).slice(0, 22), m, y);
         doc.text(pdfFormatCurrency(amt), 70, y);
-        doc.text(pdfFormatDateBR(p.payment_date), 100, y);
-        doc.text(String(p.payment_type).slice(0, 12), 130, y);
-        doc.text(notes, 160, y);
+        doc.text(pdfFormatCurrency(split.capital), 95, y);
+        doc.text(pdfFormatCurrency(split.juros), 120, y);
+        doc.text(pdfFormatCurrency(fine), 142, y);
+        doc.text(pdfFormatDateBR(p.payment_date), 160, y);
         y += 6;
       }
       addPdfFooter(doc, pageNum);
@@ -253,7 +338,7 @@ export default function Pagamentos() {
                     </td>
                     <td className="p-4">
                       <span className="inline-flex px-2 py-0.5 rounded-full text-[10px] font-medium bg-primary/10 text-primary">
-                        {String(p.payment_type)}
+                        {paymentTypeLabel(String(p.payment_type))}
                       </span>
                     </td>
                     <td className="p-4 text-sm text-muted-foreground">{String(p.notes || "—")}</td>

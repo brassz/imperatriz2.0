@@ -10,7 +10,14 @@ import { PAGE_SIZE } from "@/lib/constants";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Label } from "@/components/ui/label";
 import { toast } from "sonner";
-import { fetchEmergencyContacts, fetchGuarantors } from "@/api/contacts";
+import {
+  fetchEmergencyContacts,
+  fetchGuarantors,
+  insertEmergencyContact,
+  insertGuarantor,
+} from "@/api/contacts";
+import { consultInfoseekCpf, type InfoseekConsultResult } from "@/api/infoseek";
+import { InfoseekConsultBody } from "@/components/InfoseekConsultBody";
 
 export default function Clientes() {
   const [search, setSearch] = useState("");
@@ -29,6 +36,14 @@ export default function Clientes() {
     address: "",
     instagram: "",
     facebook: "",
+    guarantor_name: "",
+    guarantor_cpf: "",
+    guarantor_phone: "",
+    guarantor_relationship: "",
+    guarantor_email: "",
+    emergency_name: "",
+    emergency_phone: "",
+    emergency_relationship: "",
   });
   const [editClient, setEditClient] = useState({
     name: "",
@@ -40,6 +55,13 @@ export default function Clientes() {
     instagram: "",
     facebook: "",
   });
+
+  const [detailsInfoseekCpf, setDetailsInfoseekCpf] = useState("");
+  const [detailsInfoseekResult, setDetailsInfoseekResult] = useState<InfoseekConsultResult | null>(null);
+  const [detailsInfoseekLoading, setDetailsInfoseekLoading] = useState(false);
+
+  const [newClientInfoseekLoading, setNewClientInfoseekLoading] = useState(false);
+  const [newClientInfoseekPreview, setNewClientInfoseekPreview] = useState<InfoseekConsultResult | null>(null);
 
   const { data, isLoading, error } = useQuery({
     queryKey: ["clients", page, search],
@@ -89,6 +111,16 @@ export default function Clientes() {
   useEffect(() => {
     setPage(1);
   }, [search]);
+
+  useEffect(() => {
+    if (!detailsOpen || !detailsClient) return;
+    setDetailsInfoseekCpf(String((detailsClient as Record<string, unknown>).cpf || ""));
+    setDetailsInfoseekResult(null);
+  }, [detailsOpen, detailsClient]);
+
+  useEffect(() => {
+    if (!newClientOpen) setNewClientInfoseekPreview(null);
+  }, [newClientOpen]);
 
   const normalizeInstagramUrl = (raw: string): string | null => {
     const s = String(raw || "").trim();
@@ -312,8 +344,16 @@ export default function Clientes() {
         <Pagination page={page} total={totalClients} pageSize={PAGE_SIZE} onPageChange={setPage} />
       </div>
 
-      <Dialog open={newClientOpen} onOpenChange={setNewClientOpen}>
-        <DialogContent className="max-w-md max-h-[90vh] overflow-y-auto">
+      <Dialog
+        open={newClientOpen}
+        onOpenChange={(o) => {
+          setNewClientOpen(o);
+          if (!o) {
+            setNewClientInfoseekPreview(null);
+          }
+        }}
+      >
+        <DialogContent className="max-w-lg max-h-[90vh] overflow-y-auto">
           <DialogHeader>
             <DialogTitle>Novo cliente</DialogTitle>
           </DialogHeader>
@@ -324,7 +364,59 @@ export default function Clientes() {
             </div>
             <div className="grid gap-1.5">
               <Label className="text-xs">CPF</Label>
-              <Input value={newClient.cpf} onChange={(e) => setNewClient((p) => ({ ...p, cpf: e.target.value }))} />
+              <div className="flex gap-2">
+                <Input
+                  className="flex-1"
+                  value={newClient.cpf}
+                  onChange={(e) => setNewClient((p) => ({ ...p, cpf: e.target.value }))}
+                  placeholder="000.000.000-00"
+                />
+                <Button
+                  type="button"
+                  variant="secondary"
+                  size="sm"
+                  className="shrink-0 gap-1"
+                  disabled={newClientInfoseekLoading}
+                  onClick={async () => {
+                    setNewClientInfoseekLoading(true);
+                    try {
+                      const r = await consultInfoseekCpf(newClient.cpf);
+                      setNewClientInfoseekPreview(r);
+                      toast.success("Consulta concluída");
+                    } catch (e) {
+                      setNewClientInfoseekPreview(null);
+                      toast.error(e instanceof Error ? e.message : "Erro na consulta");
+                    } finally {
+                      setNewClientInfoseekLoading(false);
+                    }
+                  }}
+                >
+                  <Search className="h-3.5 w-3.5" />
+                  {newClientInfoseekLoading ? "…" : "Consultar"}
+                </Button>
+              </div>
+              {newClientInfoseekPreview ? (
+                <div className="rounded-md border border-border/50 bg-muted/20 p-3 space-y-2 text-xs">
+                  <InfoseekConsultBody result={newClientInfoseekPreview} />
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    className="h-7 text-[11px]"
+                    onClick={() => {
+                      setNewClient((p) => ({
+                        ...p,
+                        name: p.name.trim() ? p.name : newClientInfoseekPreview.nome,
+                        phone: p.phone.trim() ? p.phone : newClientInfoseekPreview.telefones[0]?.telefone || p.phone,
+                        email: p.email.trim() ? p.email : newClientInfoseekPreview.emails[0]?.email || p.email,
+                      }));
+                      toast.success("Nome e contatos preenchidos onde estavam vazios");
+                    }}
+                  >
+                    Preencher nome e contatos (campos vazios)
+                  </Button>
+                </div>
+              ) : null}
             </div>
             <div className="grid gap-1.5">
               <Label className="text-xs">Telefone</Label>
@@ -354,6 +446,79 @@ export default function Clientes() {
                 onChange={(e) => setNewClient((p) => ({ ...p, facebook: e.target.value }))}
               />
             </div>
+
+            <div className="rounded-lg border border-border/50 bg-muted/15 p-3 space-y-3">
+              <p className="text-xs font-semibold text-foreground">Avalista (opcional)</p>
+              <div className="grid gap-1.5 sm:grid-cols-2">
+                <div className="grid gap-1.5 sm:col-span-2">
+                  <Label className="text-xs">Nome</Label>
+                  <Input
+                    value={newClient.guarantor_name}
+                    onChange={(e) => setNewClient((p) => ({ ...p, guarantor_name: e.target.value }))}
+                    placeholder="Nome completo"
+                  />
+                </div>
+                <div className="grid gap-1.5">
+                  <Label className="text-xs">CPF</Label>
+                  <Input
+                    value={newClient.guarantor_cpf}
+                    onChange={(e) => setNewClient((p) => ({ ...p, guarantor_cpf: e.target.value }))}
+                  />
+                </div>
+                <div className="grid gap-1.5">
+                  <Label className="text-xs">Telefone</Label>
+                  <Input
+                    value={newClient.guarantor_phone}
+                    onChange={(e) => setNewClient((p) => ({ ...p, guarantor_phone: e.target.value }))}
+                  />
+                </div>
+                <div className="grid gap-1.5">
+                  <Label className="text-xs">Parentesco</Label>
+                  <Input
+                    value={newClient.guarantor_relationship}
+                    onChange={(e) => setNewClient((p) => ({ ...p, guarantor_relationship: e.target.value }))}
+                    placeholder="Ex.: cônjuge,irmão"
+                  />
+                </div>
+                <div className="grid gap-1.5">
+                  <Label className="text-xs">E-mail</Label>
+                  <Input
+                    type="email"
+                    value={newClient.guarantor_email}
+                    onChange={(e) => setNewClient((p) => ({ ...p, guarantor_email: e.target.value }))}
+                  />
+                </div>
+              </div>
+            </div>
+
+            <div className="rounded-lg border border-border/50 bg-muted/15 p-3 space-y-3">
+              <p className="text-xs font-semibold text-foreground">Contato de emergência (opcional)</p>
+              <div className="grid gap-1.5 sm:grid-cols-2">
+                <div className="grid gap-1.5 sm:col-span-2">
+                  <Label className="text-xs">Nome</Label>
+                  <Input
+                    value={newClient.emergency_name}
+                    onChange={(e) => setNewClient((p) => ({ ...p, emergency_name: e.target.value }))}
+                    placeholder="Nome completo"
+                  />
+                </div>
+                <div className="grid gap-1.5">
+                  <Label className="text-xs">Telefone</Label>
+                  <Input
+                    value={newClient.emergency_phone}
+                    onChange={(e) => setNewClient((p) => ({ ...p, emergency_phone: e.target.value }))}
+                  />
+                </div>
+                <div className="grid gap-1.5">
+                  <Label className="text-xs">Parentesco</Label>
+                  <Input
+                    value={newClient.emergency_relationship}
+                    onChange={(e) => setNewClient((p) => ({ ...p, emergency_relationship: e.target.value }))}
+                    placeholder="Ex.: pai, amigo"
+                  />
+                </div>
+              </div>
+            </div>
           </div>
           <DialogFooter className="mt-4">
             <Button variant="outline" onClick={() => setNewClientOpen(false)}>
@@ -365,11 +530,73 @@ export default function Clientes() {
                   toast.error("Informe o nome");
                   return;
                 }
+                const emptyNewClient = {
+                  name: "",
+                  cpf: "",
+                  phone: "",
+                  email: "",
+                  address: "",
+                  instagram: "",
+                  facebook: "",
+                  guarantor_name: "",
+                  guarantor_cpf: "",
+                  guarantor_phone: "",
+                  guarantor_relationship: "",
+                  guarantor_email: "",
+                  emergency_name: "",
+                  emergency_phone: "",
+                  emergency_relationship: "",
+                };
                 try {
-                  await createClient(newClient);
+                  const created = await createClient({
+                    name: newClient.name,
+                    cpf: newClient.cpf,
+                    phone: newClient.phone,
+                    email: newClient.email,
+                    address: newClient.address,
+                    instagram: newClient.instagram,
+                    facebook: newClient.facebook,
+                  });
+                  const clientId = String((created as { id?: string }).id || "");
+                  const contactIssues: string[] = [];
+                  if (clientId && newClient.guarantor_name.trim()) {
+                    try {
+                      await insertGuarantor({
+                        client_id: clientId,
+                        name: newClient.guarantor_name,
+                        cpf: newClient.guarantor_cpf,
+                        phone: newClient.guarantor_phone,
+                        relationship: newClient.guarantor_relationship,
+                        email: newClient.guarantor_email,
+                      });
+                    } catch (err) {
+                      contactIssues.push(
+                        err instanceof Error ? `Avalista: ${err.message}` : "Avalista não foi salvo.",
+                      );
+                    }
+                  }
+                  if (clientId && newClient.emergency_name.trim()) {
+                    try {
+                      await insertEmergencyContact({
+                        client_id: clientId,
+                        name: newClient.emergency_name,
+                        phone: newClient.emergency_phone,
+                        relationship: newClient.emergency_relationship,
+                      });
+                    } catch (err) {
+                      contactIssues.push(
+                        err instanceof Error
+                          ? `Emergência: ${err.message}`
+                          : "Contato de emergência não foi salvo.",
+                      );
+                    }
+                  }
                   toast.success("Cliente criado");
+                  if (contactIssues.length > 0) {
+                    toast.warning(contactIssues.join(" "));
+                  }
                   setNewClientOpen(false);
-                  setNewClient({ name: "", cpf: "", phone: "", email: "", address: "", instagram: "", facebook: "" });
+                  setNewClient(emptyNewClient);
                   queryClient.invalidateQueries({ queryKey: ["clients"] });
                 } catch (e) {
                   toast.error(e instanceof Error ? e.message : "Erro ao criar cliente");
@@ -509,6 +736,48 @@ export default function Clientes() {
                   );
                 })()}
               </div>
+            </div>
+
+            <div className="rounded-lg border border-border/50 bg-muted/20 p-4 space-y-3">
+              <p className="text-xs font-semibold text-foreground flex items-center gap-2">
+                <Search className="h-3.5 w-3.5" />
+                Consulta por CPF
+              </p>
+              <div className="flex flex-col sm:flex-row gap-2">
+                <Input
+                  className="text-xs font-mono h-9"
+                  value={detailsInfoseekCpf}
+                  onChange={(e) => setDetailsInfoseekCpf(e.target.value)}
+                  placeholder="CPF para consultar"
+                />
+                <Button
+                  type="button"
+                  variant="secondary"
+                  size="sm"
+                  className="shrink-0 gap-1.5"
+                  disabled={detailsInfoseekLoading}
+                  onClick={async () => {
+                    setDetailsInfoseekLoading(true);
+                    try {
+                      const r = await consultInfoseekCpf(detailsInfoseekCpf);
+                      setDetailsInfoseekResult(r);
+                      toast.success("Consulta concluída");
+                    } catch (e) {
+                      setDetailsInfoseekResult(null);
+                      toast.error(e instanceof Error ? e.message : "Erro na consulta");
+                    } finally {
+                      setDetailsInfoseekLoading(false);
+                    }
+                  }}
+                >
+                  {detailsInfoseekLoading ? "Consultando…" : "Consultar"}
+                </Button>
+              </div>
+              {detailsInfoseekResult ? (
+                <div className="rounded-md border border-border/40 bg-background/60 p-3 space-y-2 text-xs">
+                  <InfoseekConsultBody result={detailsInfoseekResult} />
+                </div>
+              ) : null}
             </div>
 
             <div className="rounded-lg border border-border/50 bg-muted/20 p-4">

@@ -1,8 +1,8 @@
 import { memo } from "react";
 import {
-  LayoutDashboard, Users, Landmark, CalendarCheck, CalendarDays, CreditCard,
+  LayoutDashboard, Users, Search, Landmark, CalendarCheck, CalendarDays, CreditCard,
   AlertTriangle, Wallet, Receipt, TrendingUp, History, IdCard, Sparkles,
-  BarChart3, FileText, Settings, UserCog, ChevronLeft, LogOut, Clock
+  BarChart3, FileText, Settings, UserCog, ChevronLeft, LogOut
 } from "lucide-react";
 import { NavLink } from "@/components/NavLink";
 import { useAuth } from "@/contexts/AuthContext";
@@ -15,6 +15,7 @@ import {
 const mainItems = [
   { title: "Dashboard", url: "/", icon: LayoutDashboard },
   { title: "Clientes", url: "/clientes", icon: Users },
+  { title: "Consultas", url: "/consultas", icon: Search },
   { title: "Empréstimos", url: "/emprestimos", icon: Landmark },
   { title: "Parcelamentos", url: "/parcelamentos", icon: CalendarCheck },
   { title: "Calendário", url: "/calendario", icon: CalendarDays },
@@ -34,7 +35,6 @@ const financialItems = [
 const systemItems = [
   { title: "Relatórios", url: "/relatorios", icon: BarChart3 },
   { title: "PDFs", url: "/pdfs", icon: FileText },
-  { title: "Envios automáticos", url: "/envios-automaticos", icon: Clock },
   { title: "Configurações", url: "/configuracoes", icon: Settings },
   { title: "Usuários", url: "/usuarios", icon: UserCog },
 ];
@@ -54,7 +54,7 @@ const SidebarSection = memo(function SidebarSection({ label, items }: { label: s
         <SidebarMenu>
           {items.map((item) => (
             <SidebarMenuItem key={item.title}>
-              <SidebarMenuButton asChild className="h-9">
+              <SidebarMenuButton asChild className="min-h-11 h-11 py-2 md:min-h-9 md:h-9">
                 <NavLink
                   to={item.url}
                   end={item.url === "/"}

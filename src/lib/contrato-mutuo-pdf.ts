@@ -20,7 +20,6 @@ export type ContratoMutuoParams = {
   avalista?: ContratoMutuoAvalista | null;
   valorEmprestado: number;
   vencimento: string; // YYYY-MM-DD
-  jurosAoMesPercent: number;
   multaPercent: number;
   cidadeUf: string;
   dataAssinatura: string; // YYYY-MM-DD
@@ -32,6 +31,9 @@ const MUTUANTE = {
   endereco: "AV Presidente Vargas 700, Franca/SP.",
 };
 
+/** Juros ao mês exibidos no texto do contrato PDF (valor fixo do instrumento). */
+const JUROS_CONTRATO_PDF_PERCENT = 1;
+
 function safeLine(s: unknown, fallback = "—"): string {
   const v = String(s ?? "").trim();
   return v ? v : fallback;
@@ -41,11 +43,10 @@ function ymd(s: string): string {
   return String(s || "").split("T")[0];
 }
 
-function addParagraph(doc: jsPDF, text: string, x: number, y: number, maxWidth: number): number {
-  const lines = doc.splitTextToSize(text, maxWidth) as string[];
+function addLines(doc: jsPDF, lines: string[], x: number, y: number, lineH = 5): number {
   for (const line of lines) {
     doc.text(line, x, y);
-    y += 5;
+    y += lineH;
   }
   return y;
 }
@@ -55,8 +56,8 @@ export function generateContratoMutuoPdf(params: ContratoMutuoParams): jsPDF {
   const m = 14;
   const pageW = 210;
   const pageH = 297;
-  const maxWidth = pageW - m * 2;
   const bottom = pageH - 18;
+  const lineH = 5;
 
   const mutuario = params.mutuario;
   const avalista = params.avalista ?? null;
@@ -77,25 +78,23 @@ export function generateContratoMutuoPdf(params: ContratoMutuoParams): jsPDF {
   doc.setFont("helvetica", "normal");
   doc.setFontSize(11);
 
-  y = addParagraph(
-    doc,
-    "Pelo presente instrumento particular, as partes abaixo qualificadas:",
-    m,
-    y,
-    maxWidth,
-  );
+  // Importante: manter texto/linhas iguais ao modelo de referência.
+  y = addLines(doc, ["Pelo presente instrumento particular, as partes abaixo qualificadas:"], m, y, lineH);
   y += 2;
 
   doc.setFont("helvetica", "bold");
   doc.text("MUTUANTE:", m, y);
   doc.setFont("helvetica", "normal");
   y += 6;
-  y = addParagraph(
+  y = addLines(
     doc,
-    `${MUTUANTE.nome}, pessoa jurídica de direito privado, inscrita no CNPJ sob nº ${MUTUANTE.cnpj}, com sede à ${MUTUANTE.endereco}`,
+    [
+      `${MUTUANTE.nome}, pessoa jurídica de direito privado, inscrita no CNPJ sob nº ${MUTUANTE.cnpj}, com sede à`,
+      `${MUTUANTE.endereco}`,
+    ],
     m,
     y,
-    maxWidth,
+    lineH
   );
   y += 2;
 
@@ -103,12 +102,17 @@ export function generateContratoMutuoPdf(params: ContratoMutuoParams): jsPDF {
   doc.text("MUTUÁRIO:", m, y);
   doc.setFont("helvetica", "normal");
   y += 6;
-  y = addParagraph(
+  // Mantém o texto do modelo (inclusive "residente e domiciliada à").
+  // Para ficar idêntico, usamos quebras fixas; os valores mudam, mas a estrutura não.
+  y = addLines(
     doc,
-    `${safeLine(mutuario.name)}, brasileiro, portador do CPF nº ${safeLine(mutuario.cpf, "—")}, RG nº ${safeLine(mutuario.rg, "—")}, residente e domiciliada à ${mutuarioAddr}.`,
+    [
+      `${safeLine(mutuario.name)}, brasileiro, portador do CPF nº ${safeLine(mutuario.cpf, "—")}, RG nº ${safeLine(mutuario.rg, "—")}, residente e domiciliada à`,
+      `${mutuarioAddr}.`,
+    ],
     m,
     y,
-    maxWidth,
+    lineH
   );
   y += 2;
 
@@ -117,60 +121,98 @@ export function generateContratoMutuoPdf(params: ContratoMutuoParams): jsPDF {
     doc.text("AVALISTA:", m, y);
     doc.setFont("helvetica", "normal");
     y += 6;
-    y = addParagraph(
+    y = addLines(
       doc,
-      `${safeLine(avalista.name)}, brasileiro, portador do CPF nº ${safeLine(avalista.cpf, "—")}, RG nº ${safeLine(avalista.rg, "—")}, residente e domiciliado à ${avalistaAddr}, que neste ato assume a responsabilidade solidária pelo pagamento da dívida.`,
+      [
+        `${safeLine(avalista.name)}, brasileiro, portador do CPF nº ${safeLine(avalista.cpf, "—")}, RG nº ${safeLine(avalista.rg, "—")}, residente e domiciliado à`,
+        `${avalistaAddr},`,
+        "que neste ato assume a responsabilidade solidária pelo pagamento da dívida.",
+      ],
       m,
       y,
-      maxWidth,
+      lineH
     );
     y += 2;
   }
 
-  y = addParagraph(
+  y = addLines(
     doc,
-    "Têm entre si justo e acordado o presente contrato de mútuo, que se regerá pelas seguintes cláusulas e condições:",
+    ["Têm entre si justo e acordado o presente contrato de mútuo, que se regerá pelas seguintes cláusulas e", "condições:"],
     m,
     y,
-    maxWidth,
+    lineH
   );
   y += 4;
 
-  const clauses: string[] = [
-    "CLÁUSULA PRIMEIRA - DO OBJETO DO CONTRATO",
-    `1.1. Pelo presente instrumento, o MUTUANTE empresta ao MUTUÁRIO, que aceita, a quantia de ${valor}, que será utilizada conforme acordado entre as partes. O MUTUÁRIO declara ter recebido o valor nesta data.`,
-    "CLÁUSULA SEGUNDA - DO PRAZO E FORMA DE PAGAMENTO",
-    `2.1. O valor do mútuo será devolvido em uma parcela única, com vencimento em ${venc}, podendo ser renegociado por escrito. O pagamento deverá ser feito por transferência bancária ou outro meio acordado.`,
-    "CLÁUSULA TERCEIRA - DOS ENCARGOS PELO EMPRÉSTIMO",
-    `3.1. O mútuo será acrescido de juros de ${params.jurosAoMesPercent}% ao mês e multa de ${params.multaPercent}% sobre o valor da parcela vencida, além de correção monetária pelo IGPM/FGV.`,
-    "CLÁUSULA QUARTA - DA CONFISSÃO DE DÍVIDA",
-    "4.1. O MUTUÁRIO confessa que a dívida é líquida, certa e exigível, não podendo contestar sua existência ou valor. Em caso de inadimplemento, o MUTUANTE poderá exigir o pagamento imediato do saldo devedor, acrescido de encargos.",
-    "CLÁUSULA QUINTA - DA GARANTIA E DA EXECUÇÃO",
-    "5.1. O contrato é título executivo extrajudicial, conforme artigo 784, III do CPC, podendo o MUTUANTE requerer judicialmente a penhora de bens do MUTUÁRIO em caso de inadimplência.",
-    ...(avalista
-      ? [
-          "5.2. O AVALISTA assume responsabilidade solidária pelo pagamento integral da dívida, juros, multa e demais encargos, podendo ser executado diretamente pelo MUTUANTE em caso de inadimplemento do MUTUÁRIO, independentemente de ordem de preferência ou benefício de ordem.",
-        ]
-      : []),
-    "CLÁUSULA SEXTA - DA NOTIFICAÇÃO",
-    "6.1. Em caso de inadimplemento, o MUTUANTE notificará o MUTUÁRIO por carta registrada ou e-mail, concedendo-lhe 10 dias para regularizar o pagamento.",
-    "CLÁUSULA SÉTIMA - DO FORO",
-    "7.1. Fica eleito o foro da Comarca de Franca/SP para dirimir qualquer litígio decorrente deste contrato.",
+  const clauses: Array<{ type: "title" | "text"; lines: string[] }> = [
+    { type: "title", lines: ["CLÁUSULA PRIMEIRA - DO OBJETO DO CONTRATO"] },
+    {
+      type: "text",
+      lines: [
+        "1.1. Pelo presente instrumento, o MUTUANTE empresta ao MUTUÁRIO, que aceita, a quantia de R$",
+        `${valor.replace(/^R\$\s?/, "")}, que será utilizada conforme acordado entre as partes. O MUTUÁRIO declara ter recebido o valor`,
+        "nesta data.",
+      ],
+    },
+    { type: "title", lines: ["CLÁUSULA SEGUNDA - DO PRAZO E FORMA DE PAGAMENTO"] },
+    {
+      type: "text",
+      lines: [
+        `2.1. O valor do mútuo será devolvido em uma parcela única, com vencimento em ${venc}, podendo`,
+        "ser renegociado por escrito. O pagamento deverá ser feito por transferência bancária ou outro meio",
+        "acordado.",
+      ],
+    },
+    { type: "title", lines: ["CLÁUSULA TERCEIRA - DOS ENCARGOS PELO EMPRÉSTIMO"] },
+    {
+      type: "text",
+      lines: [
+        `3.1. O mútuo será acrescido de juros de ${JUROS_CONTRATO_PDF_PERCENT}% ao mês e multa de ${params.multaPercent}% sobre o valor da parcela vencida,`,
+        "além de correção monetária pelo IGPM/FGV.",
+      ],
+    },
+    { type: "title", lines: ["CLÁUSULA QUARTA - DA CONFISSÃO DE DÍVIDA"] },
+    {
+      type: "text",
+      lines: [
+        "4.1. O MUTUÁRIO confessa que a dívida é líquida, certa e exigível, não podendo contestar sua existência",
+        "ou valor. Em caso de inadimplemento, o MUTUANTE poderá exigir o pagamento imediato do saldo",
+        "devedor, acrescido de encargos.",
+      ],
+    },
+    { type: "title", lines: ["CLÁUSULA QUINTA - DA GARANTIA E DA EXECUÇÃO"] },
+    {
+      type: "text",
+      lines: [
+        "5.1. O contrato é título executivo extrajudicial, conforme artigo 784, III do CPC, podendo o MUTUANTE",
+        "requerer judicialmente a penhora de bens do MUTUÁRIO em caso de inadimplência.",
+      ],
+    },
+    { type: "title", lines: ["CLÁUSULA SEXTA - DA NOTIFICAÇÃO"] },
+    {
+      type: "text",
+      lines: [
+        "6.1. Em caso de inadimplemento, o MUTUANTE notificará o MUTUÁRIO por carta registrada ou e-mail,",
+        "concedendo-lhe 10 dias para regularizar o pagamento.",
+      ],
+    },
+    { type: "title", lines: ["CLÁUSULA SÉTIMA - DO FORO"] },
+    { type: "text", lines: ["7.1. Fica eleito o foro da Comarca de Franca/SP para dirimir qualquer litígio decorrente deste contrato."] },
   ];
 
-  for (const part of clauses) {
+  for (const block of clauses) {
     if (y > bottom) {
       doc.addPage();
       y = 18;
       doc.setFont("helvetica", "normal");
       doc.setFontSize(11);
     }
-    if (/^CLÁUSULA/.test(part)) {
+    if (block.type === "title") {
       doc.setFont("helvetica", "bold");
-      y = addParagraph(doc, part, m, y, maxWidth);
+      y = addLines(doc, block.lines, m, y, lineH);
       doc.setFont("helvetica", "normal");
     } else {
-      y = addParagraph(doc, part, m, y, maxWidth);
+      y = addLines(doc, block.lines, m, y, lineH);
     }
     y += 2;
   }
@@ -181,12 +223,15 @@ export function generateContratoMutuoPdf(params: ContratoMutuoParams): jsPDF {
   }
 
   y += 2;
-  y = addParagraph(
+  y = addLines(
     doc,
-    "E por estarem assim justos e contratados, firmam o presente instrumento em duas vias de igual teor e forma, para que produza seus jurídicos e legais efeitos.",
+    [
+      "E por estarem assim justos e contratados, firmam o presente instrumento em duas vias de igual teor e",
+      "forma, para que produza seus jurídicos e legais efeitos.",
+    ],
     m,
     y,
-    maxWidth,
+    lineH
   );
   y += 6;
   doc.text(`${params.cidadeUf}, ${dataAss}.`, m, y);

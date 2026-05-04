@@ -1,38 +1,45 @@
 import { supabase } from "@/lib/supabase";
 import { PAGE_SIZE } from "@/lib/constants";
+import { computeLoanRemainingTotal, effectiveLoanPrincipal } from "@/api/loan-calc";
 
-const INTEREST_ONLY_TYPES = [
-  "renewal",
-  "interest_renewal",
-  "early_payment_partial_interest",
-  "early_payment_interest_renewal",
-  "partial_interest",
-];
+/** Ordenação da listagem de empréstimos (além do modo padrão do sistema). */
+export type LoanSortOption =
+  | "default"
+  | "due_date_asc"
+  | "due_date_desc"
+  | "loan_date_asc"
+  | "loan_date_desc"
+  | "created_at_asc"
+  | "created_at_desc";
 
-function computeRemaining(
-  originalCapital: number,
-  interestRate: number,
-  payments: Array<{ amount: number; payment_type: string; fine_amount: number }>
-): number {
-  let rate = interestRate;
-  if (rate > 100) rate = rate / 100;
-  const realPayments = payments.filter((p) => p.amount > 0);
-  let capitalPaid = 0;
-  let currentCapital = originalCapital;
-  for (const payment of realPayments) {
-    const amt = payment.amount;
-    const type = String(payment.payment_type || "");
-    if (!INTEREST_ONLY_TYPES.includes(type)) {
-      const currentInterest = currentCapital * (rate / 100);
-      if (amt > currentInterest) {
-        capitalPaid += amt - currentInterest;
-        currentCapital = Math.max(0, currentCapital - (amt - currentInterest));
-      }
+function parseLoanSort(sort: LoanSortOption | undefined): {
+  field: "due_date" | "loan_date" | "created_at";
+  asc: boolean;
+} | null {
+  if (!sort || sort === "default") return null;
+  const m = sort.match(/^(due_date|loan_date|created_at)_(asc|desc)$/);
+  if (!m) return null;
+  return { field: m[1] as "due_date" | "loan_date" | "created_at", asc: m[2] === "asc" };
+}
+
+function sortLoanRows(
+  rows: Array<Record<string, unknown>>,
+  field: "due_date" | "loan_date" | "created_at",
+  asc: boolean
+): Array<Record<string, unknown>> {
+  const mul = asc ? 1 : -1;
+  return [...rows].sort((a, b) => {
+    if (field === "created_at") {
+      const ta = new Date(String(a.created_at || "")).getTime() || 0;
+      const tb = new Date(String(b.created_at || "")).getTime() || 0;
+      if (ta !== tb) return (ta - tb) * mul;
+    } else {
+      const va = String(a[field] || "").split("T")[0];
+      const vb = String(b[field] || "").split("T")[0];
+      if (va !== vb) return va.localeCompare(vb) * mul;
     }
-  }
-  const remainingCapital = Math.max(0, originalCapital - capitalPaid);
-  const remainingInterest = remainingCapital * (rate / 100);
-  return remainingCapital + remainingInterest;
+    return String(a.id || "").localeCompare(String(b.id || ""));
+  });
 }
 
 async function attachRemainingAmounts(
@@ -61,10 +68,10 @@ async function attachRemainingAmounts(
   }
 
   for (const item of nonPaid) {
-    const cap = parseFloat(String(item.amount || 0));
+    const cap = effectiveLoanPrincipal(item as { original_amount?: unknown; amount?: unknown });
     const rate = parseFloat(String(item.interest_rate || 0));
     const payments = byLoan[String(item.id)] || [];
-    item.remaining_amount = computeRemaining(cap, rate, payments);
+    item.remaining_amount = computeLoanRemainingTotal(cap, rate, payments);
   }
   for (const item of items) {
     if (item.status === "paid" || item.status === "cancelled") {
@@ -73,6 +80,41 @@ async function attachRemainingAmounts(
     if (item.status === "installments") {
       (item as Record<string, unknown>).remaining_amount = undefined;
     }
+  }
+}
+
+/** Soma `fine_amount` (multas) e `amount` (pagamentos) por empréstimo — para listagem. */
+async function attachPaymentAndFineTotals(items: Array<Record<string, unknown>>): Promise<void> {
+  if (items.length === 0) return;
+  const loanIds = [...new Set(items.map((r) => String(r.id || "")).filter(Boolean))];
+  if (loanIds.length === 0) return;
+
+  const { data: paymentsData, error } = await supabase
+    .from("payments")
+    .select("loan_id, amount, fine_amount")
+    .in("loan_id", loanIds);
+
+  if (error) throw error;
+
+  const byLoan: Record<string, { fines: number; paid: number }> = {};
+  for (const id of loanIds) {
+    byLoan[id] = { fines: 0, paid: 0 };
+  }
+  for (const p of paymentsData || []) {
+    const row = p as { loan_id: string; amount?: unknown; fine_amount?: unknown };
+    const lid = String(row.loan_id || "");
+    if (!byLoan[lid]) continue;
+    const amt = parseFloat(String(row.amount || 0));
+    const fine = parseFloat(String(row.fine_amount || 0));
+    byLoan[lid].fines += fine;
+    byLoan[lid].paid += amt;
+  }
+
+  for (const item of items) {
+    const id = String(item.id || "");
+    const t = byLoan[id] || { fines: 0, paid: 0 };
+    item.total_fines_amount = t.fines;
+    item.total_paid_amount = t.paid;
   }
 }
 
@@ -86,11 +128,19 @@ function mapLoanRow(loan: Record<string, unknown>, client: (c: unknown) => { nam
     client_cpf: cl.cpf || "",
     client_email: cl.email || "",
     amount: parseFloat(String(loan.amount || 0)),
+    original_amount: loan.original_amount != null ? parseFloat(String(loan.original_amount || 0)) : undefined,
     interest_rate: parseFloat(String(loan.interest_rate || 0)),
     loan_date: loan.loan_date,
     due_date: loan.due_date,
     status: loan.status,
     created_at: loan.created_at,
+    capital_raise_id: (loan as any).capital_raise_id ?? null,
+    capital_raise_capital: parseFloat(String((loan as any).capital_raise_capital || 0)),
+    capital_raise_interest: parseFloat(String((loan as any).capital_raise_interest || 0)),
+    is_authorized: Boolean((loan as any).is_authorized ?? true),
+    authorized_at: (loan as any).authorized_at ?? null,
+    contract_pdf_path: (loan as any).contract_pdf_path ?? null,
+    contract_pdf_uploaded_at: (loan as any).contract_pdf_uploaded_at ?? null,
   };
 }
 
@@ -125,6 +175,12 @@ async function hydrateClientsForLoans(rows: Array<Record<string, unknown>>): Pro
       phone: cl.phone || fallback.phone,
       email: cl.email || fallback.email,
     };
+    const rawLoan = loan as Record<string, unknown>;
+    const amt = parseFloat(String(loan.amount || 0));
+    const orig = effectiveLoanPrincipal({
+      original_amount: rawLoan.original_amount,
+      amount: rawLoan.amount,
+    });
     return {
       id: loan.id,
       client_id: loan.client_id,
@@ -132,7 +188,8 @@ async function hydrateClientsForLoans(rows: Array<Record<string, unknown>>): Pro
       client_phone: mergedClient.phone || "",
       client_cpf: mergedClient.cpf || "",
       client_email: mergedClient.email || "",
-      amount: parseFloat(String(loan.amount || 0)),
+      amount: amt,
+      original_amount: orig,
       interest_rate: parseFloat(String(loan.interest_rate || 0)),
       loan_date: loan.loan_date,
       due_date: loan.due_date,
@@ -201,12 +258,14 @@ export async function fetchLoans(
   statusFilter?: string,
   page = 1,
   search?: string,
-  opts?: { periodFrom?: string; periodTo?: string }
+  opts?: { periodFrom?: string; periodTo?: string; sort?: LoanSortOption }
 ) {
   const client = (c: unknown) => (c as { name?: string; cpf?: string; phone?: string; email?: string }) || {};
 
   let items: Array<Record<string, unknown>> = [];
   let total = 0;
+
+  const sortOpt = parseLoanSort(opts?.sort);
 
   // Lote que respeita limite por requisição do Supabase (ex.: 50); múltiplas requisições até trazer tudo
   const CHUNK = 50;
@@ -222,11 +281,12 @@ export async function fetchLoans(
 
   function applyCommonLoanFilters<T extends ReturnType<typeof supabase.from>>(
     q: any,
-    extra?: { includeInstallments?: boolean }
+    extra?: { includeInstallments?: boolean; excludeFinalized?: boolean }
   ) {
     let query = q;
     // normal: não listar empréstimos já vinculados a parcelamento
     if (!extra?.includeInstallments) query = query.neq("status", "installments");
+    if (extra?.excludeFinalized !== false) query = query.neq("status", "finalized");
     if (periodFrom) query = query.gte("loan_date", periodFrom);
     if (periodTo) query = query.lte("loan_date", periodTo);
     if (searchClientIds) query = query.in("client_id", searchClientIds);
@@ -252,7 +312,27 @@ export async function fetchLoans(
 
   const searchClientIds = await resolveClientIdsForSearch();
 
-  if (statusFilter === "paid") {
+  if (statusFilter === "finalized") {
+    let q = supabase
+      .from("loans")
+      .select(
+        "id, client_id, amount, original_amount, interest_rate, loan_date, due_date, status, created_at, is_authorized, authorized_at, capital_raise_id, capital_raise_capital, capital_raise_interest, clients (name, cpf, email, phone)",
+        { count: "exact" }
+      )
+      .eq("status", "finalized");
+    if (periodFrom) q = q.gte("loan_date", periodFrom);
+    if (periodTo) q = q.lte("loan_date", periodTo);
+    if (searchClientIds) q = q.in("client_id", searchClientIds);
+    const orderField = sortOpt?.field ?? "created_at";
+    const orderAsc = sortOpt ? sortOpt.asc : false;
+    q = q.order(orderField, { ascending: orderAsc }).order("id", { ascending: true });
+    const start = (page - 1) * PAGE_SIZE;
+    const end = start + PAGE_SIZE - 1;
+    const { data, error, count } = await q.range(start, end);
+    if (error) throw error;
+    total = count ?? 0;
+    items = await hydrateClientsForLoans((data || []) as Array<Record<string, unknown>>);
+  } else if (statusFilter === "paid") {
     let q = supabase
       .from("paid_loans")
       .select("loan_id, client_id, original_amount, interest_rate, loan_date, due_date, paid_date")
@@ -269,7 +349,7 @@ export async function fetchLoans(
     const paidList = (paidData || []) as Array<Record<string, unknown>>;
     const { clientNameByLoanId, clientIdByLoanId } = await resolvePaidLoanClientNames(paidList);
 
-    const paidItems = paidList.map((p: Record<string, unknown>) => {
+    let paidItems = paidList.map((p: Record<string, unknown>) => {
       const lid = String(p.loan_id ?? "");
       const cid = clientIdByLoanId[lid] ?? "";
       const clientName = clientNameByLoanId[lid] ?? "—";
@@ -288,6 +368,9 @@ export async function fetchLoans(
         created_at: p.paid_date,
       };
     });
+    if (sortOpt) {
+      paidItems = sortLoanRows(paidItems, sortOpt.field, sortOpt.asc);
+    }
     total = paidItems.length;
     const start = (page - 1) * PAGE_SIZE;
     items = paidItems.slice(start, start + PAGE_SIZE);
@@ -303,8 +386,9 @@ export async function fetchLoans(
       if (hasMoreLoans) {
         let q = supabase
           .from("loans")
-          .select("id, client_id, amount, interest_rate, loan_date, due_date, status, created_at, clients (name, cpf, email, phone)")
+          .select("id, client_id, amount, original_amount, interest_rate, loan_date, due_date, status, created_at, is_authorized, authorized_at, capital_raise_id, capital_raise_capital, capital_raise_interest, contract_pdf_path, contract_pdf_uploaded_at, clients (name, cpf, email, phone)")
           .neq("status", "installments")
+          .neq("status", "finalized")
           .order("created_at", { ascending: false });
         if (periodFrom) q = q.gte("loan_date", periodFrom);
         if (periodTo) q = q.lte("loan_date", periodTo);
@@ -363,49 +447,56 @@ export async function fetchLoans(
         created_at: rec.paid_date,
       });
     }
-    // Ordem global:
+    // Ordem global (padrão):
     // 1) vence hoje (não quitado/cancelado)
     // 2) próximos vencimentos (due_date >= amanhã)
     // 3) vencidos (due_date < hoje)
     // 4) paid/cancelled por created_at desc (paid_date / created_at)
-    const merged = Array.from(byId.values()).sort((a, b) => {
-      const aStatus = String(a.status || "");
-      const bStatus = String(b.status || "");
-      const aDue = String(a.due_date || "").split("T")[0];
-      const bDue = String(b.due_date || "").split("T")[0];
-      const aClosed = aStatus === "paid" || aStatus === "cancelled";
-      const bClosed = bStatus === "paid" || bStatus === "cancelled";
-      const aIsDueToday = !aClosed && aDue === todayYmd;
-      const bIsDueToday = !bClosed && bDue === todayYmd;
-      if (aIsDueToday !== bIsDueToday) return aIsDueToday ? -1 : 1;
+    let merged: Array<Record<string, unknown>>;
+    if (sortOpt) {
+      merged = sortLoanRows(Array.from(byId.values()), sortOpt.field, sortOpt.asc);
+    } else {
+      merged = Array.from(byId.values()).sort((a, b) => {
+        const aStatus = String(a.status || "");
+        const bStatus = String(b.status || "");
+        const aDue = String(a.due_date || "").split("T")[0];
+        const bDue = String(b.due_date || "").split("T")[0];
+        const aClosed = aStatus === "paid" || aStatus === "cancelled" || aStatus === "finalized";
+        const bClosed = bStatus === "paid" || bStatus === "cancelled" || bStatus === "finalized";
+        const aIsDueToday = !aClosed && aDue === todayYmd;
+        const bIsDueToday = !bClosed && bDue === todayYmd;
+        if (aIsDueToday !== bIsDueToday) return aIsDueToday ? -1 : 1;
 
-      const aIsFuture = !aClosed && aDue >= tomorrowYmd;
-      const bIsFuture = !bClosed && bDue >= tomorrowYmd;
-      if (aIsFuture !== bIsFuture) return aIsFuture ? -1 : 1;
+        const aIsFuture = !aClosed && aDue >= tomorrowYmd;
+        const bIsFuture = !bClosed && bDue >= tomorrowYmd;
+        if (aIsFuture !== bIsFuture) return aIsFuture ? -1 : 1;
 
-      const aIsPast = !aClosed && aDue !== "" && aDue < todayYmd;
-      const bIsPast = !bClosed && bDue !== "" && bDue < todayYmd;
-      if (aIsPast !== bIsPast) return aIsPast ? -1 : 1;
+        const aIsPast = !aClosed && aDue !== "" && aDue < todayYmd;
+        const bIsPast = !bClosed && bDue !== "" && bDue < todayYmd;
+        if (aIsPast !== bIsPast) return aIsPast ? -1 : 1;
 
-      // dentro do futuro: por vencimento asc
-      if (aIsFuture && bIsFuture) {
-        if (aDue !== bDue) return aDue.localeCompare(bDue);
-      }
+        // dentro do futuro: por vencimento asc
+        if (aIsFuture && bIsFuture) {
+          if (aDue !== bDue) return aDue.localeCompare(bDue);
+        }
 
-      // dentro do passado: vencimento desc (mais recente primeiro)
-      if (aIsPast && bIsPast) {
-        if (aDue !== bDue) return bDue.localeCompare(aDue);
-      }
+        // dentro do passado: vencimento desc (mais recente primeiro)
+        if (aIsPast && bIsPast) {
+          if (aDue !== bDue) return bDue.localeCompare(aDue);
+        }
 
-      const dA = new Date(String(a.created_at || "")).getTime() || 0;
-      const dB = new Date(String(b.created_at || "")).getTime() || 0;
-      return dB - dA;
-    });
+        const dA = new Date(String(a.created_at || "")).getTime() || 0;
+        const dB = new Date(String(b.created_at || "")).getTime() || 0;
+        return dB - dA;
+      });
+    }
     total = merged.length;
     const start = (page - 1) * PAGE_SIZE;
     items = merged.slice(start, start + PAGE_SIZE);
   } else if (statusFilter === "overdue") {
     const today = new Date().toISOString().split("T")[0];
+    const overdueOrderField = sortOpt ? sortOpt.field : "due_date";
+    const overdueAsc = sortOpt ? sortOpt.asc : true;
     let allData: Array<Record<string, unknown>> = [];
     let offset = 0;
     let hasMore = true;
@@ -413,11 +504,13 @@ export async function fetchLoans(
       let q = supabase
         .from("loans")
         .select(
-          "id, client_id, amount, interest_rate, loan_date, due_date, status, created_at, clients (name, cpf, email, phone)"
+          "id, client_id, amount, original_amount, interest_rate, loan_date, due_date, status, created_at, is_authorized, authorized_at, clients (name, cpf, email, phone)"
         )
+        .neq("status", "finalized")
         .in("status", ["active", "partial_paid", "overdue"])
         .lt("due_date", today)
-        .order("due_date", { ascending: true });
+        .order(overdueOrderField, { ascending: overdueAsc })
+        .order("id", { ascending: true });
       if (periodFrom) q = q.gte("loan_date", periodFrom);
       if (periodTo) q = q.lte("loan_date", periodTo);
       if (searchClientIds) q = q.in("client_id", searchClientIds);
@@ -434,12 +527,6 @@ export async function fetchLoans(
     const start = (page - 1) * PAGE_SIZE;
     items = overdueItems.slice(start, start + PAGE_SIZE);
   } else {
-    // Ordenação global com paginação:
-    // - 1) vence hoje (hoje <= due_date < amanhã)
-    // - 2) próximos vencimentos (due_date >= amanhã) por due_date asc (e created_at desc)
-    // - 3) vencidos (due_date < hoje) por due_date desc (mais recente primeiro)
-    // Para suportar paginação, buscamos buckets separadamente.
-
     const statusScope =
       statusFilter === "active"
         ? ["active", "overdue", "partial_paid"]
@@ -447,11 +534,33 @@ export async function fetchLoans(
           ? [statusFilter]
           : null;
 
+    if (sortOpt) {
+      let q = supabase.from("loans").select(
+        "id, client_id, amount, original_amount, interest_rate, loan_date, due_date, status, created_at, is_authorized, authorized_at, capital_raise_id, capital_raise_capital, capital_raise_interest, clients (name, cpf, email, phone)",
+        { count: "exact" }
+      );
+      q = applyCommonLoanFilters(q);
+      if (statusScope) q = q.in("status", statusScope);
+      q = q.order(sortOpt.field, { ascending: sortOpt.asc }).order("id", { ascending: true });
+
+      const start = (page - 1) * PAGE_SIZE;
+      const end = start + PAGE_SIZE - 1;
+      const { data, error, count } = await q.range(start, end);
+      if (error) throw error;
+      total = count ?? 0;
+      items = await hydrateClientsForLoans((data || []) as Array<Record<string, unknown>>);
+    } else {
+    // Ordenação global com paginação (padrão):
+    // - 1) vence hoje (hoje <= due_date < amanhã)
+    // - 2) próximos vencimentos (due_date >= amanhã) por due_date asc (e created_at desc)
+    // - 3) vencidos (due_date < hoje) por due_date desc (mais recente primeiro)
+    // Para suportar paginação, buscamos buckets separadamente.
+
     // Bucket 1: vence hoje
     let dueTodayQ = supabase
       .from("loans")
       .select(
-        "id, client_id, amount, interest_rate, loan_date, due_date, status, created_at, clients (name, cpf, email, phone)",
+        "id, client_id, amount, original_amount, interest_rate, loan_date, due_date, status, created_at, is_authorized, authorized_at, capital_raise_id, capital_raise_capital, capital_raise_interest, clients (name, cpf, email, phone)",
         { count: "exact" }
       );
     dueTodayQ = applyCommonLoanFilters(dueTodayQ);
@@ -471,7 +580,7 @@ export async function fetchLoans(
     let futureQ = supabase
       .from("loans")
       .select(
-        "id, client_id, amount, interest_rate, loan_date, due_date, status, created_at, clients (name, cpf, email, phone)",
+        "id, client_id, amount, original_amount, interest_rate, loan_date, due_date, status, created_at, is_authorized, authorized_at, capital_raise_id, capital_raise_capital, capital_raise_interest, clients (name, cpf, email, phone)",
         { count: "exact" }
       );
     futureQ = applyCommonLoanFilters(futureQ);
@@ -491,7 +600,7 @@ export async function fetchLoans(
     let pastQ = supabase
       .from("loans")
       .select(
-        "id, client_id, amount, interest_rate, loan_date, due_date, status, created_at, clients (name, cpf, email, phone)",
+        "id, client_id, amount, original_amount, interest_rate, loan_date, due_date, status, created_at, is_authorized, authorized_at, capital_raise_id, capital_raise_capital, capital_raise_interest, clients (name, cpf, email, phone)",
         { count: "exact" }
       );
     pastQ = applyCommonLoanFilters(pastQ);
@@ -554,9 +663,11 @@ export async function fetchLoans(
     }
 
     items = await hydrateClientsForLoans(pageItems);
+    }
   }
 
   await attachRemainingAmounts(items);
+  await attachPaymentAndFineTotals(items);
   return { data: items, total };
 }
 
@@ -615,6 +726,9 @@ export async function createLoan(data: {
   interest_rate: number;
   loan_date: string;
   due_date: string;
+  capital_raise_id?: string | null;
+  capital_raise_capital?: number;
+  capital_raise_interest?: number;
 }) {
   const row = {
     client_id: data.client_id,
@@ -624,6 +738,9 @@ export async function createLoan(data: {
     loan_date: data.loan_date,
     due_date: data.due_date,
     status: "active",
+    capital_raise_id: data.capital_raise_id ?? null,
+    capital_raise_capital: data.capital_raise_capital ?? null,
+    capital_raise_interest: data.capital_raise_interest ?? null,
   };
   const { data: inserted, error } = await supabase.from("loans").insert([row]).select("id").single();
   if (error) {
@@ -635,24 +752,103 @@ export async function createLoan(data: {
   return inserted;
 }
 
+type PgLikeError = { message?: string; code?: string; details?: string; hint?: string };
+
+/** Converte 400 do PostgREST em mensagem útil (CHECK em status, RLS, etc.). */
+function throwLoanUpdateError(error: PgLikeError, action: string): never {
+  const msg = String(error.message || "");
+  const code = String(error.code || "");
+  const lower = msg.toLowerCase();
+  const statusCheck =
+    code === "23514" ||
+    msg.includes("loans_status_check") ||
+    (lower.includes("check constraint") && lower.includes("status"));
+  if (statusCheck) {
+    throw new Error(
+      `${action}: o banco rejeitou o status do empréstimo (CHECK ou trigger antigo). ` +
+        `No Supabase desta empresa, abra o SQL Editor e execute o arquivo ` +
+        `supabase/migrations/20260403100000_loans_finalize_check_and_trigger.sql ` +
+        `(alinha CHECK em loans.status e a função calculate_loan_status). Detalhe: ${msg}`,
+    );
+  }
+  if (code === "42501" || lower.includes("permission denied") || lower.includes("row-level security")) {
+    throw new Error(`${action}: atualização bloqueada por RLS/permissões em public.loans. ${msg}`);
+  }
+  const err = new Error(msg || "Erro ao atualizar empréstimo");
+  (err as Error & { cause?: unknown }).cause = error;
+  throw err;
+}
+
 export async function updateLoan(
   id: string,
-  data: { amount?: number; interest_rate?: number; loan_date?: string; due_date?: string; status?: string; client_id?: string }
+  data: {
+    amount?: number;
+    interest_rate?: number;
+    loan_date?: string;
+    due_date?: string;
+    status?: string;
+    client_id?: string;
+    capital_raise_id?: string | null;
+    capital_raise_capital?: number | null;
+    capital_raise_interest?: number | null;
+  }
 ) {
-  const { error } = await supabase.from("loans").update(data).eq("id", id);
+  const payload: Record<string, unknown> = {};
+  if (data.amount !== undefined) payload.amount = data.amount;
+  if (data.interest_rate !== undefined) payload.interest_rate = data.interest_rate;
+  if (data.loan_date !== undefined) payload.loan_date = data.loan_date;
+  if (data.due_date !== undefined) payload.due_date = data.due_date;
+  if (data.client_id !== undefined) payload.client_id = data.client_id;
+  if (data.status !== undefined && String(data.status).trim() !== "") payload.status = data.status;
+  if (data.capital_raise_id !== undefined) payload.capital_raise_id = data.capital_raise_id;
+  if (data.capital_raise_capital !== undefined) payload.capital_raise_capital = data.capital_raise_capital;
+  if (data.capital_raise_interest !== undefined) payload.capital_raise_interest = data.capital_raise_interest;
+
+  const { error } = await supabase.from("loans").update(payload).eq("id", id);
+  if (error) throwLoanUpdateError(error, "Atualizar empréstimo");
+}
+
+/**
+ * Encerra o empréstimo na operação (some das abas normais). Não remove linhas em `payments` nem altera quitados.
+ */
+export async function finalizeLoan(loanId: string): Promise<void> {
+  const { data: row, error } = await supabase.from("loans").select("id, status").eq("id", loanId).maybeSingle();
   if (error) throw error;
+  if (!row) throw new Error("Empréstimo não encontrado");
+  const st = String((row as Record<string, unknown>).status || "");
+  if (st === "paid" || st === "cancelled" || st === "finalized" || st === "installments") {
+    throw new Error("Este empréstimo não pode ser finalizado neste estado.");
+  }
+  const { data: updatedRows, error: upErr } = await supabase
+    .from("loans")
+    .update({ status: "finalized" })
+    .eq("id", loanId)
+    .select("id, status");
+  if (upErr) throwLoanUpdateError(upErr, "Finalizar empréstimo");
+  const row0 = (updatedRows || [])[0] as { status?: string } | undefined;
+  if (!row0 || String(row0.status) !== "finalized") {
+    throw new Error(
+      "O status não ficou como finalizado (comum: trigger calculate_loan_status no banco sobrescreve o status, ou CHECK em loans.status não inclui finalized). Aplique a migração supabase/migrations/20260403100000_loans_finalize_check_and_trigger.sql no projeto Supabase (SQL Editor ou supabase db push). Se o erro persistir, verifique RLS em UPDATE/SELECT em loans."
+    );
+  }
+
+  // Finalizar ≠ quitar: remove registro em paid_loans (triggers legados ou dados antigos),
+  // senão o cliente aparece como "quitado" no score e em relatórios que leem paid_loans.
+  await supabase.from("paid_loans").delete().eq("loan_id", loanId);
 }
 
 export async function markLoanAsPaid(loanId: string, paidDate: string) {
   const { data: loan, error: loanErr } = await supabase
     .from("loans")
-    .select("id, client_id, amount, interest_rate, loan_date, due_date")
+    .select("id, client_id, amount, original_amount, interest_rate, loan_date, due_date")
     .eq("id", loanId)
     .single();
 
   if (loanErr || !loan) throw loanErr || new Error("Empréstimo não encontrado");
 
-  const principal = parseFloat(String(loan.amount || 0));
+  const principal = parseFloat(
+    String((loan as { original_amount?: number }).original_amount || loan.amount || 0),
+  );
   const rate = parseFloat(String(loan.interest_rate || 0));
   const totalWithInterest = principal + principal * (rate / 100);
 
@@ -695,7 +891,7 @@ export async function markLoanAsPaid(loanId: string, paidDate: string) {
     .eq("id", loanId);
 
   if (updateErr) {
-    throw updateErr;
+    throwLoanUpdateError(updateErr, "Marcar empréstimo como quitado");
   }
 }
 
@@ -706,6 +902,7 @@ export async function fetchLoanById(id: string) {
       id,
       client_id,
       amount,
+      original_amount,
       interest_rate,
       loan_date,
       due_date,

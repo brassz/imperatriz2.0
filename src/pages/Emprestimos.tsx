@@ -13,11 +13,15 @@ import {
   ExternalLink,
   Eye,
   Tag as TagIcon,
+  Archive,
+  StickyNote,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
+import { ScrollArea } from "@/components/ui/scroll-area";
+import { Badge } from "@/components/ui/badge";
 import {
   Dialog,
   DialogContent,
@@ -53,20 +57,31 @@ import {
   updateLoan,
   markLoanAsPaid,
   fetchLoanById,
+  finalizeLoan,
+  type LoanSortOption,
 } from "@/api/loans";
 import { fetchInstallments, type InstallmentRow } from "@/api/installments";
 import { createPayment, createRenewalPayment, fetchPaymentsByLoanId, deletePayment } from "@/api/payments";
+import { insertLoanFineWaivers } from "@/api/loan-fine-waivers";
+import {
+  searchLoanNotesAndObservations,
+  type LoanNotesSearchScope,
+  type PaymentNoteHit,
+  type PaidLoanNoteHit,
+} from "@/api/loan-notes-search";
 import { calculateLoanRemaining, calculateNextDueDate, type LoanRemainingResult } from "@/api/loan-calc";
 import { fetchPixKeys } from "@/api/pix-keys";
 import { sendWhatsAppComprovante, sendWhatsAppMessage } from "@/api/evolution";
-import { buildCobrancaMessage, buildComprovanteMessage } from "@/lib/whatsapp-messages";
+import { buildCobrancaMessage, buildComprovanteMessage, buildLoanCreationNotificationMessage } from "@/lib/whatsapp-messages";
 import { createFine } from "@/api/fines";
 import { fetchClientsForSelect, fetchClientHistory, fetchClientScore } from "@/api/clients";
 import { fetchClientTags, createClientTag, deleteClientTag, type ClientTagRow } from "@/api/client-tags";
 import { fetchGuarantors, fetchEmergencyContacts } from "@/api/contacts";
+import { fetchCapitalRaises, type CapitalRaise } from "@/api/captacao";
 import { supabase } from "@/lib/supabase";
 import { useState } from "react";
 import { toast } from "sonner";
+import { createLoanSignatureRequest } from "@/api/loan-signature";
 import { jsPDF } from "jspdf";
 import { addPdfHeader, addPdfFooter, getPdfMargin, PDF_BRAND } from "@/lib/pdf-utils";
 import { comprovantePdfToBase64, generateComprovantePagamentoPdf } from "@/lib/comprovante-pdf";
@@ -74,6 +89,9 @@ import { generateContratoMutuoPdf } from "@/lib/contrato-mutuo-pdf";
 import { Pagination } from "@/components/Pagination";
 import { PAGE_SIZE } from "@/lib/constants";
 import { useAuth } from "@/contexts/AuthContext";
+import { paymentTypeLabel } from "@/lib/payment-type-label";
+import { useCompany } from "@/contexts/CompanyContext";
+import { PaymentFineWaiveDialog } from "@/components/loans/PaymentFineWaiveDialog";
 
 function isTerm20Days(loanDate: string, dueDate: string): boolean {
   if (!loanDate || !dueDate) return false;
@@ -81,6 +99,60 @@ function isTerm20Days(loanDate: string, dueDate: string): boolean {
   const d2 = new Date(String(dueDate).split("T")[0]);
   const diff = Math.round((d2.getTime() - d1.getTime()) / (1000 * 60 * 60 * 24));
   return diff >= 18 && diff <= 22;
+}
+
+function safeFilePart(s: string): string {
+  return String(s || "")
+    .replace(/[\\/:*?"<>|]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 80);
+}
+
+async function uploadLoanContractPdf(opts: {
+  loanId: string;
+  clientName: string;
+  loanDateYmd: string;
+  doc: jsPDF;
+}): Promise<{ ok: true; path: string } | { ok: false; error: string }> {
+  try {
+    const bucket = "contratos";
+    const title = safeFilePart(opts.clientName) || "cliente";
+    const date = safeFilePart(opts.loanDateYmd) || "data";
+    // Nome único evita precisar de permissão de UPDATE no Storage (upsert),
+    // e evita colisão quando o contrato é gerado mais de uma vez no mesmo dia.
+    const suffix =
+      typeof crypto !== "undefined" && "randomUUID" in crypto
+        ? String((crypto as Crypto).randomUUID()).slice(0, 8)
+        : String(Math.random()).slice(2, 10);
+    const filename = `Contrato_${title}_${date}_${suffix}.pdf`;
+    const path = `${opts.loanId}/${filename}`;
+    const blob = opts.doc.output("blob");
+
+    const { error: upErr } = await supabase.storage
+      .from(bucket)
+      .upload(path, blob, { contentType: "application/pdf", upsert: false });
+    if (upErr) throw upErr;
+
+    await supabase
+      .from("loans")
+      .update({ contract_pdf_path: path, contract_pdf_uploaded_at: new Date().toISOString() })
+      .eq("id", opts.loanId);
+
+    return { ok: true, path };
+  } catch (e) {
+    const msg =
+      e && typeof e === "object" && "message" in e
+        ? String((e as any).message)
+        : "Falha ao salvar contrato no Storage";
+    const status =
+      e && typeof e === "object" && "statusCode" in e ? String((e as any).statusCode || "") : "";
+    const name = e && typeof e === "object" && "name" in e ? String((e as any).name || "") : "";
+    const details =
+      e && typeof e === "object" && "error" in e && (e as any).error ? String((e as any).error) : "";
+    const composed = [name, status, details, msg].filter(Boolean).join(" — ");
+    return { ok: false, error: composed || msg };
+  }
 }
 
 function todayInSaoPauloYmd(): string {
@@ -96,6 +168,7 @@ function todayInSaoPauloYmd(): string {
 function getLoanStatusFromDueDate(dueDate: string, dbStatus: string | null): string {
   if (dbStatus === "paid") return "paid";
   if (dbStatus === "cancelled") return "cancelled";
+  if (dbStatus === "finalized") return "finalized";
 
   const dueYmd = String(dueDate || "").split("T")[0];
   if (!dueYmd) return "active";
@@ -113,6 +186,7 @@ const statusMap: Record<string, { label: string; className: string }> = {
   partial_paid: { label: "Pago parcial", className: "bg-warning/10 text-warning" },
   paid: { label: "Quitado", className: "bg-success/10 text-success" },
   cancelled: { label: "Cancelado", className: "bg-muted text-muted-foreground" },
+  finalized: { label: "Finalizado", className: "bg-slate-500/15 text-slate-700 dark:text-slate-300" },
 };
 
 function formatCurrency(n: number) {
@@ -124,9 +198,46 @@ function formatDate(d: string) {
   const [y, m, day] = s.split("-");
   return `${day}/${m}/${y}`;
 }
+function formatDateTimePt(raw: string) {
+  if (!raw) return "—";
+  const d = new Date(raw);
+  if (Number.isNaN(d.getTime())) return String(raw);
+  return d.toLocaleString("pt-BR", {
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
 function toInputDate(d: string) {
   if (!d) return "";
   return String(d).split("T")[0];
+}
+
+function parseMoneyInput(raw: string): number {
+  const s = String(raw || "").trim();
+  if (!s) return NaN;
+  const cleaned = s.replace(/[^\d.,-]/g, "");
+  const lastDot = cleaned.lastIndexOf(".");
+  const lastComma = cleaned.lastIndexOf(",");
+  const decSep = lastDot > lastComma ? "." : lastComma > lastDot ? "," : null;
+  let normalized = cleaned;
+
+  if (decSep) {
+    const thousandsSep = decSep === "." ? "," : ".";
+    normalized = normalized.replaceAll(thousandsSep, "");
+    normalized = normalized.replace(decSep, ".");
+  } else {
+    normalized = normalized.replaceAll(".", "").replaceAll(",", "");
+  }
+
+  const parts = normalized.split(".");
+  if (parts.length > 2) {
+    const dec = parts.pop() as string;
+    normalized = `${parts.join("")}.${dec}`;
+  }
+  return parseFloat(normalized);
 }
 
 
@@ -182,13 +293,25 @@ export default function Emprestimos() {
   const [search, setSearch] = useState("");
   const [periodFrom, setPeriodFrom] = useState("");
   const [periodTo, setPeriodTo] = useState("");
+  const [loanSort, setLoanSort] = useState<LoanSortOption>("default");
   const [editOpen, setEditOpen] = useState(false);
   const [registerPaymentOpen, setRegisterPaymentOpen] = useState(false);
   const [whatsappOpen, setWhatsappOpen] = useState(false);
   const [quitarOpen, setQuitarOpen] = useState(false);
+  const [finalizeOpen, setFinalizeOpen] = useState(false);
   const [multaOpen, setMultaOpen] = useState(false);
   const [contactsOpen, setContactsOpen] = useState(false);
   const [viewDetailsOpen, setViewDetailsOpen] = useState(false);
+  const [paymentDetailOpen, setPaymentDetailOpen] = useState(false);
+  const [paymentDetailRow, setPaymentDetailRow] = useState<{
+    id: string;
+    payment_date: string;
+    created_at: string;
+    amount: number;
+    fine_amount: number;
+    payment_type: string;
+    notes: string;
+  } | null>(null);
   const [comprovanteOpen, setComprovanteOpen] = useState(false);
   const [comprovanteData, setComprovanteData] = useState<{
     clientId: string;
@@ -199,6 +322,7 @@ export default function Emprestimos() {
     loanId: string;
     paymentDate: string;
     paymentDescription: string;
+    quitado?: boolean;
   } | null>(null);
   const [comprovanteSending, setComprovanteSending] = useState(false);
   const [selectedLoan, setSelectedLoan] = useState<LoanRow | null>(null);
@@ -226,24 +350,41 @@ export default function Emprestimos() {
     term_days: "30" as "20" | "30",
     loan_date: toInputDate(new Date().toISOString()),
     due_date: "",
+    capital_raise_id: "",
+    capital_raise_capital: "",
+    capital_raise_interest: "",
   });
   const [confirmDueDateOpen, setConfirmDueDateOpen] = useState(false);
+  const [signModalOpen, setSignModalOpen] = useState(false);
+  const [signUrl, setSignUrl] = useState("");
   const [renewalOptionsOpen, setRenewalOptionsOpen] = useState(false);
   const [renewalDays, setRenewalDays] = useState<30 | 20>(30);
   const [overrideDueDate, setOverrideDueDate] = useState("");
+  const [fineWaiveOpen, setFineWaiveOpen] = useState(false);
+  const [pendingRenewalOption, setPendingRenewalOption] = useState<
+    "capital_interest_renewal" | "interest_renewal" | "capital_renewal" | "quitacao_total" | null
+  >(null);
   const queryClient = useQueryClient();
   const { user } = useAuth();
+  const { companyName } = useCompany();
   const [newTagText, setNewTagText] = useState("");
   const [tagDialogOpen, setTagDialogOpen] = useState(false);
   const [tagDialogClientId, setTagDialogClientId] = useState<string | null>(null);
   const [tagDialogClientName, setTagDialogClientName] = useState<string>("");
   const [tagDialogColor, setTagDialogColor] = useState<string>("blue");
+  const [notesSearchOpen, setNotesSearchOpen] = useState(false);
+  const [notesSearchScope, setNotesSearchScope] = useState<LoanNotesSearchScope>("all");
+  const [notesSearchTerm, setNotesSearchTerm] = useState("");
+  const [notesSearchLoading, setNotesSearchLoading] = useState(false);
+  const [notesSearchPayments, setNotesSearchPayments] = useState<PaymentNoteHit[]>([]);
+  const [notesSearchPaidLoans, setNotesSearchPaidLoans] = useState<PaidLoanNoteHit[]>([]);
+  const [notesSearchHasRun, setNotesSearchHasRun] = useState(false);
 
   const isParcelamentos = statusFilter === "parcelamentos";
 
   const { data, isLoading, error } = useQuery({
-    queryKey: ["loans", statusFilter, page, search, periodFrom, periodTo],
-    queryFn: () => fetchLoans(statusFilter, page, search, { periodFrom, periodTo }),
+    queryKey: ["loans", statusFilter, page, search, periodFrom, periodTo, loanSort],
+    queryFn: () => fetchLoans(statusFilter, page, search, { periodFrom, periodTo, sort: loanSort }),
     enabled: !isParcelamentos,
     /** Evita desmontar a página a cada tecla na busca (queryKey muda e isLoading ficava true). */
     placeholderData: keepPreviousData,
@@ -266,7 +407,7 @@ export default function Emprestimos() {
   const { data: loanFull } = useQuery({
     queryKey: ["loan-full", selectedLoan?.id],
     queryFn: () => fetchLoanById(String(selectedLoan?.id)),
-    enabled: !!selectedLoan?.id && (editOpen || quitarOpen || viewDetailsOpen),
+    enabled: !!selectedLoan?.id && (editOpen || quitarOpen || finalizeOpen || viewDetailsOpen),
   });
 
   const { data: clientsForSelect = [] } = useQuery({
@@ -274,6 +415,15 @@ export default function Emprestimos() {
     queryFn: fetchClientsForSelect,
     enabled: newLoanOpen,
   });
+
+  const { data: capitalRaises = [] } = useQuery({
+    queryKey: ["capital-raises"],
+    queryFn: fetchCapitalRaises,
+    enabled: newLoanOpen,
+    staleTime: 30_000,
+  });
+
+  const activeCapitalRaises = (capitalRaises as CapitalRaise[]).filter((r) => r.ativo);
 
   const { data: clientHistory, isLoading: clientHistoryLoading } = useQuery({
     queryKey: ["client-history", newLoanForm.client_id],
@@ -283,17 +433,33 @@ export default function Emprestimos() {
   const { data: loanRemaining } = useQuery<LoanRemainingResult>({
     queryKey: ["loan-remaining", selectedLoan?.id],
     queryFn: () => calculateLoanRemaining(String(selectedLoan?.id)),
-    enabled: !!selectedLoan?.id && (registerPaymentOpen || viewDetailsOpen || whatsappOpen),
+    enabled: !!selectedLoan?.id && (registerPaymentOpen || viewDetailsOpen || whatsappOpen || fineWaiveOpen),
   });
   const { data: loanPayments = [] } = useQuery({
     queryKey: ["loan-payments", selectedLoan?.id],
     queryFn: () => fetchPaymentsByLoanId(String(selectedLoan?.id)),
     enabled: !!selectedLoan?.id && viewDetailsOpen,
   });
+  const { data: detailsGuarantors = [] } = useQuery({
+    queryKey: ["loan-client-guarantors", selectedLoan?.client_id],
+    queryFn: () => fetchGuarantors(String(selectedLoan?.client_id)),
+    enabled: !!selectedLoan?.client_id && viewDetailsOpen,
+  });
+  const { data: detailsEmergency = [] } = useQuery({
+    queryKey: ["loan-client-emergency", selectedLoan?.client_id],
+    queryFn: () => fetchEmergencyContacts(String(selectedLoan?.client_id)),
+    enabled: !!selectedLoan?.client_id && viewDetailsOpen,
+  });
   const { data: clientTags = [], isLoading: clientTagsLoading } = useQuery({
     queryKey: ["client-tags", selectedLoan?.client_id],
     queryFn: () => fetchClientTags(String(selectedLoan?.client_id)),
     enabled: !!selectedLoan?.client_id && viewDetailsOpen,
+  });
+
+  const { data: tagDialogTags = [], isLoading: tagDialogTagsLoading } = useQuery({
+    queryKey: ["client-tags", tagDialogClientId],
+    queryFn: () => fetchClientTags(String(tagDialogClientId)),
+    enabled: tagDialogOpen && !!tagDialogClientId,
   });
 
   const { data: comprovanteScore, isLoading: comprovanteScoreLoading } = useQuery({
@@ -302,8 +468,17 @@ export default function Emprestimos() {
     enabled: comprovanteOpen && !!comprovanteData?.clientId,
   });
 
-  const [guarantors, setGuarantors] = useState<Array<{ id: string; name: string; phone: string }>>([]);
-  const [emergencyContacts, setEmergencyContacts] = useState<Array<{ id: string; name: string; phone: string }>>([]);
+  const { data: comprovanteRemaining, isLoading: comprovanteRemainingLoading } = useQuery<LoanRemainingResult>({
+    queryKey: ["loan-remaining", "comprovante", comprovanteData?.loanId],
+    queryFn: () => calculateLoanRemaining(String(comprovanteData!.loanId)),
+    enabled: comprovanteOpen && !!comprovanteData?.loanId && !Boolean(comprovanteData?.quitado),
+    staleTime: 0,
+  });
+
+  const [guarantors, setGuarantors] = useState<Array<{ id: string; name: string; phone: string; relationship?: string }>>([]);
+  const [emergencyContacts, setEmergencyContacts] = useState<
+    Array<{ id: string; name: string; phone: string; relationship?: string }>
+  >([]);
 
   // Quando `search` está preenchido, a busca é feita no backend (por CPF ou nome do cliente).
   const todayYmd = toInputDate(new Date().toISOString());
@@ -360,62 +535,37 @@ export default function Emprestimos() {
     return "bg-red-500/10 text-red-600";
   };
 
-  const ScoreGauge = ({ score }: { score?: number }) => {
-    const s = typeof score === "number" ? Math.max(0, Math.min(100, score)) : null;
-    const angle = s === null ? -90 : -90 + (s / 100) * 180;
+  /** Bolinha + número (sem SVG) — mais leve na listagem. */
+  const getScoreDotBg = (score: number) => {
+    if (score >= 80) return "bg-emerald-500";
+    if (score >= 60) return "bg-primary";
+    if (score >= 40) return "bg-amber-500";
+    return "bg-red-500";
+  };
 
+  const ScoreDot = ({ score }: { score?: number }) => {
+    if (typeof score !== "number") {
+      return (
+        <span className="inline-flex items-center gap-1 min-w-[2.25rem] tabular-nums">
+          <span className="h-2 w-2 rounded-full shrink-0 bg-muted-foreground/35" aria-hidden />
+          <span className="text-[10px] font-semibold text-muted-foreground">—</span>
+        </span>
+      );
+    }
+    const s = Math.max(0, Math.min(100, score));
     return (
-      <svg viewBox="0 0 100 60" className="w-10 h-7">
-        <defs>
-          <linearGradient id="scoreGaugeGradient" x1="0" y1="0" x2="1" y2="0">
-            <stop offset="0%" stopColor="#ef4444" />
-            <stop offset="55%" stopColor="#f59e0b" />
-            <stop offset="100%" stopColor="#22c55e" />
-          </linearGradient>
-        </defs>
-
-        {/* trilho */}
-        <path
-          d="M 10 50 A 40 40 0 0 1 90 50"
-          fill="none"
-          stroke="hsl(var(--muted))"
-          strokeWidth="8"
-          strokeLinecap="round"
-        />
-
-        {/* arco colorido */}
-        <path
-          d="M 10 50 A 40 40 0 0 1 90 50"
-          fill="none"
-          stroke="url(#scoreGaugeGradient)"
-          strokeWidth="8"
-          strokeLinecap="round"
-          opacity={s === null ? 0.35 : 1}
-        />
-
-        {/* ponteiro */}
-        <g transform={`rotate(${angle} 50 50)`} opacity={s === null ? 0.35 : 1}>
-          <line x1="50" y1="50" x2="50" y2="18" stroke="hsl(var(--foreground))" strokeWidth="2.5" />
-          <circle cx="50" cy="50" r="3.5" fill="hsl(var(--foreground))" />
-        </g>
-
-        {/* número */}
-        <text
-          x="50"
-          y="40"
-          textAnchor="middle"
-          fontSize="16"
-          fontWeight="800"
-          fill="hsl(var(--foreground))"
-        >
-          {s === null ? "—" : String(s)}
-        </text>
-      </svg>
+      <span className={`inline-flex items-center gap-1 min-w-[2.25rem] tabular-nums ${getScoreColor(s)}`}>
+        <span className={`h-2 w-2 rounded-full shrink-0 ${getScoreDotBg(s)}`} aria-hidden />
+        <span className="text-[10px] font-semibold">{s}</span>
+      </span>
     );
   };
 
   const computeDueDate = (loanDate: string, termDays: 20 | 30) => {
-    const d = new Date(loanDate + "T12:00:00");
+    const base = String(loanDate || "").trim();
+    if (!base) return "";
+    const d = new Date(base + "T12:00:00");
+    if (Number.isNaN(d.getTime())) return "";
     d.setDate(d.getDate() + termDays);
     return toInputDate(d.toISOString());
   };
@@ -426,10 +576,14 @@ export default function Emprestimos() {
     setNewLoanForm({
       client_id: "",
       amount: "",
-      interest_rate: "",
+      // Padrão solicitado para contrato: 1% ao mês (editável).
+      interest_rate: "1",
       term_days: "30",
       loan_date: today,
       due_date: computeDueDate(today, 30),
+      capital_raise_id: "",
+      capital_raise_capital: "",
+      capital_raise_interest: "",
     });
     setNewLoanOpen(true);
   };
@@ -440,15 +594,28 @@ export default function Emprestimos() {
       toast.error("Preencha todos os campos");
       return;
     }
-    const amt = parseFloat(String(newLoanForm.amount).replace(",", "."));
+    const amt = parseMoneyInput(newLoanForm.amount);
     if (isNaN(amt) || amt <= 0) {
       toast.error("Valor inválido");
       return;
     }
-    const rate = parseFloat(String(newLoanForm.interest_rate).replace(",", "."));
+    const rate = parseMoneyInput(newLoanForm.interest_rate);
     if (isNaN(rate) || rate < 0) {
       toast.error("Juros inválidos");
       return;
+    }
+    const raiseId = String(newLoanForm.capital_raise_id || "").trim();
+    const raiseCap = raiseId ? parseMoneyInput(newLoanForm.capital_raise_capital || "0") : 0;
+    const raiseInt = raiseId ? parseMoneyInput(newLoanForm.capital_raise_interest || "0") : 0;
+    if (raiseId) {
+      if (!(raiseCap >= 0) || !(raiseInt >= 0)) {
+        toast.error("Valores de captação inválidos");
+        return;
+      }
+      if (raiseCap > amt + 1e-9) {
+        toast.error("Capital (captação) não pode ser maior que o valor do empréstimo");
+        return;
+      }
     }
     if (newLoanForm.due_date < newLoanForm.loan_date) {
       toast.error("Data de vencimento deve ser posterior à data do empréstimo");
@@ -468,9 +635,13 @@ export default function Emprestimos() {
         interest_rate: rate,
         loan_date: newLoanForm.loan_date,
         due_date: newLoanForm.due_date,
+        capital_raise_id: raiseId ? raiseId : null,
+        capital_raise_capital: raiseId ? raiseCap : undefined,
+        capital_raise_interest: raiseId ? raiseInt : undefined,
       });
       toast.success("Empréstimo cadastrado");
 
+      let uploadedPath: string | null = null;
       try {
         const full = await fetchLoanById(String(inserted?.id));
         const guarantorsList = await fetchGuarantors(String(newLoanForm.client_id));
@@ -493,20 +664,68 @@ export default function Emprestimos() {
             : null,
           valorEmprestado: amt,
           vencimento: String(newLoanForm.due_date),
-          jurosAoMesPercent: rate,
           multaPercent: 10,
           cidadeUf: "Franca",
           dataAssinatura: String(newLoanForm.loan_date),
         });
 
-        const clientName = String((full as { client_name?: unknown }).client_name || "cliente")
-          .replace(/[\\/:*?\"<>|]+/g, " ")
-          .replace(/\s+/g, " ")
-          .trim();
-        const fileName = `Contrato_${clientName}_${String(newLoanForm.loan_date)}.pdf`;
+        const displayClientName = safeFilePart(String((full as { client_name?: unknown }).client_name || "cliente")) || "cliente";
+        const loanDateYmd = String(newLoanForm.loan_date || "").split("T")[0];
+        const fileName = `Contrato_${displayClientName}_${safeFilePart(loanDateYmd) || "data"}.pdf`;
+
+        // salva localmente (download) e também salva no Storage para manter histórico
         doc.save(fileName);
+        const uploaded = await uploadLoanContractPdf({
+          loanId: String(inserted?.id),
+          clientName: displayClientName,
+          loanDateYmd,
+          doc,
+        });
+        if (!uploaded.ok) {
+          toast.error(`Contrato: falha ao salvar no sistema (${uploaded.error}).`);
+        } else {
+          uploadedPath = uploaded.path;
+        }
+
+        const minimumPayment = amt * (rate / 100);
+        const notifyMsg = buildLoanCreationNotificationMessage({
+          clientName: displayClientName,
+          capital: amt,
+          loanDate: String(newLoanForm.loan_date),
+          dueDate: String(newLoanForm.due_date),
+          minimumPayment,
+        });
+
+        const phone = String((full as { client_phone?: unknown }).client_phone || "").trim();
+        if (phone) {
+          await sendWhatsAppMessage(phone, notifyMsg);
+        } else {
+          toast.message("Cliente sem telefone: não foi possível enviar a notificação por WhatsApp.");
+        }
       } catch {
-        // se falhar o contrato, não bloquear o cadastro
+        // se falhar o contrato / WhatsApp, não bloquear o cadastro
+      }
+
+      try {
+        if (!uploadedPath) {
+          toast.error("Contrato não disponível para assinatura. Salve o PDF do contrato no sistema e gere o link novamente.");
+          throw new Error("missing_contract_pdf");
+        }
+        const { url } = await createLoanSignatureRequest(String(inserted?.id), {
+          contractPdfPath: uploadedPath,
+        });
+        setSignUrl(url);
+        setSignModalOpen(true);
+        const fullForLink = await fetchLoanById(String(inserted?.id));
+        const phone = String((fullForLink as { client_phone?: unknown }).client_phone || "").trim();
+        if (phone) {
+          await sendWhatsAppMessage(
+            phone,
+            `✅ Contrato disponível para assinatura.\n\nAbra o link e assine para autorizar o empréstimo:\n${url}\n\n_Equipe NEXUS_`,
+          );
+        }
+      } catch (e) {
+        // link de assinatura é opcional: não bloquear o cadastro
       }
 
       setNewLoanOpen(false);
@@ -558,6 +777,11 @@ export default function Emprestimos() {
     setQuitarOpen(true);
   };
 
+  const openFinalize = (loan: LoanRow) => {
+    setSelectedLoan(loan);
+    setFinalizeOpen(true);
+  };
+
   const openMulta = (loan: LoanRow) => {
     setSelectedLoan(loan);
     setMultaForm({ amount: "", reason: "", notes: "" });
@@ -569,8 +793,8 @@ export default function Emprestimos() {
     const cid = String(loan.client_id);
     try {
       const [g, e] = await Promise.all([fetchGuarantors(cid), fetchEmergencyContacts(cid)]);
-      setGuarantors((g as Array<{ id: string; name: string; phone: string }>) || []);
-      setEmergencyContacts((e as Array<{ id: string; name: string; phone: string }>) || []);
+      setGuarantors((g as Array<{ id: string; name: string; phone: string; relationship?: string }>) || []);
+      setEmergencyContacts((e as Array<{ id: string; name: string; phone: string; relationship?: string }>) || []);
       setContactsOpen(true);
     } catch {
       toast.error("Erro ao carregar contatos");
@@ -579,7 +803,30 @@ export default function Emprestimos() {
 
   const openViewDetails = (loan: LoanRow) => {
     setSelectedLoan(loan);
+    setPaymentDetailOpen(false);
+    setPaymentDetailRow(null);
     setViewDetailsOpen(true);
+  };
+
+  const openPaymentDetail = (p: {
+    id?: unknown;
+    payment_date?: unknown;
+    created_at?: unknown;
+    amount?: unknown;
+    fine_amount?: unknown;
+    payment_type?: unknown;
+    notes?: unknown;
+  }) => {
+    setPaymentDetailRow({
+      id: String(p.id ?? ""),
+      payment_date: String(p.payment_date || "").split("T")[0],
+      created_at: String(p.created_at || ""),
+      amount: parseFloat(String(p.amount || 0)),
+      fine_amount: parseFloat(String(p.fine_amount || 0)),
+      payment_type: String(p.payment_type || ""),
+      notes: String(p.notes || ""),
+    });
+    setPaymentDetailOpen(true);
   };
 
   const handleDeletePayment = async (paymentId: string) => {
@@ -589,6 +836,10 @@ export default function Emprestimos() {
     try {
       await deletePayment(paymentId);
       toast.success("Pagamento excluído");
+      if (paymentDetailRow?.id === paymentId) {
+        setPaymentDetailOpen(false);
+        setPaymentDetailRow(null);
+      }
       invalidateLoanRelated(String(selectedLoan.id));
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Erro ao excluir pagamento");
@@ -599,6 +850,14 @@ export default function Emprestimos() {
 
   const handleEditSubmit = async () => {
     if (!selectedLoan?.id) return;
+    if (editForm.loan_date && Number.isNaN(new Date(`${editForm.loan_date}T12:00:00`).getTime())) {
+      toast.error("Data do empréstimo inválida");
+      return;
+    }
+    if (editForm.due_date && Number.isNaN(new Date(`${editForm.due_date}T12:00:00`).getTime())) {
+      toast.error("Data de vencimento inválida");
+      return;
+    }
     setIsSubmitting(true);
     try {
       await updateLoan(String(selectedLoan.id), {
@@ -618,16 +877,22 @@ export default function Emprestimos() {
     }
   };
 
-  const invalidateLoanRelated = (loanId?: string) => {
-    queryClient.invalidateQueries({ queryKey: ["loans"] });
-    queryClient.invalidateQueries({ queryKey: ["payments"] });
-    queryClient.invalidateQueries({ queryKey: ["dashboard-metrics"] });
+  const invalidateLoanRelated = async (loanId?: string) => {
+    const tasks: Promise<unknown>[] = [
+      queryClient.invalidateQueries({ queryKey: ["loans"] }),
+      queryClient.invalidateQueries({ queryKey: ["payments"] }),
+      queryClient.invalidateQueries({ queryKey: ["dashboard-metrics"] }),
+      queryClient.invalidateQueries({ predicate: (q) => q.queryKey[0] === "client-history" }),
+    ];
     if (loanId) {
-      queryClient.invalidateQueries({ queryKey: ["loan-remaining", loanId] });
-      queryClient.invalidateQueries({ queryKey: ["loan-full", loanId] });
-      queryClient.invalidateQueries({ queryKey: ["loan-payments", loanId] });
+      tasks.push(
+        queryClient.invalidateQueries({ queryKey: ["loan-remaining", loanId] }),
+        queryClient.invalidateQueries({ queryKey: ["loan-full", loanId] }),
+        queryClient.invalidateQueries({ queryKey: ["loan-payments", loanId] }),
+        queryClient.invalidateQueries({ queryKey: ["loan-fine-waivers", loanId] }),
+      );
     }
-    queryClient.invalidateQueries({ predicate: (q) => q.queryKey[0] === "client-history" });
+    await Promise.all(tasks);
   };
 
   const handleQuitarSubmit = async () => {
@@ -648,6 +913,85 @@ export default function Emprestimos() {
     }
   };
 
+  const handleFinalizeSubmit = async () => {
+    if (!selectedLoan?.id) return;
+    const loanIdStr = String(selectedLoan.id);
+    setIsSubmitting(true);
+    try {
+      await finalizeLoan(loanIdStr);
+      setFinalizeOpen(false);
+      queryClient.setQueriesData(
+        {
+          predicate: (q) =>
+            Array.isArray(q.queryKey) &&
+            q.queryKey[0] === "loans" &&
+            q.queryKey[1] !== "finalized",
+        },
+        (old) => {
+          if (!old || typeof old !== "object" || !("data" in old)) return old;
+          const o = old as { data: Array<{ id: unknown }>; total: number };
+          const data = o.data ?? [];
+          const next = data.filter((l) => String(l.id) !== loanIdStr);
+          if (next.length === data.length) return o;
+          return { ...o, data: next, total: Math.max(0, (o.total ?? data.length) - 1) };
+        },
+      );
+      await invalidateLoanRelated(loanIdStr);
+      toast.success("Empréstimo finalizado. Ele sai da operação; os pagamentos continuam no histórico do cliente.");
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Erro ao finalizar");
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const runNotesSearch = async () => {
+    const t = notesSearchTerm.trim();
+    if (!t) {
+      toast.error("Digite um termo para buscar nas observações");
+      return;
+    }
+    setNotesSearchLoading(true);
+    try {
+      const res = await searchLoanNotesAndObservations(t, notesSearchScope);
+      setNotesSearchPayments(res.payments);
+      setNotesSearchPaidLoans(res.paidLoans);
+      setNotesSearchHasRun(true);
+      const n = res.payments.length + res.paidLoans.length;
+      if (n === 0) {
+        toast.message("Nenhum resultado", { description: "Tente outro termo ou outro tipo de registro." });
+      }
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Erro ao buscar observações");
+    } finally {
+      setNotesSearchLoading(false);
+    }
+  };
+
+  const openLoanFromNotesSearch = async (loanId: string) => {
+    try {
+      const full = await fetchLoanById(loanId);
+      setNotesSearchOpen(false);
+      setSelectedLoan({
+        id: full.id,
+        client_id: full.client_id,
+        client_name: full.client_name,
+        client_phone: full.client_phone,
+        client_cpf: full.client_cpf,
+        client_email: full.client_email,
+        amount: full.amount,
+        interest_rate: full.interest_rate,
+        loan_date: full.loan_date,
+        due_date: full.due_date,
+        status: full.status,
+        created_at: full.created_at,
+      } as LoanRow);
+      setViewDetailsOpen(true);
+    } catch {
+      toast.error("Empréstimo não encontrado ou sem permissão para visualizar.");
+    }
+  };
+
   const openConfirmDueDate = () => {
     setRenewalDays(30);
     setConfirmDueDateOpen(true);
@@ -663,7 +1007,24 @@ export default function Emprestimos() {
     setRenewalOptionsOpen(true);
   };
 
-  const handleRenewalPayment = async (option: "capital_interest_renewal" | "interest_renewal" | "capital_renewal") => {
+  type RenewalPaymentOption =
+    | "capital_interest_renewal"
+    | "interest_renewal"
+    | "capital_renewal"
+    | "quitacao_total";
+
+  const handleRenewalPayment = (option: RenewalPaymentOption) => {
+    if (!selectedLoan?.id) return;
+    const amt = parseFloat(String(paymentForm.amount).replace(",", "."));
+    if (isNaN(amt) || amt <= 0) {
+      toast.error("Informe o valor do pagamento");
+      return;
+    }
+    setPendingRenewalOption(option);
+    setFineWaiveOpen(true);
+  };
+
+  const proceedRenewalAfterFineModal = async (option: RenewalPaymentOption, waiveDates: string[]) => {
     if (!selectedLoan?.id) return;
     const amt = parseFloat(String(paymentForm.amount).replace(",", "."));
     if (isNaN(amt) || amt <= 0) {
@@ -674,27 +1035,51 @@ export default function Emprestimos() {
       capital_interest_renewal: "Capital + Juros",
       interest_renewal: "Somente Juros",
       capital_renewal: "Somente Capital",
+      quitacao_total: "Quitação total",
     };
-    const newDue = overrideDueDate
-      || calculateNextDueDate(String(selectedLoan.due_date), renewalDays);
-    const confirmMsg = `Confirmar renovação por +${renewalDays} dias?\n\nTipo: ${labels[option]}\nValor: R$ ${amt.toFixed(2)}\nNova data: ${formatDate(newDue)}`;
+    const isQuitacao = option === "quitacao_total";
+    const newDue = isQuitacao
+      ? String(selectedLoan.due_date || "")
+      : (overrideDueDate || calculateNextDueDate(String(selectedLoan.due_date), renewalDays));
+    const confirmMsg = isQuitacao
+      ? `Confirmar QUITAÇÃO TOTAL?\n\nTipo: ${labels[option]}\nValor: R$ ${amt.toFixed(2)}\nData do pagamento: ${formatDate(paymentForm.payment_date)}`
+      : `Confirmar renovação por +${renewalDays} dias?\n\nTipo: ${labels[option]}\nValor: R$ ${amt.toFixed(2)}\nNova data: ${formatDate(newDue)}`;
     if (!confirm(confirmMsg)) return;
 
     setIsSubmitting(true);
     try {
+      if (waiveDates.length > 0) {
+        await insertLoanFineWaivers(String(selectedLoan.id), waiveDates);
+      }
       const fineAmt = paymentForm.fine_amount ? parseFloat(String(paymentForm.fine_amount).replace(",", ".")) : 0;
-      await createRenewalPayment({
-        loan_id: String(selectedLoan.id),
-        amount: amt,
-        payment_date: paymentForm.payment_date,
-        payment_type: option,
-        notes: `${labels[option]} - Renovação +${renewalDays} dias. ${paymentForm.notes || ""}`.trim(),
-        fine_amount: fineAmt > 0 ? fineAmt : undefined,
-        new_due_date: newDue,
-      });
+      if (isQuitacao) {
+        await createPayment({
+          loan_id: String(selectedLoan.id),
+          amount: amt,
+          payment_date: paymentForm.payment_date,
+          payment_type: "quitacao_total",
+          notes: `Quitação total. ${paymentForm.notes || ""}`.trim(),
+          fine_amount: fineAmt > 0 ? fineAmt : undefined,
+        });
+        await markLoanAsPaid(String(selectedLoan.id), paymentForm.payment_date);
+      } else {
+        await createRenewalPayment({
+          loan_id: String(selectedLoan.id),
+          amount: amt,
+          payment_date: paymentForm.payment_date,
+          payment_type: option,
+          notes: `${labels[option]} - Renovação +${renewalDays} dias. ${paymentForm.notes || ""}`.trim(),
+          fine_amount: fineAmt > 0 ? fineAmt : undefined,
+          new_due_date: newDue,
+        });
+      }
       const fineAmtVal = fineAmt > 0 ? fineAmt : 0;
       const valorTotal = amt + fineAmtVal;
-      toast.success(`Renovação registrada. Nova data: ${formatDate(newDue)}`);
+      toast.success(
+        isQuitacao
+          ? "Quitação registrada. Empréstimo quitado."
+          : `Renovação registrada. Nova data: ${formatDate(newDue)}`,
+      );
       setRegisterPaymentOpen(false);
       setRenewalOptionsOpen(false);
       setPaymentForm({
@@ -719,11 +1104,16 @@ export default function Emprestimos() {
         proximoVencimento: newDue,
         loanId: String(selectedLoan.id),
         paymentDate: paymentForm.payment_date,
-        paymentDescription: `${labels[option]} — Renovação +${renewalDays} dias`,
+        paymentDescription: isQuitacao ? "Quitação total" : `${labels[option]} — Renovação +${renewalDays} dias`,
+        quitado: isQuitacao,
       });
       setComprovanteOpen(true);
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Erro ao registrar renovação");
+      toast.error(
+        err instanceof Error
+          ? err.message
+          : (option === "quitacao_total" ? "Erro ao quitar empréstimo" : "Erro ao registrar renovação"),
+      );
     } finally {
       setIsSubmitting(false);
     }
@@ -795,13 +1185,15 @@ export default function Emprestimos() {
     const rate = Number(selectedLoan.interest_rate ?? 0);
     const capital = loanRemaining?.capital ?? amt;
     const interest = loanRemaining?.interestAmount ?? amt * (rate / 100);
+    const overdueFine = loanRemaining?.overdueDailyFineOwed ?? 0;
+    const baseRemaining = loanRemaining?.remainingAmount ?? amt + amt * (rate / 100);
     const loanForMsg = {
       client_name: String(selectedLoan.client_name),
       client_phone: phone,
-      amount: loanRemaining?.remainingAmount ?? amt + amt * (rate / 100),
+      amount: baseRemaining + overdueFine,
       capital,
       interest,
-      fine: 0,
+      fine: overdueFine,
       due_date: String(selectedLoan.due_date),
       minimumPayment: loanRemaining?.minimumPayment ?? interest,
     };
@@ -872,13 +1264,16 @@ export default function Emprestimos() {
           : null,
         valorEmprestado: parseFloat(String(loan.amount || 0)),
         vencimento: String(loan.due_date || ""),
-        jurosAoMesPercent: parseFloat(String(loan.interest_rate || 0)) || 0,
         multaPercent: 10,
         cidadeUf: "Franca",
         dataAssinatura: String(loan.loan_date || ""),
       });
 
-      doc.save(`contrato-emprestimo-${loan.id}.pdf`);
+      const displayClientName = safeFilePart(String((full as { client_name?: unknown }).client_name || loan.client_name || "cliente")) || "cliente";
+      const loanDateYmd = String(loan.loan_date || "").split("T")[0];
+      const fileName = `Contrato_${displayClientName}_${safeFilePart(loanDateYmd) || String(loan.id)}.pdf`;
+      doc.save(fileName);
+      await uploadLoanContractPdf({ loanId: String(loan.id), clientName: displayClientName, loanDateYmd, doc });
       toast.success("Contrato gerado");
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Erro ao gerar contrato");
@@ -888,27 +1283,126 @@ export default function Emprestimos() {
   const handlePDF = async (loan: LoanRow) => {
     try {
       const full = loanFull || (await fetchLoanById(String(loan.id)));
+      const clientId = String((full as { client_id?: unknown }).client_id || loan.client_id || "").trim();
+      const [guarantors, emergency] = await Promise.all([
+        clientId ? fetchGuarantors(clientId) : Promise.resolve([]),
+        clientId ? fetchEmergencyContacts(clientId) : Promise.resolve([]),
+      ]);
+
       const doc = new jsPDF();
       const m = getPdfMargin();
-      let y = addPdfHeader(doc, "Comprovante de Empréstimo", undefined);
+      const clientName = String((full as { client_name?: unknown }).client_name || loan.client_name || "—");
+      const cpf = String((full as { client_cpf?: unknown }).client_cpf || "-");
+      const phone = String((full as { client_phone?: unknown }).client_phone || "").trim();
+      const address = String((full as { client_address?: unknown }).client_address || "").trim();
+
+      let y = addPdfHeader(doc, "PDF de Cobrança", `${PDF_BRAND.companyDisplayName} · uso interno`);
       y += 8;
+
+      doc.setFont("helvetica", "bold");
       doc.setFontSize(12);
+      doc.text("Dados do cliente", m, y);
+      y += 7;
       doc.setFont("helvetica", "normal");
-      doc.text(`Cliente: ${(full as { client_name?: string }).client_name || loan.client_name}`, m, y);
+      doc.setFontSize(11);
+      doc.text(`Nome: ${clientName}`, m, y, { maxWidth: 182 });
+      y += 6.5;
+      doc.text(`CPF: ${cpf}`, m, y);
+      y += 6.5;
+      doc.text(`Telefone: ${phone || "—"}`, m, y);
+      y += 6.5;
+      doc.text("Endereço:", m, y);
+      y += 6;
+      doc.setFontSize(10);
+      doc.text(address || "—", m, y, { maxWidth: 182 });
+      y += address ? 10 : 8;
+
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(12);
+      doc.text("Dados do empréstimo", m, y);
       y += 7;
-      doc.text(`CPF: ${(full as { client_cpf?: string }).client_cpf || "-"}`, m, y);
-      y += 7;
-      doc.text(`Valor: R$ ${Number(loan.amount).toFixed(2)}`, m, y);
-      y += 7;
-      doc.text(`Juros: ${loan.interest_rate}%`, m, y);
-      y += 7;
+      doc.setFont("helvetica", "normal");
+      doc.setFontSize(11);
       const amt = Number(loan.amount);
       const rate = Number(loan.interest_rate);
-      doc.text(`Total: R$ ${(amt + amt * (rate / 100)).toFixed(2)}`, m, y);
-      y += 7;
+      const total = amt + amt * (rate / 100);
+      doc.text(`ID: ${String(loan.id)}`, m, y);
+      y += 6.5;
+      doc.text(`Valor: R$ ${amt.toFixed(2)}`, m, y);
+      y += 6.5;
+      doc.text(`Juros: ${rate}%`, m, y);
+      y += 6.5;
+      doc.text(`Total (aprox.): R$ ${total.toFixed(2)}`, m, y);
+      y += 6.5;
       doc.text(`Vencimento: ${formatDate(String(loan.due_date))}`, m, y);
-      addPdfFooter(doc, 1);
-      doc.save(`emprestimo-${loan.id}.pdf`);
+      y += 9;
+
+      const allContactsCount = (guarantors?.length || 0) + (emergency?.length || 0);
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(12);
+      doc.text(`Contatos para cobrança (${allContactsCount})`, m, y);
+      y += 7;
+
+      doc.setFont("helvetica", "normal");
+      doc.setFontSize(10);
+
+      const ensureSpace = () => {
+        if (y <= 265) return;
+        addPdfFooter(doc, pageNum);
+        doc.addPage();
+        pageNum++;
+        y = 20;
+      };
+
+      let pageNum = 1;
+
+      const rows: Array<{ type: "Avalista" | "Emergência"; name: string; phone: string; relationship?: string; cpf?: string }> = [];
+      for (const g of guarantors as Array<{ name?: unknown; phone?: unknown; relationship?: unknown; cpf?: unknown }>) {
+        rows.push({
+          type: "Avalista",
+          name: String(g.name || "—"),
+          phone: String(g.phone || ""),
+          relationship: String(g.relationship || ""),
+          cpf: String(g.cpf || ""),
+        });
+      }
+      for (const e of emergency as Array<{ name?: unknown; phone?: unknown; relationship?: unknown }>) {
+        rows.push({
+          type: "Emergência",
+          name: String(e.name || "—"),
+          phone: String(e.phone || ""),
+          relationship: String(e.relationship || ""),
+        });
+      }
+
+      if (rows.length === 0) {
+        doc.setTextColor(100, 116, 139);
+        doc.text("Nenhum avalista/contato de emergência cadastrado para este cliente.", m, y, { maxWidth: 182 });
+        doc.setTextColor(30, 41, 59);
+        y += 10;
+      } else {
+        for (const r of rows) {
+          ensureSpace();
+          doc.setFont("helvetica", "bold");
+          doc.text(`${r.type}: ${r.name}`, m, y, { maxWidth: 182 });
+          y += 5.5;
+          doc.setFont("helvetica", "normal");
+          const rel = r.relationship ? ` (${r.relationship})` : "";
+          const phoneLine = `Telefone: ${String(r.phone || "—").trim() || "—"}${rel}`;
+          doc.text(phoneLine, m, y, { maxWidth: 182 });
+          y += 5.5;
+          if (r.type === "Avalista" && r.cpf) {
+            doc.text(`CPF: ${r.cpf}`, m, y, { maxWidth: 182 });
+            y += 5.5;
+          }
+          doc.setDrawColor(226, 232, 240);
+          doc.line(m, y, 196, y);
+          y += 6;
+        }
+      }
+
+      addPdfFooter(doc, pageNum);
+      doc.save(`cobranca-${loan.id}.pdf`);
       toast.success("PDF gerado");
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Erro ao gerar PDF");
@@ -987,8 +1481,40 @@ export default function Emprestimos() {
               <SelectItem value="paid">Quitados</SelectItem>
               <SelectItem value="overdue">Vencidos</SelectItem>
               <SelectItem value="cancelled">Cancelados</SelectItem>
+              <SelectItem value="finalized">Finalizados</SelectItem>
             </SelectContent>
           </Select>
+          <Button
+            type="button"
+            variant="outline"
+            className="h-8 text-xs gap-1.5 shrink-0"
+            onClick={() => setNotesSearchOpen(true)}
+          >
+            <StickyNote className="h-3.5 w-3.5" />
+            Notas e observações
+          </Button>
+          {!isParcelamentos && (
+            <Select
+              value={loanSort}
+              onValueChange={(v) => {
+                setLoanSort(v as LoanSortOption);
+                setPage(1);
+              }}
+            >
+              <SelectTrigger className="w-auto h-8 text-xs nexus-input min-w-[200px] max-w-[260px]">
+                <SelectValue placeholder="Ordenar" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="default">Ordem padrão (prioridade)</SelectItem>
+                <SelectItem value="due_date_asc">Vencimento · crescente</SelectItem>
+                <SelectItem value="due_date_desc">Vencimento · decrescente</SelectItem>
+                <SelectItem value="loan_date_asc">Contrato · crescente</SelectItem>
+                <SelectItem value="loan_date_desc">Contrato · decrescente</SelectItem>
+                <SelectItem value="created_at_asc">Cadastro · mais antigo</SelectItem>
+                <SelectItem value="created_at_desc">Cadastro · mais recente</SelectItem>
+              </SelectContent>
+            </Select>
+          )}
           {!isParcelamentos && (
             <div className="flex items-center gap-2 flex-wrap">
               <div className="flex items-center gap-2">
@@ -1086,7 +1612,7 @@ export default function Emprestimos() {
                                           </span>
                                         ) : (
                                           <>
-                                            <ScoreGauge score={typeof score === "number" ? score : undefined} />
+                                            <ScoreDot score={typeof score === "number" ? score : undefined} />
                                             <button
                                               type="button"
                                               className="p-0.5 rounded-full hover:bg-muted/60"
@@ -1162,6 +1688,7 @@ export default function Emprestimos() {
                       );
                       const st = statusMap[displayStatus] || statusMap.active;
                       const isPaid = loan.status === "paid";
+                      const isFinalized = loan.status === "finalized";
 
                       return (
                         <motion.tr
@@ -1172,56 +1699,66 @@ export default function Emprestimos() {
                           className="border-b border-border/20 hover:bg-surface-hover transition-colors"
                         >
                           <td className="p-4 text-sm font-medium text-foreground">
-                            <div className="relative inline-flex items-center pr-20">
-                              <span className="truncate max-w-[240px]">{String(loan.client_name)}</span>
-                              {(() => {
-                                const cid = String((loan as { client_id?: string | number }).client_id || "");
-                                const score = clientScoreById[cid]?.score;
-                                const label = clientScoreById[cid]?.label;
-                                const isLoadingScore = clientScoreQueries[clientIdsOnPage.indexOf(cid)]?.isLoading;
+                            <div className="flex flex-col gap-1 min-w-0">
+                              <div className="relative inline-flex items-center pr-20 min-w-0">
+                                <span className="truncate max-w-[240px]">{String(loan.client_name)}</span>
+                                {(() => {
+                                  const cid = String((loan as { client_id?: string | number }).client_id || "");
+                                  const score = clientScoreById[cid]?.score;
+                                  const label = clientScoreById[cid]?.label;
+                                  const isLoadingScore = clientScoreQueries[clientIdsOnPage.indexOf(cid)]?.isLoading;
 
-                                return (
-                                  <Tooltip>
-                                    <TooltipTrigger asChild>
-                                      <span className="absolute right-2 top-1/2 -translate-y-1/2 flex items-center gap-1">
-                                        {isLoadingScore ? (
-                                          <span className={`px-2 py-0.5 rounded-full text-[10px] font-semibold border border-border/40 ${getScoreBg(score)}`}>
-                                            …
-                                          </span>
-                                        ) : (
-                                          <>
-                                            <ScoreGauge score={typeof score === "number" ? score : undefined} />
-                                            <button
-                                              type="button"
-                                              className="p-0.5 rounded-full hover:bg-muted/60"
-                                              onClick={(e) => {
-                                                e.stopPropagation();
-                                                openTagDialog(
-                                                  cid,
-                                                  String(loan.client_name || "")
-                                                );
-                                              }}
-                                              aria-label="Adicionar etiqueta"
-                                            >
-                                              <TagIcon className="h-3.5 w-3.5 text-muted-foreground" />
-                                            </button>
-                                          </>
-                                        )}
-                                      </span>
-                                    </TooltipTrigger>
-                                    <TooltipContent side="top">
-                                      <span className={`font-semibold ${getScoreColor(score)}`}>
-                                        {typeof score === "number" ? `${score}/100` : "Sem score"}
-                                      </span>
-                                      {label ? <span className="ml-2 text-muted-foreground">{label}</span> : null}
-                                    </TooltipContent>
-                                  </Tooltip>
-                                );
-                              })()}
+                                  return (
+                                    <Tooltip>
+                                      <TooltipTrigger asChild>
+                                        <span className="absolute right-2 top-1/2 -translate-y-1/2 flex items-center gap-1">
+                                          {isLoadingScore ? (
+                                            <span className={`px-2 py-0.5 rounded-full text-[10px] font-semibold border border-border/40 ${getScoreBg(score)}`}>
+                                              …
+                                            </span>
+                                          ) : (
+                                            <>
+                                              <ScoreDot score={typeof score === "number" ? score : undefined} />
+                                              <button
+                                                type="button"
+                                                className="p-0.5 rounded-full hover:bg-muted/60"
+                                                onClick={(e) => {
+                                                  e.stopPropagation();
+                                                  openTagDialog(
+                                                    cid,
+                                                    String(loan.client_name || "")
+                                                  );
+                                                }}
+                                                aria-label="Adicionar etiqueta"
+                                              >
+                                                <TagIcon className="h-3.5 w-3.5 text-muted-foreground" />
+                                              </button>
+                                            </>
+                                          )}
+                                        </span>
+                                      </TooltipTrigger>
+                                      <TooltipContent side="top">
+                                        <span className={`font-semibold ${getScoreColor(score)}`}>
+                                          {typeof score === "number" ? `${score}/100` : "Sem score"}
+                                        </span>
+                                        {label ? <span className="ml-2 text-muted-foreground">{label}</span> : null}
+                                      </TooltipContent>
+                                    </Tooltip>
+                                  );
+                                })()}
+                              </div>
+                              <div className="flex flex-row flex-wrap items-center gap-x-3 gap-y-0.5 text-[10px] font-semibold leading-tight">
+                                <span className="text-red-600 dark:text-red-500 whitespace-nowrap">
+                                  Multas = {formatCurrency(Number((loan as { total_fines_amount?: unknown }).total_fines_amount ?? 0))}
+                                </span>
+                                <span className="text-green-600 dark:text-green-500 whitespace-nowrap">
+                                  Valor pago = {formatCurrency(Number((loan as { total_paid_amount?: unknown }).total_paid_amount ?? 0))}
+                                </span>
+                              </div>
                             </div>
                           </td>
                           <td className="p-4 text-sm text-foreground">{formatCurrency(Number(loan.amount))}</td>
-                          <td className="p-4 text-sm text-muted-foreground">{loan.interest_rate}%</td>
+                          <td className="p-4 text-sm text-muted-foreground">{String(loan.interest_rate ?? "")}%</td>
                           <td className="p-4 text-sm font-medium text-foreground">
                             {loan.status === "paid" || loan.status === "cancelled"
                               ? "—"
@@ -1249,12 +1786,19 @@ export default function Emprestimos() {
                               <LoanActionButton icon={Eye} label="Ver detalhes" onClick={() => openViewDetails(loan)} variant="view" />
                               {isPaid ? (
                                 <LoanActionButton icon={Trash2} label="Excluir" onClick={() => handleDelete(loan)} variant="delete" />
+                              ) : isFinalized ? (
+                                <>
+                                  <LoanActionButton icon={FileText} label="Contrato" onClick={() => handleContract(loan)} variant="document" />
+                                  <LoanActionButton icon={FileDown} label="PDF" onClick={() => handlePDF(loan)} variant="pdf" />
+                                  <LoanActionButton icon={Users} label="Contatos" onClick={() => openContacts(loan)} variant="contacts" />
+                                </>
                               ) : (
                                 <>
                                   <LoanActionButton icon={Pencil} label="Editar" onClick={() => openEdit(loan)} variant="edit" />
                                   <LoanActionButton icon={Wallet} label="Pagamentos" onClick={() => openPayments(loan)} variant="payment" />
                                   <LoanActionButton icon={MessageCircle} label="COBRANÇA" onClick={() => openWhatsapp(loan)} variant="whatsapp" />
                                   <LoanActionButton icon={CheckCircle} label="Quitar" onClick={() => openQuitar(loan)} variant="complete" />
+                                  <LoanActionButton icon={Archive} label="Finalizar" onClick={() => openFinalize(loan)} variant="view" />
                                   <LoanActionButton icon={FileText} label="Contrato" onClick={() => handleContract(loan)} variant="document" />
                                   <LoanActionButton icon={FileDown} label="PDF" onClick={() => handlePDF(loan)} variant="pdf" />
                                   <LoanActionButton icon={Users} label="Contatos" onClick={() => openContacts(loan)} variant="contacts" />
@@ -1395,6 +1939,74 @@ export default function Emprestimos() {
                 required
               />
             </div>
+
+            <div className="rounded-lg border border-border/50 bg-muted/20 p-4 space-y-3">
+              <p className="text-xs font-semibold text-foreground">Vínculo com levantamento (opcional)</p>
+              <div className="grid gap-2">
+                <Label className="text-xs">Levantamento</Label>
+                <Select
+                  value={newLoanForm.capital_raise_id}
+                  onValueChange={(v) =>
+                    setNewLoanForm((f) => ({
+                      ...f,
+                      capital_raise_id: v === "__none__" ? "" : v,
+                      capital_raise_capital: v ? f.capital_raise_capital : "",
+                      capital_raise_interest: v ? f.capital_raise_interest : "",
+                    }))
+                  }
+                >
+                  <SelectTrigger className="h-9">
+                    <SelectValue placeholder="Sem vínculo" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="__none__">Sem vínculo</SelectItem>
+                    {activeCapitalRaises.map((r) => (
+                      <SelectItem key={r.id} value={r.id}>
+                        {r.nome}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <p className="text-[11px] text-muted-foreground leading-snug">
+                  O empréstimo continua normal. Esse vínculo só serve para acompanhar quitação do levantamento.
+                </p>
+              </div>
+
+              {String(newLoanForm.capital_raise_id || "").trim() ? (
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="grid gap-2">
+                    <Label className="text-xs">Capital (captação)</Label>
+                    <Input
+                      type="text"
+                      inputMode="decimal"
+                      placeholder="0,00"
+                      value={newLoanForm.capital_raise_capital}
+                      onChange={(e) =>
+                        setNewLoanForm((f) => ({
+                          ...f,
+                          capital_raise_capital: e.target.value.replace(/[^\d,.-]/g, ""),
+                        }))
+                      }
+                    />
+                  </div>
+                  <div className="grid gap-2">
+                    <Label className="text-xs">Juros (captação)</Label>
+                    <Input
+                      type="text"
+                      inputMode="decimal"
+                      placeholder="0,00"
+                      value={newLoanForm.capital_raise_interest}
+                      onChange={(e) =>
+                        setNewLoanForm((f) => ({
+                          ...f,
+                          capital_raise_interest: e.target.value.replace(/[^\d,.-]/g, ""),
+                        }))
+                      }
+                    />
+                  </div>
+                </div>
+              ) : null}
+            </div>
             <div className="grid gap-2">
               <Label>Prazo *</Label>
               <Select
@@ -1452,6 +2064,48 @@ export default function Emprestimos() {
               </Button>
             </DialogFooter>
           </form>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={signModalOpen}
+        onOpenChange={(v) => {
+          setSignModalOpen(v);
+          if (!v) setSignUrl("");
+        }}
+      >
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>Assinatura do contrato</DialogTitle>
+            <DialogDescription>
+              Envie este link para o cliente assinar e autorizar o empréstimo. Enquanto não assinar, o nome do cliente
+              aparece em vermelho na lista.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-2">
+            <Label className="text-xs">Link</Label>
+            <Input readOnly value={signUrl || "—"} className="font-mono text-xs" />
+            <div className="flex gap-2">
+              <Button
+                type="button"
+                variant="outline"
+                onClick={async () => {
+                  try {
+                    await navigator.clipboard.writeText(signUrl);
+                    toast.success("Link copiado");
+                  } catch {
+                    toast.message("Não foi possível copiar automaticamente. Copie manualmente.");
+                  }
+                }}
+                disabled={!signUrl}
+              >
+                Copiar
+              </Button>
+              <Button type="button" onClick={() => setSignModalOpen(false)}>
+                Ok
+              </Button>
+            </div>
+          </div>
         </DialogContent>
       </Dialog>
 
@@ -1513,6 +2167,7 @@ export default function Emprestimos() {
                   <SelectItem value="overdue">Vencido</SelectItem>
                   <SelectItem value="paid">Quitado</SelectItem>
                   <SelectItem value="cancelled">Cancelado</SelectItem>
+                  <SelectItem value="finalized">Finalizado</SelectItem>
                 </SelectContent>
               </Select>
             </div>
@@ -1528,8 +2183,187 @@ export default function Emprestimos() {
         </DialogContent>
       </Dialog>
 
+      {/* Modal Finalizar empréstimo */}
+      <Dialog open={finalizeOpen} onOpenChange={setFinalizeOpen}>
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>Finalizar empréstimo</DialogTitle>
+            <DialogDescription>
+              O contrato deixa de aparecer em Todos, Ativos e Vencidos. Os pagamentos já registrados permanecem no histórico do cliente (menu Histórico).
+              {selectedLoan ? ` Cliente: ${String(selectedLoan.client_name)}.` : ""}
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter className="gap-2 sm:gap-0">
+            <Button variant="outline" onClick={() => setFinalizeOpen(false)}>
+              Cancelar
+            </Button>
+            <Button onClick={handleFinalizeSubmit} disabled={isSubmitting}>
+              {isSubmitting ? "Processando..." : "Confirmar finalização"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={notesSearchOpen}
+        onOpenChange={(open) => {
+          setNotesSearchOpen(open);
+          if (!open) {
+            setNotesSearchPayments([]);
+            setNotesSearchPaidLoans([]);
+            setNotesSearchHasRun(false);
+          }
+        }}
+      >
+        <DialogContent className="max-w-lg max-h-[92vh] flex flex-col gap-4 overflow-hidden sm:max-w-lg">
+          <DialogHeader className="shrink-0 space-y-1.5 text-left">
+            <DialogTitle>Buscar notas e observações</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-3 shrink-0">
+            <div className="space-y-1.5">
+              <Label className="text-xs">Onde buscar</Label>
+              <Select
+                value={notesSearchScope}
+                onValueChange={(v) => setNotesSearchScope(v as LoanNotesSearchScope)}
+              >
+                <SelectTrigger className="h-9 text-xs nexus-input">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">Pagamentos e quitações</SelectItem>
+                  <SelectItem value="payments">Somente pagamentos</SelectItem>
+                  <SelectItem value="paid_loans">Somente quitações (histórico quitado)</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="space-y-1.5">
+              <Label className="text-xs">Termo</Label>
+              <div className="flex gap-2">
+                <Input
+                  className="h-9 text-xs nexus-input flex-1"
+                  placeholder="Ex.: PIX, renovação, multa..."
+                  value={notesSearchTerm}
+                  onChange={(e) => setNotesSearchTerm(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") void runNotesSearch();
+                  }}
+                />
+                <Button
+                  type="button"
+                  className="h-9 text-xs shrink-0"
+                  disabled={notesSearchLoading}
+                  onClick={() => void runNotesSearch()}
+                >
+                  {notesSearchLoading ? "…" : "Buscar"}
+                </Button>
+              </div>
+            </div>
+          </div>
+          <ScrollArea className="h-[min(520px,calc(92vh-260px))] min-h-[200px] w-full shrink-0 rounded-md border border-border/40 pr-3">
+            <div className="space-y-4 p-3 pr-1">
+              {(notesSearchScope === "all" || notesSearchScope === "payments") &&
+                notesSearchPayments.length > 0 && (
+                  <div>
+                    <p className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wider mb-2">
+                      Pagamentos ({notesSearchPayments.length})
+                    </p>
+                    <ul className="space-y-2">
+                      {notesSearchPayments.map((row) => (
+                        <li
+                          key={row.id}
+                          className="rounded-lg border border-border/40 bg-muted/20 p-3 text-sm"
+                        >
+                          <div className="flex flex-wrap items-center gap-2 mb-1">
+                            <Badge variant="secondary" className="text-[10px]">
+                              Pagamento
+                            </Badge>
+                            <span className={`font-medium ${row.is_authorized === false ? "text-red-600 dark:text-red-400" : "text-foreground"}`}>
+                              {row.client_name}
+                            </span>
+                            <span className="text-xs text-muted-foreground">
+                              {formatDate(row.payment_date)} · {formatCurrency(row.amount)}
+                            </span>
+                          </div>
+                          <p className="text-foreground/90 whitespace-pre-wrap break-words">{row.notes}</p>
+                          <Button
+                            type="button"
+                            variant="link"
+                            className="h-auto p-0 text-xs mt-2"
+                            onClick={() => void openLoanFromNotesSearch(row.loan_id)}
+                          >
+                            Abrir empréstimo
+                          </Button>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+              {(notesSearchScope === "all" || notesSearchScope === "paid_loans") &&
+                notesSearchPaidLoans.length > 0 && (
+                  <div>
+                    <p className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wider mb-2">
+                      Quitações ({notesSearchPaidLoans.length})
+                    </p>
+                    <ul className="space-y-2">
+                      {notesSearchPaidLoans.map((row) => (
+                        <li
+                          key={row.id}
+                          className="rounded-lg border border-border/40 bg-muted/20 p-3 text-sm"
+                        >
+                          <div className="flex flex-wrap items-center gap-2 mb-1">
+                            <Badge variant="outline" className="text-[10px]">
+                              Quitação
+                            </Badge>
+                            <span className={`font-medium ${row.is_authorized === false ? "text-red-600 dark:text-red-400" : "text-foreground"}`}>
+                              {row.client_name}
+                            </span>
+                            <span className="text-xs text-muted-foreground">
+                              {formatDate(row.paid_date)} · {formatCurrency(row.original_amount)}
+                            </span>
+                          </div>
+                          <p className="text-foreground/90 whitespace-pre-wrap break-words">{row.notes}</p>
+                          <Button
+                            type="button"
+                            variant="link"
+                            className="h-auto p-0 text-xs mt-2"
+                            onClick={() => void openLoanFromNotesSearch(row.loan_id)}
+                          >
+                            Abrir empréstimo
+                          </Button>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+              {notesSearchHasRun &&
+                !notesSearchLoading &&
+                notesSearchPayments.length === 0 &&
+                notesSearchPaidLoans.length === 0 && (
+                  <p className="text-sm text-muted-foreground text-center py-8">
+                    Nenhuma observação encontrada para este termo.
+                  </p>
+                )}
+            </div>
+          </ScrollArea>
+          <DialogFooter className="shrink-0 sm:justify-end">
+            <Button type="button" variant="outline" onClick={() => setNotesSearchOpen(false)}>
+              Fechar
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       {/* Modal Ver Detalhes do Empréstimo */}
-      <Dialog open={viewDetailsOpen} onOpenChange={setViewDetailsOpen}>
+      <Dialog
+        open={viewDetailsOpen}
+        onOpenChange={(open) => {
+          setViewDetailsOpen(open);
+          if (!open) {
+            setPaymentDetailOpen(false);
+            setPaymentDetailRow(null);
+          }
+        }}
+      >
         <DialogContent className="max-w-2xl max-h-[90vh] overflow-y-auto">
           <DialogHeader>
             <DialogTitle>Detalhes do empréstimo</DialogTitle>
@@ -1541,11 +2375,50 @@ export default function Emprestimos() {
               <div className="rounded-lg border bg-muted/30 p-4">
                 <h4 className="font-semibold text-foreground mb-3">Dados do cliente</h4>
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-sm">
-                  <div><span className="text-muted-foreground">Nome:</span> <span className="font-medium">{loanFull?.client_name ?? selectedLoan.client_name}</span></div>
-                  <div><span className="text-muted-foreground">CPF:</span> {loanFull?.client_cpf ?? selectedLoan.client_cpf ?? "—"}</div>
-                  <div><span className="text-muted-foreground">Telefone:</span> {loanFull?.client_phone ?? selectedLoan.client_phone ?? "—"}</div>
-                  <div><span className="text-muted-foreground">E-mail:</span> {loanFull?.client_email ?? selectedLoan.client_email ?? "—"}</div>
-                  <div className="md:col-span-2"><span className="text-muted-foreground">Endereço:</span> {loanFull?.client_address ?? "—"}</div>
+                  <div>
+                    <span className="text-muted-foreground">Nome:</span>{" "}
+                    <span className="font-medium">
+                      {String((loanFull as { client_name?: unknown } | null | undefined)?.client_name ?? selectedLoan.client_name ?? "—")}
+                    </span>
+                  </div>
+                  <div><span className="text-muted-foreground">CPF:</span> {String((loanFull as { client_cpf?: unknown } | null | undefined)?.client_cpf ?? selectedLoan.client_cpf ?? "—")}</div>
+                  <div><span className="text-muted-foreground">Telefone:</span> {String((loanFull as { client_phone?: unknown } | null | undefined)?.client_phone ?? selectedLoan.client_phone ?? "—")}</div>
+                  <div><span className="text-muted-foreground">E-mail:</span> {String((loanFull as { client_email?: unknown } | null | undefined)?.client_email ?? selectedLoan.client_email ?? "—")}</div>
+                  <div className="md:col-span-2"><span className="text-muted-foreground">Endereço:</span> {String((loanFull as { client_address?: unknown } | null | undefined)?.client_address ?? "—")}</div>
+                </div>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mt-4">
+                  <div className="rounded-lg border border-border/50 bg-background/40 p-3">
+                    <p className="text-xs font-semibold text-foreground mb-2">Avalistas</p>
+                    {(detailsGuarantors as any[]).length === 0 ? (
+                      <p className="text-xs text-muted-foreground">Nenhum avalista cadastrado.</p>
+                    ) : (
+                      <div className="space-y-2">
+                        {(detailsGuarantors as any[]).map((g: any) => (
+                          <div key={String(g.id)} className="text-xs">
+                            <p className="font-medium text-foreground">{String(g.name || "—")}</p>
+                            <p className="text-muted-foreground">Tel: {String(g.phone || "—")}</p>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                  <div className="rounded-lg border border-border/50 bg-background/40 p-3">
+                    <p className="text-xs font-semibold text-foreground mb-2">Contatos de emergência</p>
+                    {(detailsEmergency as any[]).length === 0 ? (
+                      <p className="text-xs text-muted-foreground">Nenhum contato de emergência cadastrado.</p>
+                    ) : (
+                      <div className="space-y-2">
+                        {(detailsEmergency as any[]).map((c: any) => (
+                          <div key={String(c.id)} className="text-xs">
+                            <p className="font-medium text-foreground">{String(c.name || "—")}</p>
+                            <p className="text-muted-foreground">
+                              Tel: {String(c.phone || "—")} {c.relationship ? `· ${String(c.relationship)}` : ""}
+                            </p>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
                 </div>
               </div>
               {/* Valores e datas */}
@@ -1553,7 +2426,7 @@ export default function Emprestimos() {
                 <h4 className="font-semibold text-foreground mb-3">Empréstimo</h4>
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-sm">
                   <div><span className="text-muted-foreground">Valor original:</span> <span className="font-semibold">{formatCurrency(Number(selectedLoan.amount ?? 0))}</span></div>
-                  <div><span className="text-muted-foreground">Juros:</span> {selectedLoan.interest_rate}%</div>
+                  <div><span className="text-muted-foreground">Juros:</span> {String(selectedLoan.interest_rate ?? "")}%</div>
                   <div><span className="text-muted-foreground">Data do empréstimo:</span> {formatDate(String(selectedLoan.loan_date))}</div>
                   <div><span className="text-muted-foreground">Vencimento:</span> {formatDate(String(selectedLoan.due_date))}</div>
                   {(() => {
@@ -1574,7 +2447,9 @@ export default function Emprestimos() {
                                 ? "— (cobrança no parcelamento)"
                                 : loanRemaining
                                   ? formatCurrency(loanRemaining.remainingAmount)
-                                  : "—"}
+                                  : typeof selectedLoan.remaining_amount === "number"
+                                    ? formatCurrency(selectedLoan.remaining_amount)
+                                    : "—"}
                           </span>
                         </div>
                       </>
@@ -1599,7 +2474,7 @@ export default function Emprestimos() {
                       <span className="max-w-[220px] truncate">{tag.text}</span>
                       {tag.created_by_name && (
                         <span className="text-[9px] text-primary/70 ml-1">
-                          · {tag.created_by_name}
+                          · {String(tag.created_by_name)}
                         </span>
                       )}
                       <button
@@ -1637,18 +2512,33 @@ export default function Emprestimos() {
                         </tr>
                       </thead>
                       <tbody>
-                        {loanPayments.map((p: { id: string; payment_date: string; amount: number; fine_amount: number; payment_type: string }) => (
-                          <tr key={p.id} className="border-b border-border/30">
-                            <td className="py-2">{formatDate(p.payment_date)}</td>
-                            <td>{formatCurrency(p.amount)}</td>
-                            <td>{p.fine_amount ? formatCurrency(p.fine_amount) : "—"}</td>
-                            <td className="text-muted-foreground">{p.payment_type || "—"}</td>
+                        {loanPayments.map((p: { id?: unknown; payment_date?: unknown; created_at?: unknown; amount?: unknown; fine_amount?: unknown; payment_type?: unknown; notes?: unknown }) => (
+                          <tr
+                            key={String(p.id ?? "")}
+                            role="button"
+                            tabIndex={0}
+                            className="border-b border-border/30 cursor-pointer hover:bg-muted/50 transition-colors"
+                            onClick={() => openPaymentDetail(p)}
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter" || e.key === " ") {
+                                e.preventDefault();
+                                openPaymentDetail(p);
+                              }
+                            }}
+                          >
+                            <td className="py-2">{formatDate(String(p.payment_date || p.created_at || ""))}</td>
+                            <td>{formatCurrency(parseFloat(String(p.amount || 0)))}</td>
+                            <td>{p.fine_amount ? formatCurrency(parseFloat(String(p.fine_amount))) : "—"}</td>
+                            <td className="text-muted-foreground">{paymentTypeLabel(String(p.payment_type || ""))}</td>
                             <td className="py-2 text-right">
                               <Tooltip>
                                 <TooltipTrigger asChild>
                                   <button
                                     type="button"
-                                    onClick={() => handleDeletePayment(p.id)}
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      void handleDeletePayment(String(p.id || ""));
+                                    }}
                                     disabled={isSubmitting}
                                     className="p-1.5 rounded-md transition-colors text-destructive hover:text-destructive/80 hover:bg-destructive/10 disabled:opacity-50"
                                     title="Excluir pagamento"
@@ -1668,6 +2558,64 @@ export default function Emprestimos() {
               </div>
             </div>
           )}
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={paymentDetailOpen}
+        onOpenChange={(open) => {
+          setPaymentDetailOpen(open);
+          if (!open) setPaymentDetailRow(null);
+        }}
+      >
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>Detalhes do pagamento</DialogTitle>
+            <DialogDescription>
+              {selectedLoan ? String(selectedLoan.client_name) : "—"}
+            </DialogDescription>
+          </DialogHeader>
+          {paymentDetailRow ? (
+            <div className="space-y-4 py-2 text-sm">
+              <div>
+                <p className="text-xs text-muted-foreground">Data do pagamento</p>
+                <p className="font-medium text-foreground mt-0.5">{formatDate(paymentDetailRow.payment_date)}</p>
+              </div>
+              <div>
+                <p className="text-xs text-muted-foreground">Registrado em (data e hora)</p>
+                <p className="font-medium text-foreground mt-0.5">
+                  {paymentDetailRow.created_at ? formatDateTimePt(paymentDetailRow.created_at) : "—"}
+                </p>
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <p className="text-xs text-muted-foreground">Valor</p>
+                  <p className="font-medium text-foreground mt-0.5">{formatCurrency(paymentDetailRow.amount)}</p>
+                </div>
+                <div>
+                  <p className="text-xs text-muted-foreground">Multa</p>
+                  <p className="font-medium text-foreground mt-0.5">
+                    {paymentDetailRow.fine_amount ? formatCurrency(paymentDetailRow.fine_amount) : "—"}
+                  </p>
+                </div>
+              </div>
+              <div>
+                <p className="text-xs text-muted-foreground">Tipo</p>
+                <p className="font-medium text-foreground mt-0.5">{paymentTypeLabel(paymentDetailRow.payment_type)}</p>
+              </div>
+              <div>
+                <p className="text-xs text-muted-foreground">Observação</p>
+                <p className="mt-1.5 rounded-md border border-border/60 bg-background px-3 py-2 text-foreground whitespace-pre-wrap break-words min-h-[3rem]">
+                  {paymentDetailRow.notes.trim() ? paymentDetailRow.notes : "—"}
+                </p>
+              </div>
+            </div>
+          ) : null}
+          <DialogFooter>
+            <Button type="button" variant="outline" onClick={() => setPaymentDetailOpen(false)}>
+              Fechar
+            </Button>
+          </DialogFooter>
         </DialogContent>
       </Dialog>
 
@@ -1712,6 +2660,12 @@ export default function Emprestimos() {
                     <span>Pagamento mínimo</span>
                     <span>{formatCurrency(loanRemaining.minimumPayment)}</span>
                   </div>
+                  {loanRemaining.overdueDailyFineOwed > 0 ? (
+                    <div className="flex justify-between text-destructive">
+                      <span>Multa diária (atraso)</span>
+                      <span>{formatCurrency(loanRemaining.overdueDailyFineOwed)}</span>
+                    </div>
+                  ) : null}
                 </>
               ) : (
                 <p className="text-muted-foreground py-2">Carregando...</p>
@@ -1785,7 +2739,7 @@ export default function Emprestimos() {
                 </Select>
               </div>
               <div className="grid gap-2">
-                <Label>Multa (opcional)</Label>
+                <Label>Multa no pagamento (opcional)</Label>
                 <Input
                   type="text"
                   inputMode="decimal"
@@ -1795,6 +2749,13 @@ export default function Emprestimos() {
                     setPaymentForm((f) => ({ ...f, fine_amount: e.target.value.replace(/[^\d,.-]/g, "") }))
                   }
                 />
+                {loanRemaining && loanRemaining.overdueDailyFineOwed > 0 ? (
+                  <p className="text-[11px] text-muted-foreground">
+                    Multa diária de atraso calculada: {formatCurrency(loanRemaining.overdueDailyFineOwed)}. Você pode
+                    anular dias ao continuar o registro. O valor acima é o que entra neste pagamento (comprovante /
+                    histórico), além das anulações.
+                  </p>
+                ) : null}
               </div>
             </div>
             <div className="grid gap-2">
@@ -1828,6 +2789,24 @@ export default function Emprestimos() {
           </form>
         </DialogContent>
       </Dialog>
+
+      <PaymentFineWaiveDialog
+        open={fineWaiveOpen}
+        onOpenChange={(o) => {
+          if (!o) setPendingRenewalOption(null);
+          setFineWaiveOpen(o);
+        }}
+        loanId={selectedLoan?.id ? String(selectedLoan.id) : null}
+        dueDateYmd={selectedLoan?.due_date ? String(selectedLoan.due_date).split("T")[0] : ""}
+        submitting={isSubmitting}
+        onContinue={async (waiveDates) => {
+          const opt = pendingRenewalOption;
+          if (!opt) return;
+          setFineWaiveOpen(false);
+          setPendingRenewalOption(null);
+          await proceedRenewalAfterFineModal(opt, waiveDates);
+        }}
+      />
 
       {/* Modal Confirmar Nova Data de Vencimento (30 dias) */}
       <Dialog open={confirmDueDateOpen} onOpenChange={setConfirmDueDateOpen}>
@@ -1893,6 +2872,20 @@ export default function Emprestimos() {
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-3 py-4">
+            <Button
+              variant="outline"
+              className="w-full justify-start h-auto py-3 border-amber-500/30 hover:bg-amber-500/10"
+              onClick={() => handleRenewalPayment("quitacao_total")}
+              disabled={isSubmitting}
+            >
+              <span className="text-left">
+                <strong>Quitação total</strong>
+                <br />
+                <span className="text-muted-foreground text-xs">
+                  QUITAR o empréstimo agora (marca como quitado + comprovante)
+                </span>
+              </span>
+            </Button>
             <Button
               variant="outline"
               className="w-full justify-start h-auto py-3"
@@ -1985,7 +2978,9 @@ export default function Emprestimos() {
               {comprovanteData && (
                 <>
                   Pagamento de {formatCurrency(comprovanteData.valorPago)} registrado.
-                  Próximo vencimento: {formatDate(comprovanteData.proximoVencimento)}.
+                  {comprovanteData.quitado
+                    ? " Empréstimo quitado."
+                    : <> Próximo vencimento: {formatDate(comprovanteData.proximoVencimento)}.</>}
                   O PDF oficial com marca d&apos;água será baixado e enviado como anexo no WhatsApp (se a
                   instância estiver conectada).
                 </>
@@ -1997,6 +2992,9 @@ export default function Emprestimos() {
               {comprovanteData.clientId && comprovanteScoreLoading && (
                 <p className="text-xs text-muted-foreground">Atualizando score do cliente…</p>
               )}
+              {comprovanteRemainingLoading && !comprovanteData.quitado && (
+                <p className="text-xs text-muted-foreground">Calculando saldo do empréstimo…</p>
+              )}
               <div className="rounded-lg border border-border/50 bg-muted/30 p-4 text-sm">
                 <p className="font-medium text-foreground mb-2">Colinha (legenda do PDF + mensagem):</p>
                 <p className="text-muted-foreground whitespace-pre-wrap text-xs">
@@ -2007,6 +3005,18 @@ export default function Emprestimos() {
                     comprovanteScore
                       ? { score: comprovanteScore.score, label: comprovanteScore.label }
                       : null,
+                    {
+                      quitado: Boolean(comprovanteData.quitado),
+                      remaining:
+                        !comprovanteData.quitado && comprovanteRemaining
+                          ? {
+                              totalRestante: comprovanteRemaining.remainingAmount || 0,
+                              capitalRestante: comprovanteRemaining.capital || 0,
+                              jurosRestante: comprovanteRemaining.interestAmount || 0,
+                              pagamentoMinimo: comprovanteRemaining.minimumPayment || 0,
+                            }
+                          : null,
+                    },
                   )}
                 </p>
               </div>
@@ -2035,13 +3045,30 @@ export default function Emprestimos() {
                         scoreForSend != null
                           ? { score: scoreForSend.score, label: scoreForSend.label }
                           : null;
-                      const companyTitle =
-                        [PDF_BRAND.companyName, PDF_BRAND.branch].filter(Boolean).join(" · ").trim() || undefined;
+                      const companyTitle = String(companyName || "").trim() || undefined;
+                      // Para incluir saldo no texto do comprovante (sem enviar segunda mensagem).
+                      let remainingInfo:
+                        | { totalRestante: number; capitalRestante: number; jurosRestante: number; pagamentoMinimo: number }
+                        | null = null;
+                      if (!comprovanteData.quitado) {
+                        try {
+                          const remaining = await calculateLoanRemaining(comprovanteData.loanId);
+                          remainingInfo = {
+                            totalRestante: remaining.remainingAmount || 0,
+                            capitalRestante: remaining.capital || 0,
+                            jurosRestante: remaining.interestAmount || 0,
+                            pagamentoMinimo: remaining.minimumPayment || 0,
+                          };
+                        } catch {
+                          remainingInfo = null;
+                        }
+                      }
                       const colinha = buildComprovanteMessage(
                         comprovanteData.clientName,
                         comprovanteData.valorPago,
                         comprovanteData.proximoVencimento,
                         scoreInfo,
+                        { quitado: Boolean(comprovanteData.quitado), remaining: remainingInfo },
                       );
                       const doc = generateComprovantePagamentoPdf({
                         clientName: comprovanteData.clientName,
@@ -2053,10 +3080,12 @@ export default function Emprestimos() {
                         score: scoreInfo?.score,
                         scoreLabel: scoreInfo?.label,
                         companyTitle,
+                        quitado: Boolean(comprovanteData.quitado),
                       });
                       const fileName = `comprovante-${comprovanteData.loanId.slice(0, 8)}-${comprovanteData.paymentDate}.pdf`;
                       doc.save(fileName);
                       const b64 = comprovantePdfToBase64(doc);
+                      // Mantém a legenda do PDF enxuta; a colinha de saldo vai como msg separada quando via API.
                       const res = await sendWhatsAppComprovante(comprovanteData.clientPhone, colinha, b64, fileName);
                       if (res.via === "api") toast.success("PDF e mensagem enviados pelo WhatsApp");
                       else toast.success("PDF baixado. Abra o WhatsApp e anexe o arquivo se necessário.");
@@ -2177,7 +3206,10 @@ export default function Emprestimos() {
                       className="w-full p-3 border rounded-lg text-left hover:bg-muted/50 flex items-center justify-between"
                       onClick={() => handleContactWhatsApp(g.phone, g.name)}
                     >
-                      <span>{g.name} - {g.phone}</span>
+                      <span>
+                        {g.name} - {g.phone}
+                        {g.relationship ? ` · ${g.relationship}` : ""}
+                      </span>
                       <ExternalLink className="h-4 w-4 text-[#25D366]" />
                     </button>
                   ))}
@@ -2195,7 +3227,10 @@ export default function Emprestimos() {
                       className="w-full p-3 border rounded-lg text-left hover:bg-muted/50 flex items-center justify-between"
                       onClick={() => handleContactWhatsApp(e.phone, e.name)}
                     >
-                      <span>{e.name} - {e.phone}</span>
+                      <span>
+                        {e.name} - {e.phone}
+                        {e.relationship ? ` · ${e.relationship}` : ""}
+                      </span>
                       <ExternalLink className="h-4 w-4 text-[#25D366]" />
                     </button>
                   ))}
@@ -2221,6 +3256,37 @@ export default function Emprestimos() {
             </DialogDescription>
           </DialogHeader>
           <div className="grid gap-3 py-3">
+            <div className="grid gap-2">
+              <div className="flex items-center justify-between gap-2">
+                <Label className="text-sm">Etiquetas existentes</Label>
+                <span className="text-[11px] text-muted-foreground">
+                  {tagDialogTagsLoading ? "Carregando..." : `${(tagDialogTags as ClientTagRow[]).length} etiqueta(s)`}
+                </span>
+              </div>
+              <div className="flex flex-wrap gap-1.5 rounded-lg border border-border/60 bg-muted/20 p-2">
+                {!tagDialogTagsLoading && (tagDialogTags as ClientTagRow[]).length === 0 ? (
+                  <span className="text-[11px] text-muted-foreground px-1">Nenhuma etiqueta cadastrada.</span>
+                ) : (
+                  (tagDialogTags as ClientTagRow[]).map((tag) => (
+                    <span
+                      key={tag.id}
+                      className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] ${tagColorClasses(tag.color)}`}
+                      title={tag.created_by_name ? `${tag.text} · ${tag.created_by_name}` : tag.text}
+                    >
+                      <span className="max-w-[240px] truncate">{tag.text}</span>
+                      <button
+                        type="button"
+                        className="ml-0.5 text-xs text-muted-foreground hover:text-destructive"
+                        aria-label="Remover etiqueta"
+                        onClick={() => deleteTagMutation.mutate({ id: tag.id })}
+                      >
+                        ×
+                      </button>
+                    </span>
+                  ))
+                )}
+              </div>
+            </div>
             <div className="grid gap-2">
               <Label>Texto da etiqueta</Label>
               <Textarea

@@ -1,0 +1,8 @@
+{
+  "name": "nexus-render-build-bridge",
+  "private": true,
+  "description": "Render às vezes usa Root Directory = src. Este arquivo delega o build para a raiz do app (onde está o Vite).",
+  "scripts": {
+    "build": "cd .. && npm install && npm run build"
+  }
+}

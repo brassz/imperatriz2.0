@@ -15,9 +15,33 @@ const FORO_BY_BRANCH: Record<string, string> = {
   Ribeirao: "Comarca de Ribeirão Preto/SP",
 };
 
+/** Nome comercial no PDF (comprovante, cabeçalhos) — substitui "Filial ...". */
+const TRADE_NAME_BY_BRANCH: Record<string, string> = {
+  Franca: "FRANCACRED",
+  Litoral: "LITORALCRED",
+  "Litoral Cred": "LITORALCRED",
+  Mogiana: "MOGIANACRED",
+  "Mogiana Cred": "MOGIANACRED",
+  Imperatriz: "IMPERATRIZCRED",
+  "Imperatriz Cred": "IMPERATRIZCRED",
+  Ribeirao: "RIBEIRAOCRED",
+};
+
+const companyDisplayName =
+  String(import.meta.env.VITE_COMPANY_DISPLAY_NAME || "").trim() ||
+  String(import.meta.env.VITE_COMPANY_NAME || "").trim() ||
+  TRADE_NAME_BY_BRANCH[BRANCH] ||
+  BRANCH;
+
+/** Razão social na barra; se não houver env, usa o mesmo nome comercial da operação (por filial). */
+const companyLegalOrDisplay =
+  String(import.meta.env.VITE_COMPANY_LEGAL_NAME || "").trim() || companyDisplayName;
+
 export const PDF_BRAND = {
-  // Nome fixo exibido nas colinhas/mensagens para todas as empresas
-  companyName: "NOVIXCRED",
+  /** Razão / grupo (barra superior do PDF) */
+  companyName: companyLegalOrDisplay,
+  /** Nome da operação no comprovante e linha abaixo da barra (ex.: FRANCACRED) */
+  companyDisplayName,
   branch: BRANCH,
   foro: import.meta.env.VITE_COMPANY_FORO || FORO_BY_BRANCH[BRANCH] || `Comarca de ${BRANCH}/SP`,
   colors: {

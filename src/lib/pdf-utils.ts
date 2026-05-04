@@ -9,12 +9,24 @@ const HEADER_HEIGHT = 38;
 const FOOTER_HEIGHT = 15;
 const CONTENT_TOP = 48;
 
+function pdfBrandsAreDistinct(): boolean {
+  return (
+    String(PDF_BRAND.companyName).trim().toLowerCase() !==
+    String(PDF_BRAND.companyDisplayName).trim().toLowerCase()
+  );
+}
+
 export function addPdfHeader(
   doc: jsPDF,
   title: string,
-  subtitle?: string
+  subtitle?: string,
+  brand?: { companyName?: string; companyDisplayName?: string }
 ): number {
   const c = PDF_BRAND.colors;
+  const companyName = String(brand?.companyName ?? PDF_BRAND.companyName);
+  const companyDisplayName = String(brand?.companyDisplayName ?? PDF_BRAND.companyDisplayName);
+  const twoLines =
+    companyName.trim().toLowerCase() !== companyDisplayName.trim().toLowerCase();
 
   // Barra superior colorida
   doc.setFillColor(c.primary.r, c.primary.g, c.primary.b);
@@ -24,25 +36,29 @@ export function addPdfHeader(
   doc.setTextColor(255, 255, 255);
   doc.setFontSize(14);
   doc.setFont("helvetica", "bold");
-  doc.text(PDF_BRAND.companyName, PAGE_WIDTH / 2, 7, { align: "center" });
+  doc.text(companyName, PAGE_WIDTH / 2, 7, { align: "center" });
 
-  // Filial (abaixo da barra)
-  doc.setTextColor(c.primaryDark.r, c.primaryDark.g, c.primaryDark.b);
-  doc.setFontSize(9);
-  doc.setFont("helvetica", "normal");
-  doc.text(`Filial ${PDF_BRAND.branch}`, PAGE_WIDTH / 2, 16, { align: "center" });
+  // Segunda linha só se razão social ≠ nome comercial (evita repetir FRANCACRED duas vezes)
+  let titleY = 24;
+  if (twoLines) {
+    doc.setTextColor(c.primaryDark.r, c.primaryDark.g, c.primaryDark.b);
+    doc.setFontSize(9);
+    doc.setFont("helvetica", "bold");
+    doc.text(companyDisplayName, PAGE_WIDTH / 2, 16, { align: "center" });
+    titleY = 26;
+  }
 
   // Título do documento
   doc.setTextColor(c.text.r, c.text.g, c.text.b);
   doc.setFontSize(16);
   doc.setFont("helvetica", "bold");
-  doc.text(title, PAGE_WIDTH / 2, 26, { align: "center" });
+  doc.text(title, PAGE_WIDTH / 2, titleY, { align: "center" });
 
   if (subtitle) {
     doc.setFontSize(10);
     doc.setFont("helvetica", "normal");
     doc.setTextColor(c.textMuted.r, c.textMuted.g, c.textMuted.b);
-    doc.text(subtitle, PAGE_WIDTH / 2, 34, { align: "center" });
+    doc.text(subtitle, PAGE_WIDTH / 2, titleY + 8, { align: "center" });
   }
 
   // Linha separadora
@@ -55,7 +71,8 @@ export function addPdfHeader(
 export function addPdfFooter(
   doc: jsPDF,
   pageNum?: number,
-  totalPages?: number
+  totalPages?: number,
+  brand?: { companyName?: string; companyDisplayName?: string }
 ): void {
   const c = PDF_BRAND.colors;
   const pageHeight = 297;
@@ -69,7 +86,13 @@ export function addPdfFooter(
   doc.setTextColor(c.textMuted.r, c.textMuted.g, c.textMuted.b);
 
   const today = new Date().toLocaleDateString("pt-BR");
-  let footerText = `${PDF_BRAND.companyName} | ${PDF_BRAND.branch} | Gerado em ${today}`;
+  const companyName = String(brand?.companyName ?? PDF_BRAND.companyName);
+  const companyDisplayName = String(brand?.companyDisplayName ?? PDF_BRAND.companyDisplayName);
+  const footerBrand =
+    companyName.trim().toLowerCase() !== companyDisplayName.trim().toLowerCase()
+      ? `${companyDisplayName} | ${companyName}`
+      : companyDisplayName;
+  let footerText = `${footerBrand} | Gerado em ${today}`;
   if (pageNum !== undefined && totalPages !== undefined && totalPages > 1) {
     footerText += ` | Página ${pageNum}/${totalPages}`;
   } else if (pageNum !== undefined) {

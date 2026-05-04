@@ -34,7 +34,7 @@ export function CompanyProvider({ children }: { children: React.ReactNode }) {
     [companyId, queryClient]
   );
 
-  const companyName = COMPANIES.find((c) => c.id === companyId)?.name ?? "FRANCA CRED (NEXUS)";
+  const companyName = COMPANIES.find((c) => c.id === companyId)?.name ?? "NOVIX CRED";
   const value = useMemo(
     () => ({
       companyId,

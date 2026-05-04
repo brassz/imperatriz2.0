@@ -318,8 +318,14 @@ export async function fetchClientScore(clientId: string) {
   for (const l of loans) loanById[String(l.id)] = l;
   for (const p of paidLoans) {
     const row = p as Record<string, unknown>;
-    if (!loanById[String(row.loan_id)]) {
-      loanById[String(row.loan_id)] = {
+    const lid = String(row.loan_id);
+    const existing = loanById[lid];
+    const existingStatus = existing ? String(existing.status || "") : "";
+    if (existingStatus === "finalized" || existingStatus === "cancelled") {
+      continue;
+    }
+    if (!existing) {
+      loanById[lid] = {
         id: row.loan_id,
         amount: row.original_amount,
         interest_rate: row.interest_rate,
@@ -329,8 +335,8 @@ export async function fetchClientScore(clientId: string) {
         paid_date: row.paid_date,
       };
     } else {
-      loanById[String(row.loan_id)] = {
-        ...loanById[String(row.loan_id)],
+      loanById[lid] = {
+        ...existing,
         status: "paid",
         paid_date: row.paid_date,
       };

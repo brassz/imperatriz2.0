@@ -8,6 +8,7 @@ import { useAuth } from "@/contexts/AuthContext";
 const routeNames: Record<string, string> = {
   "/": "Dashboard",
   "/clientes": "Clientes",
+  "/consultas": "Consultas",
   "/emprestimos": "Empréstimos",
   "/parcelamentos": "Parcelamentos",
   "/calendario": "Calendário",
@@ -30,16 +31,16 @@ export function Topbar() {
   const { logout } = useAuth();
 
   return (
-    <header className="h-14 border-b border-border/50 bg-card/50 backdrop-blur-sm flex items-center justify-between px-4 gap-4 sticky top-0 z-30">
-      <div className="flex items-center gap-3">
-        <SidebarTrigger className="text-muted-foreground hover:text-foreground" />
-        <div>
-          <h2 className="text-sm font-semibold text-foreground">{currentPage}</h2>
-          <p className="text-[10px] text-muted-foreground">{companyName} / {currentPage}</p>
+    <header className="min-h-[3.5rem] border-b border-border/50 bg-card/50 backdrop-blur-sm flex flex-wrap items-center justify-between gap-3 px-3 sm:px-4 py-2 sm:py-0 sticky top-0 z-30 pt-[max(0.5rem,env(safe-area-inset-top,0px))] sm:pt-[max(0px,env(safe-area-inset-top,0px))]">
+      <div className="flex min-w-0 flex-1 items-center gap-2 sm:gap-3">
+        <SidebarTrigger className="h-10 w-10 shrink-0 text-muted-foreground hover:text-foreground md:h-7 md:w-7" />
+        <div className="min-w-0">
+          <h2 className="truncate text-sm font-semibold text-foreground">{currentPage}</h2>
+          <p className="truncate text-[10px] text-muted-foreground">{companyName} / {currentPage}</p>
         </div>
       </div>
 
-      <div className="flex items-center gap-3">
+      <div className="flex shrink-0 items-center gap-2 sm:gap-3">
         <div className="relative hidden md:block">
           <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground" />
           <Input

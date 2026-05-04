@@ -62,6 +62,10 @@
     @apply border-border;
   }
 
+  html {
+    -webkit-tap-highlight-color: hsl(var(--primary) / 0.12);
+  }
+
   body {
     @apply bg-background text-foreground font-sans antialiased;
   }
@@ -113,5 +117,103 @@
 
   .nexus-input {
     @apply bg-secondary border-border/50 focus:border-primary/50 focus:ring-1 focus:ring-primary/20 transition-all duration-200;
+  }
+
+  /* Fundo interativo — orbes lentos */
+  @keyframes nexus-blob-1 {
+    0%,
+    100% {
+      transform: translate(0%, 0%) scale(1);
+    }
+    50% {
+      transform: translate(6%, -8%) scale(1.08);
+    }
+  }
+  @keyframes nexus-blob-2 {
+    0%,
+    100% {
+      transform: translate(0%, 0%) scale(1);
+    }
+    50% {
+      transform: translate(-8%, 10%) scale(1.06);
+    }
+  }
+  @keyframes nexus-blob-pulse {
+    0%,
+    100% {
+      transform: scale(1);
+    }
+    50% {
+      transform: scale(1.12);
+    }
+  }
+  .nexus-blob-1 {
+    animation: nexus-blob-1 22s ease-in-out infinite;
+  }
+  .nexus-blob-2 {
+    animation: nexus-blob-2 28s ease-in-out infinite;
+  }
+  .nexus-blob-pulse {
+    animation: nexus-blob-pulse 18s ease-in-out infinite;
+  }
+
+  /* Luz que se move sozinha (sem cursor) */
+  @keyframes nexus-light-drift {
+    0%,
+    100% {
+      transform: translate(-50%, -50%) translate(-14vw, -10vh) scale(1);
+    }
+    20% {
+      transform: translate(-50%, -50%) translate(18vw, 4vh) scale(1.05);
+    }
+    40% {
+      transform: translate(-50%, -50%) translate(8vw, 22vh) scale(0.98);
+    }
+    60% {
+      transform: translate(-50%, -50%) translate(-20vw, 12vh) scale(1.03);
+    }
+    80% {
+      transform: translate(-50%, -50%) translate(-6vw, -18vh) scale(1);
+    }
+  }
+  @keyframes nexus-light-twinkle {
+    0%,
+    100% {
+      opacity: 0.35;
+    }
+    35% {
+      opacity: 0.72;
+    }
+    55% {
+      opacity: 0.48;
+    }
+    70% {
+      opacity: 0.82;
+    }
+  }
+  @keyframes nexus-light-drift-alt {
+    0%,
+    100% {
+      transform: translate(-50%, -50%) translate(16vw, 14vh) scale(1);
+    }
+    33% {
+      transform: translate(-50%, -50%) translate(-12vw, -8vh) scale(1.08);
+    }
+    66% {
+      transform: translate(-50%, -50%) translate(4vw, -20vh) scale(0.95);
+    }
+  }
+  .nexus-light-drift {
+    animation: nexus-light-drift 32s ease-in-out infinite;
+  }
+  .nexus-light-drift-alt {
+    animation: nexus-light-drift-alt 26s ease-in-out infinite;
+  }
+  .nexus-light-twinkle {
+    animation: nexus-light-twinkle 5s ease-in-out infinite;
+  }
+  .nexus-light-twinkle-slow {
+    animation: nexus-light-twinkle 7.5s ease-in-out infinite;
+    animation-delay: -2s;
   }
 }

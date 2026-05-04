@@ -6,10 +6,10 @@ export interface Company {
 }
 
 export const COMPANIES: Company[] = [
-  { id: "empresa1", name: "FRANCA CRED (NEXUS)" },
+  { id: "empresa1", name: "NOVIX CRED" },
   { id: "empresa2", name: "LITORAL CRED" },
   { id: "empresa3", name: "MOGIANA CRED" },
-  { id: "empresa4", name: "IMPERATRIZ CRED" },
+  { id: "empresa4", name: "CRED CAR" },
 ];
 
 export const STORAGE_KEY = "nexus-selected-company";
