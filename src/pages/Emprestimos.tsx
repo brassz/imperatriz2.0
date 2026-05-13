@@ -62,7 +62,9 @@ import {
 } from "@/api/loans";
 import { fetchInstallments, type InstallmentRow } from "@/api/installments";
 import { createPayment, createRenewalPayment, fetchPaymentsByLoanId, deletePayment } from "@/api/payments";
-import { insertLoanFineWaivers } from "@/api/loan-fine-waivers";
+import { fetchLoanFineWaivers, insertLoanFineWaivers } from "@/api/loan-fine-waivers";
+import { listOverdueFineCalendarDates, DAILY_OVERDUE_FINE_BRL } from "@/lib/loan-overdue-fine";
+import { calendarDateInBrazil } from "@/lib/brazil-date";
 import {
   searchLoanNotesAndObservations,
   type LoanNotesSearchScope,
@@ -73,7 +75,7 @@ import { calculateLoanRemaining, calculateNextDueDate, type LoanRemainingResult 
 import { fetchPixKeys } from "@/api/pix-keys";
 import { sendWhatsAppComprovante, sendWhatsAppMessage } from "@/api/evolution";
 import { buildCobrancaMessage, buildComprovanteMessage, buildLoanCreationNotificationMessage } from "@/lib/whatsapp-messages";
-import { createFine } from "@/api/fines";
+import { createFine, fetchFinesForClient, deleteFine } from "@/api/fines";
 import { fetchClientsForSelect, fetchClientHistory, fetchClientScore } from "@/api/clients";
 import { fetchClientTags, createClientTag, deleteClientTag, type ClientTagRow } from "@/api/client-tags";
 import { fetchGuarantors, fetchEmergencyContacts } from "@/api/contacts";
@@ -81,7 +83,6 @@ import { fetchCapitalRaises, type CapitalRaise } from "@/api/captacao";
 import { supabase } from "@/lib/supabase";
 import { useState } from "react";
 import { toast } from "sonner";
-import { createLoanSignatureRequest } from "@/api/loan-signature";
 import { jsPDF } from "jspdf";
 import { addPdfHeader, addPdfFooter, getPdfMargin, PDF_BRAND } from "@/lib/pdf-utils";
 import { comprovantePdfToBase64, generateComprovantePagamentoPdf } from "@/lib/comprovante-pdf";
@@ -92,6 +93,8 @@ import { useAuth } from "@/contexts/AuthContext";
 import { paymentTypeLabel } from "@/lib/payment-type-label";
 import { useCompany } from "@/contexts/CompanyContext";
 import { PaymentFineWaiveDialog } from "@/components/loans/PaymentFineWaiveDialog";
+import { useEffect } from "react";
+import { useSearchParams } from "react-router-dom";
 
 function isTerm20Days(loanDate: string, dueDate: string): boolean {
   if (!loanDate || !dueDate) return false;
@@ -107,52 +110,6 @@ function safeFilePart(s: string): string {
     .replace(/\s+/g, " ")
     .trim()
     .slice(0, 80);
-}
-
-async function uploadLoanContractPdf(opts: {
-  loanId: string;
-  clientName: string;
-  loanDateYmd: string;
-  doc: jsPDF;
-}): Promise<{ ok: true; path: string } | { ok: false; error: string }> {
-  try {
-    const bucket = "contratos";
-    const title = safeFilePart(opts.clientName) || "cliente";
-    const date = safeFilePart(opts.loanDateYmd) || "data";
-    // Nome único evita precisar de permissão de UPDATE no Storage (upsert),
-    // e evita colisão quando o contrato é gerado mais de uma vez no mesmo dia.
-    const suffix =
-      typeof crypto !== "undefined" && "randomUUID" in crypto
-        ? String((crypto as Crypto).randomUUID()).slice(0, 8)
-        : String(Math.random()).slice(2, 10);
-    const filename = `Contrato_${title}_${date}_${suffix}.pdf`;
-    const path = `${opts.loanId}/${filename}`;
-    const blob = opts.doc.output("blob");
-
-    const { error: upErr } = await supabase.storage
-      .from(bucket)
-      .upload(path, blob, { contentType: "application/pdf", upsert: false });
-    if (upErr) throw upErr;
-
-    await supabase
-      .from("loans")
-      .update({ contract_pdf_path: path, contract_pdf_uploaded_at: new Date().toISOString() })
-      .eq("id", opts.loanId);
-
-    return { ok: true, path };
-  } catch (e) {
-    const msg =
-      e && typeof e === "object" && "message" in e
-        ? String((e as any).message)
-        : "Falha ao salvar contrato no Storage";
-    const status =
-      e && typeof e === "object" && "statusCode" in e ? String((e as any).statusCode || "") : "";
-    const name = e && typeof e === "object" && "name" in e ? String((e as any).name || "") : "";
-    const details =
-      e && typeof e === "object" && "error" in e && (e as any).error ? String((e as any).error) : "";
-    const composed = [name, status, details, msg].filter(Boolean).join(" — ");
-    return { ok: false, error: composed || msg };
-  }
 }
 
 function todayInSaoPauloYmd(): string {
@@ -240,6 +197,19 @@ function parseMoneyInput(raw: string): number {
   return parseFloat(normalized);
 }
 
+function formatCurrencyBrl(n: number): string {
+  return "R$ " + (Number(n) || 0).toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+function buildParcelamentoOptions(total: number): Array<{ n: number; parcela: number }> {
+  const base = Math.max(0, Number(total) || 0);
+  const out: Array<{ n: number; parcela: number }> = [];
+  for (let n = 1; n <= 12; n++) {
+    out.push({ n, parcela: base / n });
+  }
+  return out;
+}
+
 
 type LoanRow = Record<string, unknown>;
 
@@ -289,8 +259,10 @@ function LoanActionButton({
 }
 
 export default function Emprestimos() {
+  const [searchParams] = useSearchParams();
+  const searchFromUrl = searchParams.get("search") || searchParams.get("phone") || "";
   const [statusFilter, setStatusFilter] = useState("all");
-  const [search, setSearch] = useState("");
+  const [search, setSearch] = useState(searchFromUrl);
   const [periodFrom, setPeriodFrom] = useState("");
   const [periodTo, setPeriodTo] = useState("");
   const [loanSort, setLoanSort] = useState<LoanSortOption>("default");
@@ -328,7 +300,10 @@ export default function Emprestimos() {
   const [selectedLoan, setSelectedLoan] = useState<LoanRow | null>(null);
   const [editForm, setEditForm] = useState({ amount: "", interest_rate: "", loan_date: "", due_date: "", status: "active" });
   const [quitarDate, setQuitarDate] = useState(toInputDate(new Date().toISOString()));
-  const [multaForm, setMultaForm] = useState({ amount: "", reason: "", notes: "" });
+  const [clientFines, setClientFines] = useState<Array<{ id: string; amount: number; reason: string; notes: string | null; created_at: string }>>([]);
+  const [overdueFines, setOverdueFines] = useState<Array<{ date: string; waived: boolean }>>([]);
+  const [loadingFines, setLoadingFines] = useState(false);
+  const [multaValor, setMultaValor] = useState("");
   const [paymentForm, setPaymentForm] = useState({
     payment_date: toInputDate(new Date().toISOString()),
     amount: "",
@@ -355,8 +330,6 @@ export default function Emprestimos() {
     capital_raise_interest: "",
   });
   const [confirmDueDateOpen, setConfirmDueDateOpen] = useState(false);
-  const [signModalOpen, setSignModalOpen] = useState(false);
-  const [signUrl, setSignUrl] = useState("");
   const [renewalOptionsOpen, setRenewalOptionsOpen] = useState(false);
   const [renewalDays, setRenewalDays] = useState<30 | 20>(30);
   const [overrideDueDate, setOverrideDueDate] = useState("");
@@ -379,6 +352,11 @@ export default function Emprestimos() {
   const [notesSearchPayments, setNotesSearchPayments] = useState<PaymentNoteHit[]>([]);
   const [notesSearchPaidLoans, setNotesSearchPaidLoans] = useState<PaidLoanNoteHit[]>([]);
   const [notesSearchHasRun, setNotesSearchHasRun] = useState(false);
+
+  useEffect(() => {
+    setSearch(searchFromUrl);
+    setPage(1);
+  }, [searchFromUrl]);
 
   const isParcelamentos = statusFilter === "parcelamentos";
 
@@ -641,7 +619,6 @@ export default function Emprestimos() {
       });
       toast.success("Empréstimo cadastrado");
 
-      let uploadedPath: string | null = null;
       try {
         const full = await fetchLoanById(String(inserted?.id));
         const guarantorsList = await fetchGuarantors(String(newLoanForm.client_id));
@@ -673,19 +650,7 @@ export default function Emprestimos() {
         const loanDateYmd = String(newLoanForm.loan_date || "").split("T")[0];
         const fileName = `Contrato_${displayClientName}_${safeFilePart(loanDateYmd) || "data"}.pdf`;
 
-        // salva localmente (download) e também salva no Storage para manter histórico
         doc.save(fileName);
-        const uploaded = await uploadLoanContractPdf({
-          loanId: String(inserted?.id),
-          clientName: displayClientName,
-          loanDateYmd,
-          doc,
-        });
-        if (!uploaded.ok) {
-          toast.error(`Contrato: falha ao salvar no sistema (${uploaded.error}).`);
-        } else {
-          uploadedPath = uploaded.path;
-        }
 
         const minimumPayment = amt * (rate / 100);
         const notifyMsg = buildLoanCreationNotificationMessage({
@@ -704,28 +669,6 @@ export default function Emprestimos() {
         }
       } catch {
         // se falhar o contrato / WhatsApp, não bloquear o cadastro
-      }
-
-      try {
-        if (!uploadedPath) {
-          toast.error("Contrato não disponível para assinatura. Salve o PDF do contrato no sistema e gere o link novamente.");
-          throw new Error("missing_contract_pdf");
-        }
-        const { url } = await createLoanSignatureRequest(String(inserted?.id), {
-          contractPdfPath: uploadedPath,
-        });
-        setSignUrl(url);
-        setSignModalOpen(true);
-        const fullForLink = await fetchLoanById(String(inserted?.id));
-        const phone = String((fullForLink as { client_phone?: unknown }).client_phone || "").trim();
-        if (phone) {
-          await sendWhatsAppMessage(
-            phone,
-            `✅ Contrato disponível para assinatura.\n\nAbra o link e assine para autorizar o empréstimo:\n${url}\n\n_Equipe NEXUS_`,
-          );
-        }
-      } catch (e) {
-        // link de assinatura é opcional: não bloquear o cadastro
       }
 
       setNewLoanOpen(false);
@@ -782,10 +725,49 @@ export default function Emprestimos() {
     setFinalizeOpen(true);
   };
 
-  const openMulta = (loan: LoanRow) => {
+  const openMulta = async (loan: LoanRow) => {
     setSelectedLoan(loan);
-    setMultaForm({ amount: "", reason: "", notes: "" });
+    setClientFines([]);
+    setOverdueFines([]);
     setMultaOpen(true);
+    setLoadingFines(true);
+
+    const clientId = loan.client_id ? String(loan.client_id) : "";
+    const loanId = loan.id ? String(loan.id) : "";
+
+    // Busca multas manuais
+    if (clientId) {
+      try {
+        const fines = await fetchFinesForClient(clientId);
+        setClientFines(fines);
+      } catch {
+        // silencioso - não impede mostrar multas automáticas
+      }
+    }
+
+    // Calcula multas automáticas de atraso (R$50/dia)
+    const dueDate = String(loan.due_date || "").split("T")[0];
+    const today = calendarDateInBrazil();
+    const status = String(loan.status || "").toLowerCase();
+    const settled = status === "paid" || status === "cancelled" || status === "finalized";
+
+    if (dueDate && dueDate < today && !settled) {
+      const overdueDates = listOverdueFineCalendarDates(dueDate, today);
+      if (overdueDates.length > 0) {
+        let waivedDates: string[] = [];
+        if (loanId) {
+          try {
+            waivedDates = await fetchLoanFineWaivers(loanId);
+          } catch {
+            // continua sem waivers
+          }
+        }
+        const waivedSet = new Set(waivedDates);
+        setOverdueFines(overdueDates.map((d) => ({ date: d, waived: waivedSet.has(d) })));
+      }
+    }
+
+    setLoadingFines(false);
   };
 
   const openContacts = async (loan: LoanRow) => {
@@ -1119,11 +1101,41 @@ export default function Emprestimos() {
     }
   };
 
-  const handleMultaSubmit = async () => {
+  const handleDeleteFine = async (fineId: string) => {
     if (!selectedLoan?.client_id) return;
-    const amt = parseFloat(multaForm.amount);
-    if (!multaForm.reason.trim() || isNaN(amt) || amt <= 0) {
-      toast.error("Preencha valor e motivo");
+    setIsSubmitting(true);
+    try {
+      await deleteFine(fineId);
+      toast.success("Multa removida");
+      setClientFines((prev) => prev.filter((f) => f.id !== fineId));
+      queryClient.invalidateQueries({ queryKey: ["fines"] });
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Erro ao remover multa");
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const handleWaiveOverdueFine = async (dateYmd: string) => {
+    if (!selectedLoan?.id) return;
+    setIsSubmitting(true);
+    try {
+      await insertLoanFineWaivers(String(selectedLoan.id), [dateYmd]);
+      setOverdueFines((prev) => prev.map((f) => f.date === dateYmd ? { ...f, waived: true } : f));
+      toast.success(`Multa de ${dateYmd} anulada`);
+      queryClient.invalidateQueries({ queryKey: ["fines"] });
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Erro ao anular multa");
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const handleAddMultaValor = async () => {
+    if (!selectedLoan?.client_id) return;
+    const amt = parseFloat(multaValor);
+    if (isNaN(amt) || amt <= 0) {
+      toast.error("Digite um valor válido");
       return;
     }
     setIsSubmitting(true);
@@ -1131,14 +1143,47 @@ export default function Emprestimos() {
       await createFine({
         client_id: String(selectedLoan.client_id),
         amount: amt,
-        reason: multaForm.reason.trim(),
-        notes: multaForm.notes.trim() || undefined,
+        reason: "Multa manual",
       });
-      toast.success("Multa aplicada");
-      setMultaOpen(false);
+      toast.success(`R$ ${amt.toFixed(2)} adicionado`);
+      setMultaValor("");
+      const fines = await fetchFinesForClient(String(selectedLoan.client_id));
+      setClientFines(fines);
       queryClient.invalidateQueries({ queryKey: ["fines"] });
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Erro ao aplicar multa");
+      toast.error(err instanceof Error ? err.message : "Erro ao adicionar multa");
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const handleRemoveMultaValor = async () => {
+    if (!selectedLoan?.id) return;
+    const amt = parseFloat(multaValor);
+    if (isNaN(amt) || amt <= 0) {
+      toast.error("Digite um valor válido");
+      return;
+    }
+    setIsSubmitting(true);
+    try {
+      const daysToWaive = Math.ceil(amt / DAILY_OVERDUE_FINE_BRL);
+      const activeDays = overdueFines.filter((f) => !f.waived).map((f) => f.date);
+      const toWaive = activeDays.slice(0, daysToWaive);
+      if (toWaive.length === 0) {
+        toast.error("Não há multas de atraso ativas para remover");
+        setIsSubmitting(false);
+        return;
+      }
+      await insertLoanFineWaivers(String(selectedLoan.id), toWaive);
+      setOverdueFines((prev) =>
+        prev.map((f) => toWaive.includes(f.date) ? { ...f, waived: true } : f)
+      );
+      const removedValue = toWaive.length * DAILY_OVERDUE_FINE_BRL;
+      toast.success(`R$ ${removedValue.toFixed(2)} removido (${toWaive.length} dia${toWaive.length > 1 ? "s" : ""})`);
+      setMultaValor("");
+      queryClient.invalidateQueries({ queryKey: ["fines"] });
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Erro ao remover multa");
     } finally {
       setIsSubmitting(false);
     }
@@ -1273,7 +1318,6 @@ export default function Emprestimos() {
       const loanDateYmd = String(loan.loan_date || "").split("T")[0];
       const fileName = `Contrato_${displayClientName}_${safeFilePart(loanDateYmd) || String(loan.id)}.pdf`;
       doc.save(fileName);
-      await uploadLoanContractPdf({ loanId: String(loan.id), clientName: displayClientName, loanDateYmd, doc });
       toast.success("Contrato gerado");
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Erro ao gerar contrato");
@@ -1282,12 +1326,25 @@ export default function Emprestimos() {
 
   const handlePDF = async (loan: LoanRow) => {
     try {
-      const full = loanFull || (await fetchLoanById(String(loan.id)));
+      const full = loanFull && String((loanFull as any)?.id) === String(loan.id) ? loanFull : await fetchLoanById(String(loan.id));
       const clientId = String((full as { client_id?: unknown }).client_id || loan.client_id || "").trim();
-      const [guarantors, emergency] = await Promise.all([
+      const [guarantors, emergency, remaining] = await Promise.all([
         clientId ? fetchGuarantors(clientId) : Promise.resolve([]),
         clientId ? fetchEmergencyContacts(clientId) : Promise.resolve([]),
+        calculateLoanRemaining(String(loan.id)),
       ]);
+
+      const multaEmAberto = Number(remaining.overdueDailyFineOwed || 0);
+      const multaPaga = Number(remaining.finesPaid || 0);
+      const multaTotal = multaEmAberto + multaPaga;
+      const capitalRestante = Number(remaining.capital || 0);
+      const jurosRestante = Number(remaining.interestAmount || 0);
+      const totalPago = Number(remaining.totalPaid || 0);
+      const dividaAtual = Number(remaining.remainingAmount || 0) + multaEmAberto;
+
+      const capitalAvista = capitalRestante;
+      const parcelamentoBase = dividaAtual * 1.35;
+      const parcelasTabela = buildParcelamentoOptions(parcelamentoBase);
 
       const doc = new jsPDF();
       const m = getPdfMargin();
@@ -1296,8 +1353,20 @@ export default function Emprestimos() {
       const phone = String((full as { client_phone?: unknown }).client_phone || "").trim();
       const address = String((full as { client_address?: unknown }).client_address || "").trim();
 
-      let y = addPdfHeader(doc, "PDF de Cobrança", `${PDF_BRAND.companyDisplayName} · uso interno`);
-      y += 8;
+      let pageNum = 1;
+      // Cabeçalho simples (sem marca/gerado em/página)
+      let y = 20;
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(14);
+      doc.text("PDF de Cobrança", m, y);
+      y += 10;
+
+      const ensureSpace = (minY = 20) => {
+        if (y <= 265) return;
+        doc.addPage();
+        pageNum++;
+        y = minY;
+      };
 
       doc.setFont("helvetica", "bold");
       doc.setFontSize(12);
@@ -1319,24 +1388,75 @@ export default function Emprestimos() {
 
       doc.setFont("helvetica", "bold");
       doc.setFontSize(12);
-      doc.text("Dados do empréstimo", m, y);
+      doc.text("Totais", m, y);
       y += 7;
       doc.setFont("helvetica", "normal");
       doc.setFontSize(11);
-      const amt = Number(loan.amount);
-      const rate = Number(loan.interest_rate);
-      const total = amt + amt * (rate / 100);
-      doc.text(`ID: ${String(loan.id)}`, m, y);
+      doc.text(`Multa total: ${formatCurrencyBrl(multaTotal)} (em aberto: ${formatCurrencyBrl(multaEmAberto)})`, m, y, { maxWidth: 182 });
       y += 6.5;
-      doc.text(`Valor: R$ ${amt.toFixed(2)}`, m, y);
+      doc.text(`Capital restante: ${formatCurrencyBrl(capitalRestante)}`, m, y);
       y += 6.5;
-      doc.text(`Juros: ${rate}%`, m, y);
+      doc.text(`Juros restante: ${formatCurrencyBrl(jurosRestante)}`, m, y);
       y += 6.5;
-      doc.text(`Total (aprox.): R$ ${total.toFixed(2)}`, m, y);
-      y += 6.5;
-      doc.text(`Vencimento: ${formatDate(String(loan.due_date))}`, m, y);
-      y += 9;
+      doc.text(`Total já pago: ${formatCurrencyBrl(totalPago)}`, m, y);
+      y += 8;
 
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(12);
+      doc.text("Opções de pagamento", m, y);
+      y += 7;
+      doc.setFont("helvetica", "normal");
+      doc.setFontSize(10);
+
+      const drawCheck = (x: number, y0: number, checked: boolean) => {
+        doc.rect(x, y0 - 3.5, 4, 4);
+        if (checked) {
+          doc.setFont("helvetica", "bold");
+          doc.text("X", x + 1, y0 - 0.2);
+          doc.setFont("helvetica", "normal");
+        }
+      };
+
+      // à vista (capital)
+      drawCheck(m, y, false);
+      doc.text(`Capital à vista: ${formatCurrencyBrl(capitalAvista)}`, m + 7, y, { maxWidth: 182 });
+      y += 7;
+
+      // parcelamento +35%
+      drawCheck(m, y, false);
+      doc.text(`Parcelamento da dívida total (+35%): base ${formatCurrencyBrl(parcelamentoBase)} (até 12x)`, m + 7, y, { maxWidth: 182 });
+      y += 7.5;
+
+      // tabela parcelas
+      ensureSpace();
+      doc.setFont("helvetica", "bold");
+      doc.text("Tabela de parcelas", m, y);
+      y += 6;
+      doc.setFont("helvetica", "normal");
+
+      const colX = { mark: m, n: m + 8, val: m + 30 };
+      doc.setFont("helvetica", "bold");
+      doc.text("✓", colX.mark, y);
+      doc.text("Parcelas", colX.n, y);
+      doc.text("Valor da parcela", colX.val, y);
+      doc.setFont("helvetica", "normal");
+      y += 5.5;
+      doc.setDrawColor(226, 232, 240);
+      doc.line(m, y, 196, y);
+      y += 4.5;
+
+      for (const row of parcelasTabela) {
+        ensureSpace();
+        drawCheck(colX.mark, y, false);
+        doc.text(`${row.n}x`, colX.n, y);
+        doc.text(formatCurrencyBrl(row.parcela), colX.val, y);
+        y += 5.8;
+      }
+
+      y += 4;
+
+      // contatos
+      ensureSpace();
       const allContactsCount = (guarantors?.length || 0) + (emergency?.length || 0);
       doc.setFont("helvetica", "bold");
       doc.setFontSize(12);
@@ -1345,16 +1465,6 @@ export default function Emprestimos() {
 
       doc.setFont("helvetica", "normal");
       doc.setFontSize(10);
-
-      const ensureSpace = () => {
-        if (y <= 265) return;
-        addPdfFooter(doc, pageNum);
-        doc.addPage();
-        pageNum++;
-        y = 20;
-      };
-
-      let pageNum = 1;
 
       const rows: Array<{ type: "Avalista" | "Emergência"; name: string; phone: string; relationship?: string; cpf?: string }> = [];
       for (const g of guarantors as Array<{ name?: unknown; phone?: unknown; relationship?: unknown; cpf?: unknown }>) {
@@ -1401,7 +1511,21 @@ export default function Emprestimos() {
         }
       }
 
-      addPdfFooter(doc, pageNum);
+      // assinatura no final
+      ensureSpace();
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(12);
+      doc.text("Assinatura do cliente", m, y);
+      y += 8;
+      doc.setDrawColor(148, 163, 184);
+      doc.line(m, y + 18, 196, y + 18);
+      doc.setFont("helvetica", "normal");
+      doc.setFontSize(9);
+      doc.setTextColor(100, 116, 139);
+      doc.text("Assinatura", m, y + 23);
+      doc.setTextColor(30, 41, 59);
+      y += 28;
+
       doc.save(`cobranca-${loan.id}.pdf`);
       toast.success("PDF gerado");
     } catch (err) {
@@ -2067,48 +2191,6 @@ export default function Emprestimos() {
         </DialogContent>
       </Dialog>
 
-      <Dialog
-        open={signModalOpen}
-        onOpenChange={(v) => {
-          setSignModalOpen(v);
-          if (!v) setSignUrl("");
-        }}
-      >
-        <DialogContent className="max-w-md">
-          <DialogHeader>
-            <DialogTitle>Assinatura do contrato</DialogTitle>
-            <DialogDescription>
-              Envie este link para o cliente assinar e autorizar o empréstimo. Enquanto não assinar, o nome do cliente
-              aparece em vermelho na lista.
-            </DialogDescription>
-          </DialogHeader>
-          <div className="space-y-2">
-            <Label className="text-xs">Link</Label>
-            <Input readOnly value={signUrl || "—"} className="font-mono text-xs" />
-            <div className="flex gap-2">
-              <Button
-                type="button"
-                variant="outline"
-                onClick={async () => {
-                  try {
-                    await navigator.clipboard.writeText(signUrl);
-                    toast.success("Link copiado");
-                  } catch {
-                    toast.message("Não foi possível copiar automaticamente. Copie manualmente.");
-                  }
-                }}
-                disabled={!signUrl}
-              >
-                Copiar
-              </Button>
-              <Button type="button" onClick={() => setSignModalOpen(false)}>
-                Ok
-              </Button>
-            </div>
-          </div>
-        </DialogContent>
-      </Dialog>
-
       {/* Modal Editar */}
       <Dialog open={editOpen} onOpenChange={setEditOpen}>
         <DialogContent className="max-w-md">
@@ -2277,7 +2359,7 @@ export default function Emprestimos() {
                             <Badge variant="secondary" className="text-[10px]">
                               Pagamento
                             </Badge>
-                            <span className={`font-medium ${row.is_authorized === false ? "text-red-600 dark:text-red-400" : "text-foreground"}`}>
+                            <span className="font-medium text-foreground">
                               {row.client_name}
                             </span>
                             <span className="text-xs text-muted-foreground">
@@ -2314,7 +2396,7 @@ export default function Emprestimos() {
                             <Badge variant="outline" className="text-[10px]">
                               Quitação
                             </Badge>
-                            <span className={`font-medium ${row.is_authorized === false ? "text-red-600 dark:text-red-400" : "text-foreground"}`}>
+                            <span className="font-medium text-foreground">
                               {row.client_name}
                             </span>
                             <span className="text-xs text-muted-foreground">
@@ -3138,48 +3220,146 @@ export default function Emprestimos() {
 
       {/* Modal Multa */}
       <Dialog open={multaOpen} onOpenChange={setMultaOpen}>
-        <DialogContent className="max-w-md">
+        <DialogContent className="max-w-lg max-h-[90vh] overflow-y-auto">
           <DialogHeader>
-            <DialogTitle>Aplicar multa</DialogTitle>
+            <DialogTitle>Multas</DialogTitle>
             <DialogDescription>
-              Registrar multa para {selectedLoan && String(selectedLoan.client_name)}
+              Multas de {selectedLoan && String(selectedLoan.client_name)}
             </DialogDescription>
           </DialogHeader>
-          <div className="grid gap-4 py-4">
-            <div className="grid gap-2">
-              <Label>Valor (R$)</Label>
-              <Input
-                type="number"
-                step="0.01"
-                value={multaForm.amount}
-                onChange={(e) => setMultaForm((f) => ({ ...f, amount: e.target.value }))}
-                placeholder="0,00"
-              />
+
+          {loadingFines ? (
+            <p className="text-sm text-muted-foreground">Carregando...</p>
+          ) : (
+            <div className="space-y-4">
+              {/* Multas automáticas (R$50/dia de atraso) */}
+              {overdueFines.length > 0 && (
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between">
+                    <Label className="text-sm font-medium">Multas de atraso (R$ {DAILY_OVERDUE_FINE_BRL}/dia)</Label>
+                    <Badge variant="secondary" className="text-xs">
+                      Total: R$ {(overdueFines.filter((f) => !f.waived).length * DAILY_OVERDUE_FINE_BRL).toFixed(2)}
+                    </Badge>
+                  </div>
+                  <ScrollArea className="max-h-[180px]">
+                    <div className="space-y-1">
+                      {overdueFines.map((fine) => (
+                        <div
+                          key={fine.date}
+                          className={`flex items-center justify-between rounded-md border px-3 py-1.5 ${fine.waived ? "opacity-50 bg-muted" : ""}`}
+                        >
+                          <div className="flex items-center gap-2">
+                            <span className="font-medium text-sm">
+                              R$ {DAILY_OVERDUE_FINE_BRL.toFixed(2)}
+                            </span>
+                            <Badge variant="outline" className="text-xs">
+                              {new Date(fine.date + "T12:00:00").toLocaleDateString("pt-BR")}
+                            </Badge>
+                            {fine.waived && (
+                              <Badge variant="secondary" className="text-xs text-muted-foreground">
+                                Anulada
+                              </Badge>
+                            )}
+                          </div>
+                          {!fine.waived && (
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              className="h-7 w-7 text-destructive hover:text-destructive"
+                              onClick={() => handleWaiveOverdueFine(fine.date)}
+                              disabled={isSubmitting}
+                              title="Anular multa deste dia"
+                            >
+                              <Trash2 className="h-4 w-4" />
+                            </Button>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  </ScrollArea>
+                </div>
+              )}
+
+              {/* Multas manuais */}
+              {clientFines.length > 0 && (
+                <div className="space-y-2">
+                  <Label className="text-sm font-medium">Multas manuais</Label>
+                  <ScrollArea className="max-h-[150px]">
+                    <div className="space-y-1">
+                      {clientFines.map((fine) => (
+                        <div
+                          key={fine.id}
+                          className="flex items-center justify-between rounded-md border px-3 py-1.5"
+                        >
+                          <div className="flex-1 min-w-0">
+                            <div className="flex items-center gap-2">
+                              <span className="font-medium text-sm">
+                                R$ {fine.amount.toFixed(2)}
+                              </span>
+                              <Badge variant="outline" className="text-xs">
+                                {new Date(fine.created_at).toLocaleDateString("pt-BR")}
+                              </Badge>
+                            </div>
+                            <p className="text-xs text-muted-foreground truncate">
+                              {fine.reason}
+                            </p>
+                          </div>
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            className="h-7 w-7 text-destructive hover:text-destructive"
+                            onClick={() => handleDeleteFine(fine.id)}
+                            disabled={isSubmitting}
+                            title="Excluir multa"
+                          >
+                            <Trash2 className="h-4 w-4" />
+                          </Button>
+                        </div>
+                      ))}
+                    </div>
+                  </ScrollArea>
+                </div>
+              )}
+
+              {/* Input para adicionar ou remover valor */}
+              <div className="border-t pt-4 space-y-2">
+                <Label className="text-sm font-medium">Adicionar / Remover valor</Label>
+                <div className="flex items-center gap-2">
+                  <Input
+                    type="number"
+                    step="0.01"
+                    value={multaValor}
+                    onChange={(e) => setMultaValor(e.target.value)}
+                    placeholder="Valor (R$)"
+                    className="flex-1"
+                  />
+                  <Button
+                    size="sm"
+                    onClick={handleAddMultaValor}
+                    disabled={isSubmitting || !multaValor}
+                  >
+                    Adicionar
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="destructive"
+                    onClick={handleRemoveMultaValor}
+                    disabled={isSubmitting || !multaValor}
+                  >
+                    Remover
+                  </Button>
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  Adicionar cria uma multa manual. Remover anula dias de atraso equivalentes ao valor.
+                </p>
+              </div>
+
             </div>
-            <div className="grid gap-2">
-              <Label>Motivo *</Label>
-              <Input
-                value={multaForm.reason}
-                onChange={(e) => setMultaForm((f) => ({ ...f, reason: e.target.value }))}
-                placeholder="Ex: atraso no pagamento"
-              />
-            </div>
-            <div className="grid gap-2">
-              <Label>Observacoes</Label>
-              <Textarea
-                value={multaForm.notes}
-                onChange={(e) => setMultaForm((f) => ({ ...f, notes: e.target.value }))}
-                placeholder="Opcional"
-                rows={2}
-              />
-            </div>
-          </div>
+          )}
+
           <DialogFooter>
             <Button variant="outline" onClick={() => setMultaOpen(false)}>
-              Cancelar
-            </Button>
-            <Button onClick={handleMultaSubmit} disabled={isSubmitting}>
-              {isSubmitting ? "Aplicando..." : "Aplicar multa"}
+              Fechar
             </Button>
           </DialogFooter>
         </DialogContent>

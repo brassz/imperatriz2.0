@@ -1,6 +1,7 @@
 import { defineConfig, loadEnv, type Plugin } from "vite";
 import react from "@vitejs/plugin-react-swc";
 import path from "path";
+import fs from "node:fs";
 import https from "node:https";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { componentTagger } from "lovable-tagger";
@@ -176,11 +177,34 @@ function cpfaDevProxyPlugin(
 
 // https://vitejs.dev/config/
 export default defineConfig(({ mode }) => {
-  const env = loadEnv(mode, process.cwd(), "");
+  // Em alguns ambientes Windows/monorepo, `process.cwd()` pode divergir do diretório do projeto
+  // e o Vite deixa de ler `.env`. Usamos `__dirname` (onde está o vite.config.ts) como base.
+  const envBaseDir = __dirname;
+  const env = loadEnv(mode, envBaseDir, "");
   const cpfaApiKey = String(env.INFOSEEK_API_KEY || env.VITE_INFOSEEK_API_KEY || "").trim();
   const cpfaJsonField = cpfaUpstreamJsonField(env);
   const cpfaPath = cpfaValidatePathFromEnv(env);
   const cpfaFormatted = cpfaCpfFormattedFlag(env);
+  if (mode === "development") {
+    const envFiles = [".env", ".env.local", `.env.${mode}`, `.env.${mode}.local`];
+    const envFilesState = envFiles
+      .map((f) => `${f}=${fs.existsSync(path.join(envBaseDir, f)) ? "ok" : "missing"}`)
+      .join(" ");
+    const novixUrlOk = Boolean(String(env.VITE_SUPABASE_URL_NOVIXCRED || "").trim());
+    const novixKeyLen = String(env.VITE_SUPABASE_ANON_KEY_NOVIXCRED || "").trim().length;
+    const credUrlOk = Boolean(String(env.VITE_SUPABASE_URL_CREDCARD || "").trim());
+    const credKeyLen = String(env.VITE_SUPABASE_ANON_KEY_CREDCARD || "").trim().length;
+    console.log(
+      "[traffic-env]",
+      `baseDir=${envBaseDir}`,
+      envFilesState,
+      `NOVIX url=${novixUrlOk ? "ok" : "missing"}`,
+      `keyLen=${novixKeyLen}`,
+      "|",
+      `CREDCARD url=${credUrlOk ? "ok" : "missing"}`,
+      `keyLen=${credKeyLen}`,
+    );
+  }
 
   return {
     server: {

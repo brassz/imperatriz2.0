@@ -37,6 +37,177 @@ async function parseJsonSafe(res: Response): Promise<unknown> {
 export type EvolutionQrResult = { ok: true; code: string; pairingCode?: string } | { ok: false; error: string };
 
 export type ConnectionStateResult = { ok: true; connected: boolean } | { ok: false; error: string };
+export type EvolutionChatItem = {
+  id: string;
+  remoteJid: string;
+  name: string;
+  isGroup: boolean;
+  unreadCount: number;
+  updatedAt: number;
+  updatedAtLabel: string;
+  lastMessageText: string;
+  raw: unknown;
+};
+export type EvolutionMessageItem = {
+  id: string;
+  remoteJid: string;
+  fromMe: boolean;
+  text: string;
+  messageType: string;
+  timestamp: number;
+  timestampLabel: string;
+  status: string;
+  pushName: string;
+  raw: unknown;
+};
+
+function extractTextFromMessage(message: any): string {
+  if (!message || typeof message !== "object") return "";
+  if (typeof message.conversation === "string") return message.conversation;
+  if (typeof message.extendedTextMessage?.text === "string") return message.extendedTextMessage.text;
+  if (typeof message.imageMessage?.caption === "string") return message.imageMessage.caption;
+  if (typeof message.videoMessage?.caption === "string") return message.videoMessage.caption;
+  if (typeof message.documentMessage?.caption === "string") return message.documentMessage.caption;
+  if (typeof message.buttonsResponseMessage?.selectedDisplayText === "string") {
+    return message.buttonsResponseMessage.selectedDisplayText;
+  }
+  if (typeof message.listResponseMessage?.title === "string") return message.listResponseMessage.title;
+  if (message.audioMessage) return "[Áudio]";
+  if (message.imageMessage) return "[Imagem]";
+  if (message.videoMessage) return "[Vídeo]";
+  if (message.documentMessage) return "[Documento]";
+  if (message.stickerMessage) return "[Sticker]";
+  return "";
+}
+
+function collectArrayCandidates(data: any, depth = 0, seen = new WeakSet<object>()): any[][] {
+  if (depth > 5 || data == null) return [];
+  if (Array.isArray(data)) return [data];
+  if (typeof data !== "object") return [];
+  if (seen.has(data)) return [];
+  seen.add(data);
+
+  const directKeys = [
+    "data",
+    "chats",
+    "messages",
+    "result",
+    "response",
+    "records",
+    "rows",
+    "items",
+    "results",
+  ];
+  const out: any[][] = [];
+
+  for (const key of directKeys) {
+    if (Array.isArray((data as any)?.[key])) {
+      out.push((data as any)[key]);
+    }
+  }
+
+  const values = Object.values(data);
+  for (const value of values) {
+    out.push(...collectArrayCandidates(value, depth + 1, seen));
+  }
+
+  if (out.length === 0 && values.length > 0 && values.every((value) => value && typeof value === "object")) {
+    out.push(values);
+  }
+  return out;
+}
+
+function unwrapArrayPayload(data: any): any[] {
+  const candidates = collectArrayCandidates(data);
+  if (candidates.length === 0) return [];
+  return [...candidates].sort((a, b) => b.length - a.length)[0];
+}
+
+function buildRemoteJidCandidates(remoteJid: string): string[] {
+  const base = String(remoteJid || "").trim();
+  if (!base) return [];
+  const digits = base.replace(/\D/g, "");
+  const out = new Set<string>([base]);
+  if (digits) {
+    out.add(`${digits}@s.whatsapp.net`);
+    out.add(`${digits}@lid`);
+  }
+  if (base.includes(":") && base.includes("@")) {
+    out.add(base.replace(/:\d+(?=@)/, ""));
+  }
+  return Array.from(out).filter(Boolean);
+}
+
+function normalizeRemoteJidForMatch(value: unknown): string {
+  const raw = String(value || "").trim().toLowerCase();
+  if (!raw) return "";
+  const cleaned = raw.replace(/:\d+(?=@)/, "");
+  const [local = "", domain = ""] = cleaned.split("@");
+  if (domain === "g.us") return `${local}@g.us`;
+  const digits = local.replace(/\D/g, "");
+  return digits || local;
+}
+
+function matchesRemoteJid(targetRemoteJid: string, rowRemoteJid: unknown): boolean {
+  const rowNorm = normalizeRemoteJidForMatch(rowRemoteJid);
+  if (!rowNorm) return false;
+  const targets = buildRemoteJidCandidates(targetRemoteJid).map(normalizeRemoteJidForMatch);
+  return targets.includes(rowNorm);
+}
+
+function parseTimestamp(raw: unknown): number {
+  if (typeof raw === "number" && Number.isFinite(raw)) {
+    return raw < 1_000_000_000_000 ? raw * 1000 : raw;
+  }
+  const num = Number(raw);
+  if (Number.isFinite(num) && num > 0) {
+    return num < 1_000_000_000_000 ? num * 1000 : num;
+  }
+  const asDate = new Date(String(raw || "")).getTime();
+  return Number.isFinite(asDate) ? asDate : 0;
+}
+
+function formatTimestampLabel(timestamp: number): string {
+  if (!timestamp) return "—";
+  try {
+    return new Date(timestamp).toLocaleString("pt-BR", {
+      day: "2-digit",
+      month: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+  } catch {
+    return "—";
+  }
+}
+
+async function evolutionRequestJson<T>(
+  path: string,
+  opts: { instance?: string; apiKey?: string; baseUrl?: string; method?: "GET" | "POST"; body?: unknown } = {},
+): Promise<T> {
+  const { baseUrl: cfgBase, apiKey: cfgKey, instance: cfgInstance } = getEvolutionConfig();
+  const instance = String(opts.instance || cfgInstance || "").trim();
+  const apiKey = String(opts.apiKey || cfgKey || "").trim();
+  if (!instance) throw new Error("Instância não informada");
+  if (!apiKey) throw new Error("API key não informada");
+  const base = normalizeBaseUrl(opts.baseUrl || cfgBase);
+  assertNoMixedContent(base);
+
+  const res = await fetch(`${base}${path.replace(":instance", encodeURIComponent(instance))}`, {
+    method: opts.method || "GET",
+    headers: {
+      "Content-Type": "application/json",
+      apikey: apiKey,
+    },
+    body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
+  });
+
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(err || `HTTP ${res.status}`);
+  }
+  return (await parseJsonSafe(res)) as T;
+}
 
 export async function fetchConnectionState(): Promise<ConnectionStateResult> {
   const { baseUrl, apiKey, instance } = getEvolutionConfig();
@@ -340,4 +511,118 @@ export async function sendWhatsAppTextWithInstance(
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "Erro de conexão" };
   }
+}
+
+export async function fetchEvolutionChatsForInstance(opts: {
+  instance: string;
+  apiKey: string;
+  baseUrl?: string;
+  limit?: number;
+  offset?: number;
+}): Promise<EvolutionChatItem[]> {
+  const data = await evolutionRequestJson<unknown>("/chat/findChats/:instance", {
+    instance: opts.instance,
+    apiKey: opts.apiKey,
+    baseUrl: opts.baseUrl,
+    method: "POST",
+    body: {
+      limit: opts.limit ?? 80,
+      offset: opts.offset ?? 0,
+    },
+  });
+
+  return unwrapArrayPayload(data)
+    .map((row: any) => {
+      const remoteJid = String(
+        row?.remoteJid || row?.id || row?.jid || row?.key?.remoteJid || row?.contact?.id || "",
+      ).trim();
+      if (!remoteJid) return null;
+      const updatedAt = parseTimestamp(
+        row?.updatedAt || row?.conversationTimestamp || row?.lastMessageTimestamp || row?.messageTimestamp || row?.createdAt,
+      );
+      const lastMessageText = String(
+        row?.lastMessageText ||
+          row?.conversation ||
+          extractTextFromMessage(row?.lastMessage?.message || row?.lastMessage || row?.message) ||
+          "",
+      ).trim();
+      return {
+        id: String(row?.id || remoteJid),
+        remoteJid,
+        name: String(row?.name || row?.pushName || row?.contactName || row?.contact?.name || "").trim() || remoteJid,
+        isGroup: remoteJid.endsWith("@g.us") || Boolean(row?.isGroup),
+        unreadCount: Number(row?.unreadCount || row?.unreadMessages || 0) || 0,
+        updatedAt,
+        updatedAtLabel: formatTimestampLabel(updatedAt),
+        lastMessageText: lastMessageText || "Sem mensagem visível",
+        raw: row,
+      } satisfies EvolutionChatItem;
+    })
+    .filter((row): row is EvolutionChatItem => row !== null)
+    .sort((a, b) => b.updatedAt - a.updatedAt);
+}
+
+export async function fetchEvolutionMessagesForChat(opts: {
+  instance: string;
+  apiKey: string;
+  remoteJid: string;
+  baseUrl?: string;
+}): Promise<EvolutionMessageItem[]> {
+  const payloads = await Promise.all(
+    buildRemoteJidCandidates(opts.remoteJid).flatMap((jid) => [
+      evolutionRequestJson<unknown>("/chat/findMessages/:instance", {
+        instance: opts.instance,
+        apiKey: opts.apiKey,
+        baseUrl: opts.baseUrl,
+        method: "POST",
+        body: {
+          where: {
+            key: {
+              remoteJid: jid,
+            },
+          },
+        },
+      }).catch(() => null),
+      evolutionRequestJson<unknown>("/chat/findMessages/:instance", {
+        instance: opts.instance,
+        apiKey: opts.apiKey,
+        baseUrl: opts.baseUrl,
+        method: "POST",
+        body: {
+          where: {
+            remoteJid: jid,
+          },
+        },
+      }).catch(() => null),
+    ]),
+  );
+
+  const rows = payloads.flatMap((payload) => unwrapArrayPayload(payload));
+  const deduped = new Map<string, EvolutionMessageItem>();
+
+  for (const row of rows) {
+    const remoteJid = String((row as any)?.key?.remoteJid || (row as any)?.remoteJid || "").trim();
+    if (!matchesRemoteJid(opts.remoteJid, remoteJid)) {
+      continue;
+    }
+    const timestamp = parseTimestamp((row as any)?.messageTimestamp || (row as any)?.timestamp || (row as any)?.createdAt || (row as any)?.updatedAt);
+    const id =
+      String((row as any)?.key?.id || (row as any)?.id || "").trim() ||
+      `${opts.remoteJid}-${timestamp}-${String((row as any)?.messageType || (row as any)?.type || "msg")}`;
+    const text = String(extractTextFromMessage((row as any)?.message || row) || "").trim() || "[Mensagem não textual]";
+    deduped.set(id, {
+      id,
+      remoteJid: remoteJid || opts.remoteJid,
+      fromMe: Boolean((row as any)?.key?.fromMe || (row as any)?.fromMe),
+      text,
+      messageType: String((row as any)?.messageType || (row as any)?.type || "unknown"),
+      timestamp,
+      timestampLabel: formatTimestampLabel(timestamp),
+      status: String((row as any)?.status || (row as any)?.messageStatus || ""),
+      pushName: String((row as any)?.pushName || ""),
+      raw: row,
+    });
+  }
+
+  return Array.from(deduped.values()).sort((a, b) => a.timestamp - b.timestamp);
 }

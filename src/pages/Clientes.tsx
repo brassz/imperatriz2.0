@@ -18,9 +18,12 @@ import {
 } from "@/api/contacts";
 import { consultInfoseekCpf, type InfoseekConsultResult } from "@/api/infoseek";
 import { InfoseekConsultBody } from "@/components/InfoseekConsultBody";
+import { useSearchParams } from "react-router-dom";
 
 export default function Clientes() {
-  const [search, setSearch] = useState("");
+  const [searchParams] = useSearchParams();
+  const searchFromUrl = searchParams.get("search") || searchParams.get("phone") || "";
+  const [search, setSearch] = useState(searchFromUrl);
   const [page, setPage] = useState(1);
   const queryClient = useQueryClient();
   const [newClientOpen, setNewClientOpen] = useState(false);
@@ -111,6 +114,10 @@ export default function Clientes() {
   useEffect(() => {
     setPage(1);
   }, [search]);
+
+  useEffect(() => {
+    setSearch(searchFromUrl);
+  }, [searchFromUrl]);
 
   useEffect(() => {
     if (!detailsOpen || !detailsClient) return;

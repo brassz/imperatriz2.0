@@ -118,32 +118,6 @@ async function attachPaymentAndFineTotals(items: Array<Record<string, unknown>>)
   }
 }
 
-function mapLoanRow(loan: Record<string, unknown>, client: (c: unknown) => { name?: string; cpf?: string; phone?: string; email?: string }) {
-  const cl = client(loan.clients);
-  return {
-    id: loan.id,
-    client_id: loan.client_id,
-    client_name: cl.name || "—",
-    client_phone: cl.phone || "",
-    client_cpf: cl.cpf || "",
-    client_email: cl.email || "",
-    amount: parseFloat(String(loan.amount || 0)),
-    original_amount: loan.original_amount != null ? parseFloat(String(loan.original_amount || 0)) : undefined,
-    interest_rate: parseFloat(String(loan.interest_rate || 0)),
-    loan_date: loan.loan_date,
-    due_date: loan.due_date,
-    status: loan.status,
-    created_at: loan.created_at,
-    capital_raise_id: (loan as any).capital_raise_id ?? null,
-    capital_raise_capital: parseFloat(String((loan as any).capital_raise_capital || 0)),
-    capital_raise_interest: parseFloat(String((loan as any).capital_raise_interest || 0)),
-    is_authorized: Boolean((loan as any).is_authorized ?? true),
-    authorized_at: (loan as any).authorized_at ?? null,
-    contract_pdf_path: (loan as any).contract_pdf_path ?? null,
-    contract_pdf_uploaded_at: (loan as any).contract_pdf_uploaded_at ?? null,
-  };
-}
-
 async function hydrateClientsForLoans(rows: Array<Record<string, unknown>>): Promise<Array<Record<string, unknown>>> {
   // Alguns ambientes retornam `clients: null` no join (RLS/relacionamento).
   // Para não perder empréstimos na busca por nome, carregamos os clientes por client_id.
@@ -261,6 +235,11 @@ export async function fetchLoans(
   opts?: { periodFrom?: string; periodTo?: string; sort?: LoanSortOption }
 ) {
   const client = (c: unknown) => (c as { name?: string; cpf?: string; phone?: string; email?: string }) || {};
+  const normalizePhoneDigits = (value: unknown) => {
+    let digits = String(value || "").replace(/\D/g, "");
+    if (digits.startsWith("55") && digits.length > 11) digits = digits.slice(2);
+    return digits;
+  };
 
   let items: Array<Record<string, unknown>> = [];
   let total = 0;
@@ -297,10 +276,25 @@ export async function fetchLoans(
     if (!searchTerm) return null;
     const digits = searchTerm.replace(/\D/g, "");
     const isCpf = digits.length === 11;
+    const looksLikePhone = digits.length >= 8 && digits.length !== 11;
 
     let q = supabase.from("clients").select("id");
     if (isCpf) {
       q = q.eq("cpf", digits);
+    } else if (looksLikePhone) {
+      const { data, error } = await supabase
+        .from("clients")
+        .select("id, phone")
+        .limit(3000);
+      if (error) throw error;
+      const ids = (data || [])
+        .filter((row: Record<string, unknown>) => {
+          const phoneDigits = normalizePhoneDigits(row.phone);
+          return phoneDigits === digits || phoneDigits.endsWith(digits) || digits.endsWith(phoneDigits);
+        })
+        .map((row: Record<string, unknown>) => String(row.id))
+        .filter(Boolean);
+      return ids.length ? ids : [];
     } else {
       q = q.ilike("name", `%${searchTerm}%`);
     }
@@ -316,7 +310,7 @@ export async function fetchLoans(
     let q = supabase
       .from("loans")
       .select(
-        "id, client_id, amount, original_amount, interest_rate, loan_date, due_date, status, created_at, is_authorized, authorized_at, capital_raise_id, capital_raise_capital, capital_raise_interest, clients (name, cpf, email, phone)",
+        "id, client_id, amount, original_amount, interest_rate, loan_date, due_date, status, created_at, capital_raise_id, capital_raise_capital, capital_raise_interest, clients (name, cpf, email, phone)",
         { count: "exact" }
       )
       .eq("status", "finalized");
@@ -386,7 +380,7 @@ export async function fetchLoans(
       if (hasMoreLoans) {
         let q = supabase
           .from("loans")
-          .select("id, client_id, amount, original_amount, interest_rate, loan_date, due_date, status, created_at, is_authorized, authorized_at, capital_raise_id, capital_raise_capital, capital_raise_interest, contract_pdf_path, contract_pdf_uploaded_at, clients (name, cpf, email, phone)")
+          .select("id, client_id, amount, original_amount, interest_rate, loan_date, due_date, status, created_at, capital_raise_id, capital_raise_capital, capital_raise_interest, clients (name, cpf, email, phone)")
           .neq("status", "installments")
           .neq("status", "finalized")
           .order("created_at", { ascending: false });
@@ -504,7 +498,7 @@ export async function fetchLoans(
       let q = supabase
         .from("loans")
         .select(
-          "id, client_id, amount, original_amount, interest_rate, loan_date, due_date, status, created_at, is_authorized, authorized_at, clients (name, cpf, email, phone)"
+          "id, client_id, amount, original_amount, interest_rate, loan_date, due_date, status, created_at, clients (name, cpf, email, phone)"
         )
         .neq("status", "finalized")
         .in("status", ["active", "partial_paid", "overdue"])
@@ -536,7 +530,7 @@ export async function fetchLoans(
 
     if (sortOpt) {
       let q = supabase.from("loans").select(
-        "id, client_id, amount, original_amount, interest_rate, loan_date, due_date, status, created_at, is_authorized, authorized_at, capital_raise_id, capital_raise_capital, capital_raise_interest, clients (name, cpf, email, phone)",
+        "id, client_id, amount, original_amount, interest_rate, loan_date, due_date, status, created_at, capital_raise_id, capital_raise_capital, capital_raise_interest, clients (name, cpf, email, phone)",
         { count: "exact" }
       );
       q = applyCommonLoanFilters(q);
@@ -560,7 +554,7 @@ export async function fetchLoans(
     let dueTodayQ = supabase
       .from("loans")
       .select(
-        "id, client_id, amount, original_amount, interest_rate, loan_date, due_date, status, created_at, is_authorized, authorized_at, capital_raise_id, capital_raise_capital, capital_raise_interest, clients (name, cpf, email, phone)",
+        "id, client_id, amount, original_amount, interest_rate, loan_date, due_date, status, created_at, capital_raise_id, capital_raise_capital, capital_raise_interest, clients (name, cpf, email, phone)",
         { count: "exact" }
       );
     dueTodayQ = applyCommonLoanFilters(dueTodayQ);
@@ -580,7 +574,7 @@ export async function fetchLoans(
     let futureQ = supabase
       .from("loans")
       .select(
-        "id, client_id, amount, original_amount, interest_rate, loan_date, due_date, status, created_at, is_authorized, authorized_at, capital_raise_id, capital_raise_capital, capital_raise_interest, clients (name, cpf, email, phone)",
+        "id, client_id, amount, original_amount, interest_rate, loan_date, due_date, status, created_at, capital_raise_id, capital_raise_capital, capital_raise_interest, clients (name, cpf, email, phone)",
         { count: "exact" }
       );
     futureQ = applyCommonLoanFilters(futureQ);
@@ -600,7 +594,7 @@ export async function fetchLoans(
     let pastQ = supabase
       .from("loans")
       .select(
-        "id, client_id, amount, original_amount, interest_rate, loan_date, due_date, status, created_at, is_authorized, authorized_at, capital_raise_id, capital_raise_capital, capital_raise_interest, clients (name, cpf, email, phone)",
+        "id, client_id, amount, original_amount, interest_rate, loan_date, due_date, status, created_at, capital_raise_id, capital_raise_capital, capital_raise_interest, clients (name, cpf, email, phone)",
         { count: "exact" }
       );
     pastQ = applyCommonLoanFilters(pastQ);

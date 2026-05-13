@@ -46,6 +46,7 @@ import {
   saveEvolutionConfig,
   EVOLUTION_INSTANCE_IDS,
   getApiKeyForEvolutionInstance,
+  EVOLUTION_PROFILE_LABELS,
 } from "@/lib/evolution-settings";
 import { getSupabaseCompany } from "@/lib/supabase";
 import { useAuth } from "@/contexts/AuthContext";
@@ -64,7 +65,6 @@ import {
 import {
   fetchEvolutionQrCodeForInstance,
   getQrImageUrl,
-  fetchConnectionState,
   fetchConnectionStateForInstance,
 } from "@/api/evolution";
 import {
@@ -590,11 +590,17 @@ export default function Configuracoes() {
   const companyId = getSupabaseCompany();
   const queryClient = useQueryClient();
   const queue = useAutomationQueue();
-  const config = getEvolutionConfig();
+  const cobrancaConfig = getEvolutionConfig("cobranca");
+  const atendimentoConfig = getEvolutionConfig("atendimento");
   const [evolution, setEvolution] = useState({
-    baseUrl: config.baseUrl,
-    apiKey: config.apiKey,
-    instance: config.instance,
+    baseUrl: cobrancaConfig.baseUrl,
+    apiKey: cobrancaConfig.apiKey,
+    instance: cobrancaConfig.instance,
+  });
+  const [evolutionAtendimento, setEvolutionAtendimento] = useState({
+    baseUrl: atendimentoConfig.baseUrl,
+    apiKey: atendimentoConfig.apiKey,
+    instance: atendimentoConfig.instance,
   });
   const [selectedPixId, setSelectedPixId] = useState<string>("");
   const [delayModalOpen, setDelayModalOpen] = useState(false);
@@ -747,9 +753,13 @@ export default function Configuracoes() {
   }, [instanceConnectionQueries]);
 
   const { data: connectionState, refetch: refetchConnection } = useQuery({
-    queryKey: ["evolution-connection", activeTab, evolution.instance],
+    queryKey: ["evolution-connection", "cobranca", activeTab, evolution.instance],
     queryFn: async () => {
-      const r = await fetchConnectionState();
+      const r = await fetchConnectionStateForInstance({
+        instance: evolution.instance,
+        apiKey: getApiKeyForEvolutionInstance(evolution.instance),
+        baseUrl: evolution.baseUrl,
+      });
       if (!r.ok) return { connected: false };
       return { connected: r.connected };
     },
@@ -759,8 +769,25 @@ export default function Configuracoes() {
 
   const isConnected = connectionState?.connected ?? false;
 
+  const { data: connectionStateAtendimento, refetch: refetchConnectionAtendimento } = useQuery({
+    queryKey: ["evolution-connection", "atendimento", activeTab, evolutionAtendimento.instance],
+    queryFn: async () => {
+      const r = await fetchConnectionStateForInstance({
+        instance: evolutionAtendimento.instance,
+        apiKey: getApiKeyForEvolutionInstance(evolutionAtendimento.instance),
+        baseUrl: evolutionAtendimento.baseUrl,
+      });
+      if (!r.ok) return { connected: false };
+      return { connected: r.connected };
+    },
+    enabled: activeTab === "whatsapp" && !!evolutionAtendimento.instance?.trim(),
+    staleTime: 30_000,
+  });
+
+  const isConnectedAtendimento = connectionStateAtendimento?.connected ?? false;
+
   const { data: qrResult, isLoading: loadingQr, refetch: refetchQr } = useQuery({
-    queryKey: ["evolution-qr", activeTab, evolution.instance, isConnected],
+    queryKey: ["evolution-qr", "cobranca", activeTab, evolution.instance, isConnected],
     queryFn: () =>
       fetchEvolutionQrCodeForInstance({
         instance: evolution.instance,
@@ -776,6 +803,21 @@ export default function Configuracoes() {
     refetchIntervalInBackground: true,
   });
 
+  const { data: qrResultAtendimento, isLoading: loadingQrAtendimento, refetch: refetchQrAtendimento } = useQuery({
+    queryKey: ["evolution-qr", "atendimento", activeTab, evolutionAtendimento.instance, isConnectedAtendimento],
+    queryFn: () =>
+      fetchEvolutionQrCodeForInstance({
+        instance: evolutionAtendimento.instance,
+        apiKey: getApiKeyForEvolutionInstance(evolutionAtendimento.instance),
+        baseUrl: evolutionAtendimento.baseUrl,
+      }),
+    enabled: activeTab === "whatsapp" && !!evolutionAtendimento.instance?.trim() && !isConnectedAtendimento,
+    staleTime: 0,
+    retry: false,
+    refetchInterval: 10_000,
+    refetchIntervalInBackground: true,
+  });
+
   const { data: pixKeys = [], isLoading: loadingPix } = useQuery({
     queryKey: ["pix-keys"],
     queryFn: fetchPixKeys,
@@ -787,10 +829,17 @@ export default function Configuracoes() {
   });
 
   const handleSaveEvolution = () => {
-    saveEvolutionConfig(evolution);
-    toast.success("Configuração Evolution API salva");
+    saveEvolutionConfig(evolution, "cobranca");
+    toast.success(`Configuração de ${EVOLUTION_PROFILE_LABELS.cobranca} salva`);
     refetchQr();
     refetchConnection();
+  };
+
+  const handleSaveEvolutionAtendimento = () => {
+    saveEvolutionConfig(evolutionAtendimento, "atendimento");
+    toast.success(`Configuração de ${EVOLUTION_PROFILE_LABELS.atendimento} salva`);
+    refetchQrAtendimento();
+    refetchConnectionAtendimento();
   };
 
   const getPixInfoForAutomation = useCallback((): PixInfo | null => {
@@ -1060,11 +1109,11 @@ export default function Configuracoes() {
           >
             <h3 className="text-sm font-semibold text-foreground mb-4 flex items-center gap-2">
               <MessageCircle className="h-4 w-4" />
-              Evolution API
+              Evolution API - Cobrança
             </h3>
             <p className="text-xs text-muted-foreground mb-4">
-              Escolha a instância; a API key é aplicada automaticamente para cada uma.
-              O seletor mostra ✓ quando a instância está conectada e ✕ quando não está.
+              Perfil usado pelos fluxos de cobrança e envios financeiros. Escolha a instância; a API key é aplicada
+              automaticamente para cada uma. O seletor mostra ✓ quando a instância está conectada e ✕ quando não está.
             </p>
             <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
               <div>
@@ -1116,7 +1165,75 @@ export default function Configuracoes() {
               </div>
             </div>
             <Button onClick={handleSaveEvolution} variant="outline" size="sm">
-              Salvar configuração
+              Salvar cobrança
+            </Button>
+          </motion.div>
+
+          <motion.div
+            initial={{ opacity: 0, y: 8 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ delay: 0.02 }}
+            className="glass-card p-5"
+          >
+            <h3 className="text-sm font-semibold text-foreground mb-4 flex items-center gap-2">
+              <MessageCircle className="h-4 w-4" />
+              Evolution API - Atendimento
+            </h3>
+            <p className="text-xs text-muted-foreground mb-4">
+              Perfil usado pela nova aba de atendimento. Configure uma instância separada da cobrança para evitar mistura
+              de conversas e disparos operacionais.
+            </p>
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
+              <div>
+                <Label className="text-xs">URL da API</Label>
+                <Input
+                  value={evolutionAtendimento.baseUrl}
+                  readOnly
+                  className="mt-1 h-8 text-xs"
+                />
+              </div>
+              <div>
+                <Label className="text-xs">Instância</Label>
+                <Select
+                  value={evolutionAtendimento.instance}
+                  onValueChange={(v) =>
+                    setEvolutionAtendimento((c) => ({
+                      ...c,
+                      instance: v,
+                      apiKey: getApiKeyForEvolutionInstance(v),
+                    }))
+                  }
+                >
+                  <SelectTrigger className="mt-1 h-8 text-xs">
+                    <SelectValue placeholder="Instância" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {EVOLUTION_INSTANCE_IDS.map((id) => (
+                      <SelectItem key={`atendimento-${id}`} value={id}>
+                        <span className="flex items-center justify-between gap-3 w-full">
+                          <span className="truncate">{id}</span>
+                          {connectionByInstance[id] ? (
+                            <CircleCheck className="h-4 w-4 text-emerald-600" />
+                          ) : (
+                            <CircleX className="h-4 w-4 text-muted-foreground" />
+                          )}
+                        </span>
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+              <div>
+                <Label className="text-xs">API Key</Label>
+                <Input
+                  readOnly
+                  value="Vinculada automaticamente à instância"
+                  className="mt-1 h-8 text-xs bg-muted"
+                />
+              </div>
+            </div>
+            <Button onClick={handleSaveEvolutionAtendimento} variant="outline" size="sm">
+              Salvar atendimento
             </Button>
           </motion.div>
 
@@ -1264,7 +1381,7 @@ export default function Configuracoes() {
               transition={{ delay: 0.05 }}
               className="glass-card p-5"
             >
-              <h3 className="text-sm font-semibold text-foreground mb-2">Parear WhatsApp</h3>
+              <h3 className="text-sm font-semibold text-foreground mb-2">Parear WhatsApp - Cobrança</h3>
               <p className="text-xs text-muted-foreground mb-4">
                 Escaneie o QR Code com o app WhatsApp para conectar a instância.
               </p>
@@ -1305,6 +1422,63 @@ export default function Configuracoes() {
                         : "Erro ao carregar QR"}
                     </p>
                     <Button variant="outline" size="sm" onClick={() => refetchQr()} className="gap-2">
+                      <RefreshCw className="h-3 w-3" />
+                      Tentar novamente
+                    </Button>
+                  </div>
+                )}
+              </div>
+            </motion.div>
+          )}
+
+          {activeTab === "whatsapp" && !isConnectedAtendimento && (
+            <motion.div
+              initial={{ opacity: 0, y: 8 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ delay: 0.06 }}
+              className="glass-card p-5"
+            >
+              <h3 className="text-sm font-semibold text-foreground mb-2">Parear WhatsApp - Atendimento</h3>
+              <p className="text-xs text-muted-foreground mb-4">
+                Escaneie o QR Code com o app WhatsApp para conectar a instância usada no atendimento.
+              </p>
+              <div className="flex flex-col items-center gap-3">
+                {!evolutionAtendimento.instance?.trim() ? (
+                  <p className="text-sm text-muted-foreground py-8">
+                    Salve a configuração de atendimento com uma instância válida para gerar o QR Code.
+                  </p>
+                ) : loadingQrAtendimento ? (
+                  <div className="w-[280px] h-[280px] rounded-lg bg-muted/50 animate-pulse flex items-center justify-center">
+                    <span className="text-sm text-muted-foreground">Carregando QR...</span>
+                  </div>
+                ) : qrResultAtendimento?.ok ? (
+                  <>
+                    <img
+                      src={getQrImageUrl(qrResultAtendimento.code)}
+                      alt="QR Code WhatsApp Atendimento"
+                      className="w-[280px] h-[280px] rounded-lg border border-border"
+                    />
+                    {qrResultAtendimento.pairingCode && (
+                      <p className="text-xs text-muted-foreground">
+                        Código: <span className="font-mono font-medium text-foreground">{qrResultAtendimento.pairingCode}</span>
+                      </p>
+                    )}
+                    <Button variant="outline" size="sm" onClick={() => refetchQrAtendimento()} className="gap-2">
+                      <RefreshCw className="h-3 w-3" />
+                      Atualizar QR Code
+                    </Button>
+                  </>
+                ) : (
+                  <div className="text-center py-6">
+                    <p className="text-sm text-destructive mb-2">
+                      {qrResultAtendimento != null &&
+                      typeof qrResultAtendimento === "object" &&
+                      "error" in qrResultAtendimento &&
+                      String((qrResultAtendimento as { error?: unknown }).error || "").trim()
+                        ? String((qrResultAtendimento as { error: unknown }).error)
+                        : "Erro ao carregar QR"}
+                    </p>
+                    <Button variant="outline" size="sm" onClick={() => refetchQrAtendimento()} className="gap-2">
                       <RefreshCw className="h-3 w-3" />
                       Tentar novamente
                     </Button>

@@ -113,3 +113,29 @@ export async function createFine(data: {
   }]);
   if (error) throw error;
 }
+
+export async function fetchFinesForClient(clientId: string) {
+  const { data, error } = await supabase
+    .from("client_fines")
+    .select("id, amount, reason, notes, created_at")
+    .eq("client_id", clientId)
+    .order("created_at", { ascending: false });
+
+  if (error) throw error;
+
+  return (data || []).map((f: Record<string, unknown>) => ({
+    id: String(f.id),
+    amount: parseFloat(String(f.amount || 0)),
+    reason: String(f.reason || ""),
+    notes: f.notes ? String(f.notes) : null,
+    created_at: String(f.created_at || ""),
+  }));
+}
+
+export async function deleteFine(fineId: string) {
+  const { error } = await supabase
+    .from("client_fines")
+    .delete()
+    .eq("id", fineId);
+  if (error) throw error;
+}

@@ -41,7 +41,7 @@ export async function fetchLoansForAutomation(
 
   const { data: loans, error } = await supabase
     .from("loans")
-    .select("id, client_id, amount, interest_rate, due_date, status, original_amount, is_authorized")
+    .select("id, client_id, amount, interest_rate, due_date, status, original_amount")
     .in("status", ["active", "overdue", "partial_paid"])
     .lte("due_date", tomorrow)
     .order("due_date", { ascending: true });
@@ -64,7 +64,6 @@ export async function fetchLoansForAutomation(
 
   const candidates: Array<{ row: Record<string, unknown>; type: AutomationLoan["type"] }> = [];
   for (const r of rows) {
-    if ((r as any).is_authorized === false) continue;
     const due = String(r.due_date || "").split("T")[0];
     if (!due) continue;
 

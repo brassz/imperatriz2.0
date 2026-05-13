@@ -67,6 +67,22 @@ export type CreateClientInput = {
   facebook?: string;
 };
 
+function normalizePhoneDigits(input: unknown): string {
+  let digits = String(input || "").replace(/\D/g, "");
+  if (digits.startsWith("55") && digits.length > 11) digits = digits.slice(2);
+  return digits;
+}
+
+function normalizeClientNameKey(input: unknown): string {
+  return String(input || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 export async function createClient(input: CreateClientInput) {
   const payload = {
     name: input.name.trim(),
@@ -133,6 +149,88 @@ export async function fetchClientById(id: string) {
 
   if (error) throw error;
   return data;
+}
+
+export async function fetchClientByPhone(phone: string) {
+  const target = normalizePhoneDigits(phone);
+  if (!target) return null;
+
+  const { data, error } = await supabase
+    .from("clients")
+    .select("*")
+    .order("created_at", { ascending: false })
+    .limit(2000);
+
+  if (error) throw error;
+  return (data || []).find((row: Record<string, unknown>) => {
+    const digits = normalizePhoneDigits(row.phone);
+    return digits === target || digits.endsWith(target) || target.endsWith(digits);
+  }) ?? null;
+}
+
+export async function fetchClientsByPhones(phones: string[]) {
+  const targets = [...new Set(phones.map((phone) => normalizePhoneDigits(phone)).filter(Boolean))];
+  if (targets.length === 0) return {} as Record<string, Record<string, unknown>>;
+
+  const { data, error } = await supabase
+    .from("clients")
+    .select("*")
+    .order("created_at", { ascending: false })
+    .limit(3000);
+
+  if (error) throw error;
+
+  const out: Record<string, Record<string, unknown>> = {};
+  for (const row of (data || []) as Array<Record<string, unknown>>) {
+    const digits = normalizePhoneDigits(row.phone);
+    if (!digits) continue;
+    for (const target of targets) {
+      if (out[target]) continue;
+      if (digits === target || digits.endsWith(target) || target.endsWith(digits)) {
+        out[target] = row;
+      }
+    }
+  }
+  return out;
+}
+
+export async function fetchClientByLooseNameCandidates(names: string[]) {
+  const candidates = [...new Set(names.map((name) => normalizeClientNameKey(name)).filter((name) => name.length >= 3))];
+  if (candidates.length === 0) return null;
+
+  const { data, error } = await supabase
+    .from("clients")
+    .select("*")
+    .order("created_at", { ascending: false })
+    .limit(3000);
+
+  if (error) throw error;
+
+  let bestRow: Record<string, unknown> | null = null;
+  let bestScore = -1;
+
+  for (const row of (data || []) as Array<Record<string, unknown>>) {
+    const normalizedName = normalizeClientNameKey(row.name);
+    if (!normalizedName) continue;
+
+    for (const candidate of candidates) {
+      let score = -1;
+      if (normalizedName === candidate) {
+        score = 100;
+      } else if (normalizedName.startsWith(candidate) || candidate.startsWith(normalizedName)) {
+        score = 80;
+      } else if (normalizedName.includes(candidate) || candidate.includes(normalizedName)) {
+        score = 60;
+      }
+
+      if (score > bestScore) {
+        bestScore = score;
+        bestRow = row;
+      }
+    }
+  }
+
+  return bestScore >= 60 ? bestRow : null;
 }
 
 export async function deleteClient(id: string) {

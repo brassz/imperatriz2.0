@@ -15,6 +15,8 @@ import Parcelamentos from "./pages/Parcelamentos";
 import Calendario from "./pages/Calendario";
 import Funcionarios from "./pages/Funcionarios";
 import Pagamentos from "./pages/Pagamentos";
+import WhatsApp from "./pages/WhatsApp";
+import Atendimento from "./pages/Atendimento";
 import Multas from "./pages/Multas";
 import Caixa from "./pages/Caixa";
 import Despesas from "./pages/Despesas";
@@ -23,11 +25,11 @@ import Relatorios from "./pages/Relatorios";
 import PDFs from "./pages/PDFs";
 import Historico from "./pages/Historico";
 import Remarketing from "./pages/Remarketing";
+import GestaoTrafego from "./pages/GestaoTrafego";
 import Configuracoes from "./pages/Configuracoes";
 import Usuarios from "./pages/Usuarios";
 import Login from "./pages/Login";
 import NotFound from "./pages/NotFound";
-import AssinarContrato from "./pages/AssinarContrato";
 
 const queryClient = new QueryClient();
 
@@ -41,7 +43,6 @@ const App = () => (
             <AuthProvider>
               <Routes>
                 <Route path="/login" element={<Login />} />
-                <Route path="/contrato/assinar/:token" element={<AssinarContrato />} />
                 <Route element={<ProtectedRoute />}>
                   <Route path="/" element={<AppLayout><Dashboard /></AppLayout>} />
                   <Route path="/clientes" element={<AppLayout><Clientes /></AppLayout>} />
@@ -51,6 +52,8 @@ const App = () => (
                   <Route path="/calendario" element={<AppLayout><Calendario /></AppLayout>} />
                   <Route path="/funcionarios" element={<AppLayout><Funcionarios /></AppLayout>} />
                   <Route path="/pagamentos" element={<AppLayout><Pagamentos /></AppLayout>} />
+                  <Route path="/atendimento" element={<AppLayout><Atendimento /></AppLayout>} />
+                  <Route path="/whatsapp" element={<AppLayout><WhatsApp /></AppLayout>} />
                   <Route path="/multas" element={<AppLayout><Multas /></AppLayout>} />
                   <Route path="/caixa" element={<AppLayout><Caixa /></AppLayout>} />
                   <Route path="/despesas" element={<AppLayout><Despesas /></AppLayout>} />
@@ -59,6 +62,7 @@ const App = () => (
                   <Route path="/pdfs" element={<AppLayout><PDFs /></AppLayout>} />
                   <Route path="/historico" element={<AppLayout><Historico /></AppLayout>} />
                   <Route path="/remarketing" element={<AppLayout><Remarketing /></AppLayout>} />
+                  <Route path="/gestao-trafego" element={<AppLayout><GestaoTrafego /></AppLayout>} />
                   <Route path="/configuracoes" element={<AppLayout><Configuracoes /></AppLayout>} />
                   <Route path="/usuarios" element={<AppLayout><Usuarios /></AppLayout>} />
                 </Route>
