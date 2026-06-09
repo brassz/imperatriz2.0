@@ -6,7 +6,7 @@ import { useAutomationQueue } from "@/contexts/AutomationQueueContext";
 function labelTipo(t: "cobranca" | "lembrete_hoje" | "lembrete_amanha"): string {
   if (t === "cobranca") return "Cobrança";
   if (t === "lembrete_hoje") return "Cobrança (vencem hoje)";
-  return "Lembrete (vencem amanhã)";
+  return "Lembrete";
 }
 
 function formatDurationMs(ms: number): string {

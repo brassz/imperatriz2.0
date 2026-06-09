@@ -145,6 +145,28 @@ export default function Parcelamentos() {
     return list;
   }, [installments, search, sortBy, sortOrder]);
 
+  const installmentTotals = useMemo(() => {
+    let totalContratos = 0;
+    let pendente = 0;
+    let pago = 0;
+    for (const inst of installments) {
+      totalContratos += inst.total_amount;
+      for (const p of inst.installment_payments || []) {
+        if (p.status === "pending") {
+          pendente += p.amount;
+        } else if (p.status === "paid") {
+          pago += parseFloat(String(p.paid_amount ?? p.amount ?? 0));
+        }
+      }
+    }
+    return {
+      totalContratos: Math.round(totalContratos * 100) / 100,
+      pendente: Math.round(pendente * 100) / 100,
+      pago: Math.round(pago * 100) / 100,
+      count: installments.length,
+    };
+  }, [installments]);
+
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault();
     const amt = parseFloat(String(form.total_amount).replace(",", "."));
@@ -319,6 +341,39 @@ export default function Parcelamentos() {
           <Plus className="h-4 w-4" />
           Criar Parcelamento
         </Button>
+      </div>
+
+      <div className="grid gap-3 sm:grid-cols-3">
+        <motion.div
+          initial={{ opacity: 0, y: 8 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="glass-card p-4 rounded-xl"
+        >
+          <p className="text-xs text-muted-foreground">Valor total em parcelamentos</p>
+          <p className="text-xl font-bold text-primary mt-1">{formatCurrency(installmentTotals.totalContratos)}</p>
+          <p className="text-[10px] text-muted-foreground mt-1">
+            {installmentTotals.count} parcelamento{installmentTotals.count !== 1 ? "s" : ""} ativo
+            {installmentTotals.count !== 1 ? "s" : ""}
+          </p>
+        </motion.div>
+        <motion.div
+          initial={{ opacity: 0, y: 8 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ delay: 0.04 }}
+          className="glass-card p-4 rounded-xl"
+        >
+          <p className="text-xs text-muted-foreground">A receber (pendente)</p>
+          <p className="text-xl font-bold text-amber-600 mt-1">{formatCurrency(installmentTotals.pendente)}</p>
+        </motion.div>
+        <motion.div
+          initial={{ opacity: 0, y: 8 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ delay: 0.08 }}
+          className="glass-card p-4 rounded-xl"
+        >
+          <p className="text-xs text-muted-foreground">Já recebido</p>
+          <p className="text-xl font-bold text-emerald-600 mt-1">{formatCurrency(installmentTotals.pago)}</p>
+        </motion.div>
       </div>
 
       <div className="glass-card">

@@ -61,7 +61,7 @@ export function buildCobrancaMessage(
 
 📅 Venc.: ${venc}
 Cliente: ${loan.client_name}
-Valor: ${valor} (Cap.: ${cap} • Juros: ${juros} • Multa: ${multa})
+Valor: ${valor} (Cap.: ${cap} • Aluguel: ${juros} • Multa: ${multa})
 
 💳 PIX – ${pix.tipo}
 Titular: ${pix.titular}
@@ -111,7 +111,7 @@ Cliente: ${loan.client_name}
 📅 Vencimento: ${venc}
 
 💵 Valor total: ${valor}
-📊 Juros: ${juros}
+📊 Aluguel: ${juros}
 💳 Pagamento mínimo: ${minimo}
 
 💳 PIX
@@ -161,7 +161,7 @@ ${quitado ? "🏁 *QUITADO* — Parabéns! Seu empréstimo foi quitado com suces
     msg += `\n\n📌 *Saldo do empréstimo (atualizado)*\n` +
       `• 💰 Total restante: ${formatCurrency(remaining.totalRestante)}\n` +
       `• 💵 Capital restante: ${formatCurrency(remaining.capitalRestante)}\n` +
-      `• 📈 Juros restante: ${formatCurrency(remaining.jurosRestante)}\n` +
+      `• 📈 Aluguel restante: ${formatCurrency(remaining.jurosRestante)}\n` +
       `• ⚡ Pagamento mínimo: ${formatCurrency(remaining.pagamentoMinimo)}`;
   }
 
@@ -205,7 +205,7 @@ export function buildLoanCreationNotificationMessage(p: LoanCreationNotifyParams
 Olá, *${firstName}*!
 
 • *Valor:* ${cap}
-• *Valor do juros:* ${juros}
+• *Valor do Aluguel:* ${juros}
 • *Data de criação:* ${criacao}
 • *Data de vencimento:* ${vencimento}
 
@@ -219,25 +219,54 @@ export function buildLembreteMessage(
   loan: LoanForMessage,
   pix: PixInfo
 ): string {
+  return buildLembretePagamentoMessage(loan, pix, 1);
+}
+
+/** Lembrete de pagamento (data de vencimento sem texto relativo). */
+export function buildLembretePagamentoMessage(
+  loan: LoanForMessage,
+  pix: PixInfo,
+  _daysUntilDue = 1,
+): string {
   const title = getMessageBrandTitle();
   const venc = formatDateBr(loan.due_date);
   const valor = formatCurrency(loan.amount);
   const juros = formatCurrency(loan.interest);
   const minimo = formatCurrency(loan.minimumPayment ?? loan.interest);
 
-  return `🔔 LEMBRETE – ${title}
+  const isParcel = loan.interest === 0 && loan.fine === 0 && loan.capital === loan.amount;
+
+  if (isParcel) {
+    return `🔔 LEMBRETE DE PAGAMENTO – ${title}
 
 Cliente: ${loan.client_name}
-📅 Vencimento: ${venc} (amanhã)
+📅 Vencimento da parcela: ${venc}
+
+💵 Valor da parcela: ${valor}
+
+💳 PIX
+* Banco: ${pix.tipo}
+* Titular: ${pix.titular}
+* Chave: ${pix.chave}
+
+Por favor, organize o pagamento até a data de vencimento.`;
+  }
+
+  return `🔔 LEMBRETE DE PAGAMENTO – ${title}
+
+Cliente: ${loan.client_name}
+📅 Vencimento: ${venc}
 
 💵 Valor total: ${valor}
-📊 Juros: ${juros}
+📊 Aluguel: ${juros}
 💳 Pagamento mínimo: ${minimo}
 
 💳 PIX
 * Banco: ${pix.tipo}
 * Titular: ${pix.titular}
-* Chave: ${pix.chave}`;
+* Chave: ${pix.chave}
+
+Por favor, organize o pagamento até a data de vencimento.`;
 }
 
 /** Remarketing: cliente quitado — oferta taxa única por tempo limitado */

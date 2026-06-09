@@ -7,6 +7,7 @@ export type AutomationSendTypes = {
   cobranca: boolean;
   lembrete_hoje: boolean;
   lembrete_amanha: boolean;
+  lembrete_pagamento: boolean;
 };
 
 export type AutomationQueueLog = {
@@ -118,6 +119,7 @@ export function AutomationQueueProvider({ children }: { children: React.ReactNod
           params.sendTypes.cobranca && "cobranca",
           params.sendTypes.lembrete_hoje && "lembrete_hoje",
           params.sendTypes.lembrete_amanha && "lembrete_amanha",
+          params.sendTypes.lembrete_pagamento && "lembrete_pagamento",
         ].filter(Boolean) as AutomationLoan["type"][]),
       );
 

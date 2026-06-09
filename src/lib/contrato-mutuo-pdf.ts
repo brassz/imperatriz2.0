@@ -167,7 +167,7 @@ export function generateContratoMutuoPdf(params: ContratoMutuoParams): jsPDF {
     {
       type: "text",
       lines: [
-        `3.1. O mútuo será acrescido de juros de ${JUROS_CONTRATO_PDF_PERCENT}% ao mês e multa de ${params.multaPercent}% sobre o valor da parcela vencida,`,
+        `3.1. O mútuo será acrescido de aluguel de ${JUROS_CONTRATO_PDF_PERCENT}% ao mês e multa de ${params.multaPercent}% sobre o valor da parcela vencida,`,
         "além de correção monetária pelo IGPM/FGV.",
       ],
     },

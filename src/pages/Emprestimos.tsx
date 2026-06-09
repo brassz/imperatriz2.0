@@ -1014,8 +1014,8 @@ export default function Emprestimos() {
       return;
     }
     const labels: Record<string, string> = {
-      capital_interest_renewal: "Capital + Juros",
-      interest_renewal: "Somente Juros",
+      capital_interest_renewal: "Capital + Aluguel",
+      interest_renewal: "Somente Aluguel",
       capital_renewal: "Somente Capital",
       quitacao_total: "Quitação total",
     };
@@ -1396,7 +1396,7 @@ export default function Emprestimos() {
       y += 6.5;
       doc.text(`Capital restante: ${formatCurrencyBrl(capitalRestante)}`, m, y);
       y += 6.5;
-      doc.text(`Juros restante: ${formatCurrencyBrl(jurosRestante)}`, m, y);
+      doc.text(`Aluguel restante: ${formatCurrencyBrl(jurosRestante)}`, m, y);
       y += 6.5;
       doc.text(`Total já pago: ${formatCurrencyBrl(totalPago)}`, m, y);
       y += 8;
@@ -2975,10 +2975,10 @@ export default function Emprestimos() {
               disabled={isSubmitting}
             >
               <span className="text-left">
-                <strong>Capital + Juros</strong>
+                <strong>Capital + Aluguel</strong>
                 <br />
                 <span className="text-muted-foreground text-xs">
-                  RENOVAÇÃO +{renewalDays} DIAS - Capital + Juros
+                  RENOVAÇÃO +{renewalDays} DIAS - Capital + Aluguel
                 </span>
               </span>
             </Button>
@@ -2989,10 +2989,10 @@ export default function Emprestimos() {
               disabled={isSubmitting}
             >
               <span className="text-left">
-                <strong>Somente Juros</strong>
+                <strong>Somente Aluguel</strong>
                 <br />
                 <span className="text-muted-foreground text-xs">
-                  RENOVAÇÃO +{renewalDays} DIAS - Somente Juros
+                  RENOVAÇÃO +{renewalDays} DIAS - Somente Aluguel
                 </span>
               </span>
             </Button>

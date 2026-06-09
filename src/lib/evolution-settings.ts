@@ -13,11 +13,10 @@ export type EvolutionConfig = {
   instance: string;
 };
 
-export type EvolutionProfileId = "cobranca" | "atendimento";
+export type EvolutionProfileId = "cobranca";
 
 export const EVOLUTION_PROFILE_LABELS: Record<EvolutionProfileId, string> = {
   cobranca: "Cobrança",
-  atendimento: "Atendimento",
 };
 
 const FIXED_EVOLUTION_BASE_URL = "https://sapphiredev.com.br";
@@ -45,7 +44,6 @@ export const EVOLUTION_INSTANCE_IDS = [
 
 const DEFAULT_PROFILE_INSTANCE: Record<EvolutionProfileId, string> = {
   cobranca: "vinicius",
-  atendimento: EVOLUTION_INSTANCE_IDS.includes("luciana") ? "luciana" : EVOLUTION_INSTANCE_IDS[0],
 };
 
 export function normalizeEvolutionInstanceId(id: string): string {

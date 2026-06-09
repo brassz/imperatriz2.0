@@ -9,6 +9,7 @@ import {
   Calendar,
   StopCircle,
   ListChecks,
+  Bell,
   Play,
   Pause,
   BadgePercent,
@@ -31,6 +32,7 @@ import {
 import {
   Dialog,
   DialogContent,
+  DialogDescription,
   DialogHeader,
   DialogTitle,
   DialogFooter,
@@ -46,14 +48,18 @@ import {
   saveEvolutionConfig,
   EVOLUTION_INSTANCE_IDS,
   getApiKeyForEvolutionInstance,
-  EVOLUTION_PROFILE_LABELS,
 } from "@/lib/evolution-settings";
 import { getSupabaseCompany } from "@/lib/supabase";
 import { useAuth } from "@/contexts/AuthContext";
 import { useAutomationQueue } from "@/contexts/AutomationQueueContext";
 import { useState, useCallback, useRef, useMemo, useEffect } from "react";
 import { toast } from "sonner";
-import { fetchLoansForAutomation, type AutomationLoan } from "@/api/automation";
+import {
+  fetchLoansForAutomation,
+  fetchLoansForPaymentReminder,
+  paymentReminderTargetDate,
+  type AutomationLoan,
+} from "@/api/automation";
 import { fetchInstallments, type InstallmentRow } from "@/api/installments";
 import { fetchClientsForSelect } from "@/api/clients";
 import {
@@ -72,6 +78,7 @@ import {
   buildCobrancaParcelamentoMessage,
   buildLembreteHojeMessage,
   buildLembreteMessage,
+  buildLembretePagamentoMessage,
   type PixInfo,
 } from "@/lib/whatsapp-messages";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -114,7 +121,9 @@ function labelTipoAutomacao(t: AutomationLoan["type"]): string {
     case "lembrete_hoje":
       return "Vence hoje";
     case "lembrete_amanha":
-      return "Lembrete (amanhã)";
+      return "Lembrete";
+    case "lembrete_pagamento":
+      return "Lembrete de pagamento";
     default:
       return t;
   }
@@ -591,16 +600,10 @@ export default function Configuracoes() {
   const queryClient = useQueryClient();
   const queue = useAutomationQueue();
   const cobrancaConfig = getEvolutionConfig("cobranca");
-  const atendimentoConfig = getEvolutionConfig("atendimento");
   const [evolution, setEvolution] = useState({
     baseUrl: cobrancaConfig.baseUrl,
     apiKey: cobrancaConfig.apiKey,
     instance: cobrancaConfig.instance,
-  });
-  const [evolutionAtendimento, setEvolutionAtendimento] = useState({
-    baseUrl: atendimentoConfig.baseUrl,
-    apiKey: atendimentoConfig.apiKey,
-    instance: atendimentoConfig.instance,
   });
   const [selectedPixId, setSelectedPixId] = useState<string>("");
   const [delayModalOpen, setDelayModalOpen] = useState(false);
@@ -620,7 +623,15 @@ export default function Configuracoes() {
     cobranca: true,
     lembrete_hoje: true,
     lembrete_amanha: true,
+    lembrete_pagamento: false,
   });
+  const [lembreteModalOpen, setLembreteModalOpen] = useState(false);
+  const [lembreteDaysAhead, setLembreteDaysAhead] = useState("3");
+  const [lembreteDelayMinutes, setLembreteDelayMinutes] = useState("2");
+  const [lembreteLoans, setLembreteLoans] = useState<AutomationLoan[] | null>(null);
+  const [loadingLembreteLoans, setLoadingLembreteLoans] = useState(false);
+  const [lembreteSelection, setLembreteSelection] = useState<string[]>([]);
+  const [lembreteSearch, setLembreteSearch] = useState("");
   const migratedSchedulesRef = useRef(false);
   const [activeTab, setActiveTab] = useState("whatsapp");
   const [modalAgendamento, setModalAgendamento] = useState(false);
@@ -769,23 +780,6 @@ export default function Configuracoes() {
 
   const isConnected = connectionState?.connected ?? false;
 
-  const { data: connectionStateAtendimento, refetch: refetchConnectionAtendimento } = useQuery({
-    queryKey: ["evolution-connection", "atendimento", activeTab, evolutionAtendimento.instance],
-    queryFn: async () => {
-      const r = await fetchConnectionStateForInstance({
-        instance: evolutionAtendimento.instance,
-        apiKey: getApiKeyForEvolutionInstance(evolutionAtendimento.instance),
-        baseUrl: evolutionAtendimento.baseUrl,
-      });
-      if (!r.ok) return { connected: false };
-      return { connected: r.connected };
-    },
-    enabled: activeTab === "whatsapp" && !!evolutionAtendimento.instance?.trim(),
-    staleTime: 30_000,
-  });
-
-  const isConnectedAtendimento = connectionStateAtendimento?.connected ?? false;
-
   const { data: qrResult, isLoading: loadingQr, refetch: refetchQr } = useQuery({
     queryKey: ["evolution-qr", "cobranca", activeTab, evolution.instance, isConnected],
     queryFn: () =>
@@ -803,21 +797,6 @@ export default function Configuracoes() {
     refetchIntervalInBackground: true,
   });
 
-  const { data: qrResultAtendimento, isLoading: loadingQrAtendimento, refetch: refetchQrAtendimento } = useQuery({
-    queryKey: ["evolution-qr", "atendimento", activeTab, evolutionAtendimento.instance, isConnectedAtendimento],
-    queryFn: () =>
-      fetchEvolutionQrCodeForInstance({
-        instance: evolutionAtendimento.instance,
-        apiKey: getApiKeyForEvolutionInstance(evolutionAtendimento.instance),
-        baseUrl: evolutionAtendimento.baseUrl,
-      }),
-    enabled: activeTab === "whatsapp" && !!evolutionAtendimento.instance?.trim() && !isConnectedAtendimento,
-    staleTime: 0,
-    retry: false,
-    refetchInterval: 10_000,
-    refetchIntervalInBackground: true,
-  });
-
   const { data: pixKeys = [], isLoading: loadingPix } = useQuery({
     queryKey: ["pix-keys"],
     queryFn: fetchPixKeys,
@@ -830,16 +809,9 @@ export default function Configuracoes() {
 
   const handleSaveEvolution = () => {
     saveEvolutionConfig(evolution, "cobranca");
-    toast.success(`Configuração de ${EVOLUTION_PROFILE_LABELS.cobranca} salva`);
+    toast.success("Configuração salva");
     refetchQr();
     refetchConnection();
-  };
-
-  const handleSaveEvolutionAtendimento = () => {
-    saveEvolutionConfig(evolutionAtendimento, "atendimento");
-    toast.success(`Configuração de ${EVOLUTION_PROFILE_LABELS.atendimento} salva`);
-    refetchQrAtendimento();
-    refetchConnectionAtendimento();
   };
 
   const getPixInfoForAutomation = useCallback((): PixInfo | null => {
@@ -952,6 +924,108 @@ export default function Configuracoes() {
       return true;
     });
   }, [automationLoans, recipientFilters, recipientSearch]);
+
+  const lembreteDaysNum = Math.max(0, parseInt(String(lembreteDaysAhead).replace(/\D/g, ""), 10) || 0);
+  const lembreteTargetYmd = useMemo(
+    () => paymentReminderTargetDate(lembreteDaysNum),
+    [lembreteDaysNum],
+  );
+
+  const filteredLembreteFila = useMemo(() => {
+    const list = lembreteLoans || [];
+    const q = lembreteSearch.trim().toLowerCase();
+    return list.filter((item) => {
+      if (q) {
+        const name = String(item.loan?.client_name || "").toLowerCase();
+        const phone = String(item.loan?.client_phone || "").toLowerCase();
+        if (!name.includes(q) && !phone.includes(q)) return false;
+      }
+      return true;
+    });
+  }, [lembreteLoans, lembreteSearch]);
+
+  const handleOpenLembreteModal = async () => {
+    if (!getPixInfoForAutomation()) {
+      toast.error("Selecione uma chave PIX para as mensagens");
+      return;
+    }
+    setLembreteModalOpen(true);
+    setLoadingLembreteLoans(true);
+    setLembreteLoans(null);
+    try {
+      const loans = await fetchLoansForPaymentReminder(lembreteDaysNum, { includeInstallments: true });
+      setLembreteLoans(loans);
+      setLembreteSelection(loans.map((l) => l.id));
+      setLembreteSearch("");
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "Erro ao buscar clientes para lembrete");
+    } finally {
+      setLoadingLembreteLoans(false);
+    }
+  };
+
+  const handleReloadLembreteList = async () => {
+    setLoadingLembreteLoans(true);
+    try {
+      const loans = await fetchLoansForPaymentReminder(lembreteDaysNum, { includeInstallments: true });
+      setLembreteLoans(loans);
+      setLembreteSelection((prev) => prev.filter((id) => loans.some((l) => l.id === id)));
+      if (loans.length === 0) {
+        toast.message("Nenhum cliente com vencimento nesta data.");
+      }
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "Erro ao buscar");
+    } finally {
+      setLoadingLembreteLoans(false);
+    }
+  };
+
+  const handleConfirmLembreteSend = async () => {
+    const pixInfo = getPixInfoForAutomation();
+    if (!pixInfo) {
+      toast.error("Selecione uma chave PIX para as mensagens");
+      return;
+    }
+    if (loadingLembreteLoans || !lembreteLoans) {
+      toast.message("Aguarde terminar de carregar a lista.");
+      return;
+    }
+    const min = Math.max(0, parseFloat(String(lembreteDelayMinutes).replace(",", ".")) || 0);
+    const delayMs = Math.round(min * 60_000);
+    const days = lembreteDaysNum;
+
+    setLembreteModalOpen(false);
+
+    const toSend = lembreteLoans.filter(
+      (l) => lembreteSelection.includes(l.id) && l.loan.client_phone?.trim(),
+    );
+
+    if (toSend.length === 0) {
+      toast.error("Selecione ao menos um cliente com telefone.");
+      return;
+    }
+
+    const withoutPhone = lembreteLoans.filter((l) => !l.loan.client_phone?.trim());
+    if (withoutPhone.length > 0) {
+      toast.warning(`${withoutPhone.length} cliente(s) sem telefone serão ignorados`);
+    }
+
+    await queue.start({
+      items: toSend,
+      delayMs,
+      pixInfo,
+      sendTypes: {
+        cobranca: false,
+        lembrete_hoje: false,
+        lembrete_amanha: false,
+        lembrete_pagamento: true,
+      },
+      buildMessage: (item, pix) =>
+        buildLembretePagamentoMessage(item.loan, pix, item.days_until_due ?? days),
+    });
+
+    toast.success(`Lembretes enviados: ${queue.stats.sent}${queue.stats.failed > 0 ? ` | Falhas: ${queue.stats.failed}` : ""}`);
+  };
 
   const buildAutomationMessage = (item: AutomationLoan, pixInfo: PixInfo): string => {
     const cobranca =
@@ -1101,142 +1175,6 @@ export default function Configuracoes() {
         </TabsList>
 
         <TabsContent value="whatsapp" className="space-y-4 mt-4">
-          {/* Evolution API config */}
-          <motion.div
-            initial={{ opacity: 0, y: 8 }}
-            animate={{ opacity: 1, y: 0 }}
-            className="glass-card p-5"
-          >
-            <h3 className="text-sm font-semibold text-foreground mb-4 flex items-center gap-2">
-              <MessageCircle className="h-4 w-4" />
-              Evolution API - Cobrança
-            </h3>
-            <p className="text-xs text-muted-foreground mb-4">
-              Perfil usado pelos fluxos de cobrança e envios financeiros. Escolha a instância; a API key é aplicada
-              automaticamente para cada uma. O seletor mostra ✓ quando a instância está conectada e ✕ quando não está.
-            </p>
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
-              <div>
-                <Label className="text-xs">URL da API</Label>
-                <Input
-                  value={evolution.baseUrl}
-                  readOnly
-                  className="mt-1 h-8 text-xs"
-                />
-              </div>
-              <div>
-                <Label className="text-xs">Instância</Label>
-                <Select
-                  value={evolution.instance}
-                  onValueChange={(v) =>
-                    setEvolution((c) => ({
-                      ...c,
-                      instance: v,
-                      apiKey: getApiKeyForEvolutionInstance(v),
-                    }))
-                  }
-                >
-                  <SelectTrigger className="mt-1 h-8 text-xs">
-                    <SelectValue placeholder="Instância" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {EVOLUTION_INSTANCE_IDS.map((id) => (
-                      <SelectItem key={id} value={id}>
-                        <span className="flex items-center justify-between gap-3 w-full">
-                          <span className="truncate">{id}</span>
-                          {connectionByInstance[id] ? (
-                            <CircleCheck className="h-4 w-4 text-emerald-600" />
-                          ) : (
-                            <CircleX className="h-4 w-4 text-muted-foreground" />
-                          )}
-                        </span>
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </div>
-              <div>
-                <Label className="text-xs">API Key</Label>
-                <Input
-                  readOnly
-                  value="Vinculada automaticamente à instância"
-                  className="mt-1 h-8 text-xs bg-muted"
-                />
-              </div>
-            </div>
-            <Button onClick={handleSaveEvolution} variant="outline" size="sm">
-              Salvar cobrança
-            </Button>
-          </motion.div>
-
-          <motion.div
-            initial={{ opacity: 0, y: 8 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={{ delay: 0.02 }}
-            className="glass-card p-5"
-          >
-            <h3 className="text-sm font-semibold text-foreground mb-4 flex items-center gap-2">
-              <MessageCircle className="h-4 w-4" />
-              Evolution API - Atendimento
-            </h3>
-            <p className="text-xs text-muted-foreground mb-4">
-              Perfil usado pela nova aba de atendimento. Configure uma instância separada da cobrança para evitar mistura
-              de conversas e disparos operacionais.
-            </p>
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
-              <div>
-                <Label className="text-xs">URL da API</Label>
-                <Input
-                  value={evolutionAtendimento.baseUrl}
-                  readOnly
-                  className="mt-1 h-8 text-xs"
-                />
-              </div>
-              <div>
-                <Label className="text-xs">Instância</Label>
-                <Select
-                  value={evolutionAtendimento.instance}
-                  onValueChange={(v) =>
-                    setEvolutionAtendimento((c) => ({
-                      ...c,
-                      instance: v,
-                      apiKey: getApiKeyForEvolutionInstance(v),
-                    }))
-                  }
-                >
-                  <SelectTrigger className="mt-1 h-8 text-xs">
-                    <SelectValue placeholder="Instância" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {EVOLUTION_INSTANCE_IDS.map((id) => (
-                      <SelectItem key={`atendimento-${id}`} value={id}>
-                        <span className="flex items-center justify-between gap-3 w-full">
-                          <span className="truncate">{id}</span>
-                          {connectionByInstance[id] ? (
-                            <CircleCheck className="h-4 w-4 text-emerald-600" />
-                          ) : (
-                            <CircleX className="h-4 w-4 text-muted-foreground" />
-                          )}
-                        </span>
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </div>
-              <div>
-                <Label className="text-xs">API Key</Label>
-                <Input
-                  readOnly
-                  value="Vinculada automaticamente à instância"
-                  className="mt-1 h-8 text-xs bg-muted"
-                />
-              </div>
-            </div>
-            <Button onClick={handleSaveEvolutionAtendimento} variant="outline" size="sm">
-              Salvar atendimento
-            </Button>
-          </motion.div>
-
           {/* Prévia: mesmas bases usadas no envio manual */}
           <motion.div
             initial={{ opacity: 0, y: 8 }}
@@ -1250,11 +1188,6 @@ export default function Configuracoes() {
                   <ListChecks className="h-4 w-4" />
                   Prévia para cobrança (empréstimos e parcelamentos)
                 </h3>
-                <p className="text-xs text-muted-foreground mt-1 max-w-xl">
-                  Vencidos, vencem hoje e lembretes vêm dos empréstimos com vencimento até amanhã. Parcelamentos: contratos
-                  ativos com próxima parcela pendente. O envio em massa usa a subaba Parcelamentos no modal «Enviar
-                  cobranças — fila». Clientes sem telefone aparecem aqui, mas não entram na fila até cadastrar o número.
-                </p>
                 {previewLoansError ? (
                   <p className="text-xs text-destructive mt-2">
                     {previewLoansError instanceof Error ? previewLoansError.message : "Erro ao carregar empréstimos."}
@@ -1381,7 +1314,7 @@ export default function Configuracoes() {
               transition={{ delay: 0.05 }}
               className="glass-card p-5"
             >
-              <h3 className="text-sm font-semibold text-foreground mb-2">Parear WhatsApp - Cobrança</h3>
+              <h3 className="text-sm font-semibold text-foreground mb-2">Parear WhatsApp</h3>
               <p className="text-xs text-muted-foreground mb-4">
                 Escaneie o QR Code com o app WhatsApp para conectar a instância.
               </p>
@@ -1431,62 +1364,45 @@ export default function Configuracoes() {
             </motion.div>
           )}
 
-          {activeTab === "whatsapp" && !isConnectedAtendimento && (
-            <motion.div
-              initial={{ opacity: 0, y: 8 }}
-              animate={{ opacity: 1, y: 0 }}
-              transition={{ delay: 0.06 }}
-              className="glass-card p-5"
-            >
-              <h3 className="text-sm font-semibold text-foreground mb-2">Parear WhatsApp - Atendimento</h3>
-              <p className="text-xs text-muted-foreground mb-4">
-                Escaneie o QR Code com o app WhatsApp para conectar a instância usada no atendimento.
-              </p>
-              <div className="flex flex-col items-center gap-3">
-                {!evolutionAtendimento.instance?.trim() ? (
-                  <p className="text-sm text-muted-foreground py-8">
-                    Salve a configuração de atendimento com uma instância válida para gerar o QR Code.
-                  </p>
-                ) : loadingQrAtendimento ? (
-                  <div className="w-[280px] h-[280px] rounded-lg bg-muted/50 animate-pulse flex items-center justify-center">
-                    <span className="text-sm text-muted-foreground">Carregando QR...</span>
-                  </div>
-                ) : qrResultAtendimento?.ok ? (
-                  <>
-                    <img
-                      src={getQrImageUrl(qrResultAtendimento.code)}
-                      alt="QR Code WhatsApp Atendimento"
-                      className="w-[280px] h-[280px] rounded-lg border border-border"
-                    />
-                    {qrResultAtendimento.pairingCode && (
-                      <p className="text-xs text-muted-foreground">
-                        Código: <span className="font-mono font-medium text-foreground">{qrResultAtendimento.pairingCode}</span>
-                      </p>
-                    )}
-                    <Button variant="outline" size="sm" onClick={() => refetchQrAtendimento()} className="gap-2">
-                      <RefreshCw className="h-3 w-3" />
-                      Atualizar QR Code
-                    </Button>
-                  </>
-                ) : (
-                  <div className="text-center py-6">
-                    <p className="text-sm text-destructive mb-2">
-                      {qrResultAtendimento != null &&
-                      typeof qrResultAtendimento === "object" &&
-                      "error" in qrResultAtendimento &&
-                      String((qrResultAtendimento as { error?: unknown }).error || "").trim()
-                        ? String((qrResultAtendimento as { error: unknown }).error)
-                        : "Erro ao carregar QR"}
-                    </p>
-                    <Button variant="outline" size="sm" onClick={() => refetchQrAtendimento()} className="gap-2">
-                      <RefreshCw className="h-3 w-3" />
-                      Tentar novamente
-                    </Button>
-                  </div>
-                )}
+          {/* Lembretes de pagamento */}
+          <motion.div
+            initial={{ opacity: 0, y: 8 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ delay: 0.09 }}
+            className="glass-card p-5"
+          >
+            <h3 className="text-sm font-semibold text-foreground mb-3 flex items-center gap-2">
+              <Bell className="h-4 w-4" />
+              Enviar lembretes de pagamento
+            </h3>
+            <div className="flex flex-wrap items-end gap-4">
+              <div className="w-[140px]">
+                <Label className="text-xs">Dias depois</Label>
+                <Input
+                  type="number"
+                  min={0}
+                  max={90}
+                  value={lembreteDaysAhead}
+                  onChange={(e) => setLembreteDaysAhead(e.target.value)}
+                  className="mt-1 h-8"
+                  placeholder="Ex: 3"
+                />
               </div>
-            </motion.div>
-          )}
+              <div className="min-w-[200px]">
+                <Label className="text-xs text-muted-foreground">Vencimento alvo</Label>
+                <p className="text-sm font-medium mt-1">{formatPreviewDate(lembreteTargetYmd)}</p>
+              </div>
+              <Button
+                onClick={handleOpenLembreteModal}
+                disabled={queue.isRunning || !selectedPixId}
+                variant="outline"
+                className="gap-2"
+              >
+                <Bell className="h-4 w-4" />
+                Buscar e enviar lembretes
+              </Button>
+            </div>
+          </motion.div>
 
           {/* Automação manual */}
           <motion.div
@@ -1495,18 +1411,65 @@ export default function Configuracoes() {
             transition={{ delay: 0.1 }}
             className="glass-card p-5"
           >
-            <h3 className="text-sm font-semibold text-foreground mb-4 flex items-center gap-2">
+            <h3 className="text-sm font-semibold text-foreground mb-3 flex items-center gap-2">
               <Send className="h-4 w-4" />
               Envio manual de cobranças
             </h3>
-            <p className="text-xs text-muted-foreground mb-4">
-              Cobranças (vencidos), cobranças (vencem hoje) e lembretes (vencem amanhã).
-            </p>
-            <div className="flex flex-wrap items-end gap-4">
-              <div className="min-w-[200px]">
-                <Label className="text-xs">Chave PIX para mensagens</Label>
+            <div className="flex flex-wrap items-end gap-3">
+              <div className="min-w-[140px] max-w-[180px]">
+                <Label className="text-xs">Instância WhatsApp</Label>
+                <Select
+                  value={evolution.instance}
+                  onValueChange={(v) =>
+                    setEvolution((c) => ({
+                      ...c,
+                      instance: v,
+                      apiKey: getApiKeyForEvolutionInstance(v),
+                    }))
+                  }
+                >
+                  <SelectTrigger className="mt-1 h-8 text-xs">
+                    <SelectValue placeholder="Instância" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {EVOLUTION_INSTANCE_IDS.map((id) => (
+                      <SelectItem key={id} value={id}>
+                        <span className="flex items-center justify-between gap-2 w-full">
+                          <span className="truncate">{id}</span>
+                          {connectionByInstance[id] ? (
+                            <CircleCheck className="h-3.5 w-3.5 text-emerald-600" />
+                          ) : (
+                            <CircleX className="h-3.5 w-3.5 text-muted-foreground" />
+                          )}
+                        </span>
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+              {evolution.instance?.trim() ? (
+                isConnected ? (
+                  <Badge
+                    variant="outline"
+                    className="h-8 gap-1 px-2 text-[11px] border-emerald-600/40 text-emerald-700 dark:text-emerald-400 shrink-0"
+                  >
+                    <CircleCheck className="h-3 w-3" />
+                    Conectado
+                  </Badge>
+                ) : (
+                  <Badge variant="outline" className="h-8 gap-1 px-2 text-[11px] text-muted-foreground shrink-0">
+                    <CircleX className="h-3 w-3" />
+                    Desconectado
+                  </Badge>
+                )
+              ) : null}
+              <Button onClick={handleSaveEvolution} variant="outline" size="sm" className="h-8 text-xs shrink-0">
+                Salvar
+              </Button>
+              <div className="min-w-[200px] flex-1">
+                <Label className="text-xs">Chave PIX</Label>
                 <Select value={selectedPixId} onValueChange={setSelectedPixId}>
-                  <SelectTrigger className="mt-1 h-8">
+                  <SelectTrigger className="mt-1 h-8 text-xs">
                     <SelectValue placeholder="Selecione uma chave" />
                   </SelectTrigger>
                   <SelectContent>
@@ -1521,10 +1484,11 @@ export default function Configuracoes() {
               <Button
                 onClick={handleOpenCobrancaDelayModal}
                 disabled={queue.isRunning || !selectedPixId}
-                className="gap-2"
+                size="sm"
+                className="gap-2 h-8 shrink-0"
               >
-                <Send className="h-4 w-4" />
-                {queue.isRunning ? "Enviando..." : "Enviar cobranças agora"}
+                <Send className="h-3.5 w-3.5" />
+                {queue.isRunning ? "Enviando..." : "Enviar cobranças"}
               </Button>
             </div>
           </motion.div>
@@ -1598,7 +1562,7 @@ export default function Configuracoes() {
                               setSendTypes((prev) => ({ ...prev, lembrete_amanha: Boolean(checked) }))
                             }
                           />
-                          <span>Lembretes (vencem amanhã)</span>
+                          <span>Lembrete</span>
                         </label>
                       </div>
                     </div>
@@ -1839,6 +1803,155 @@ export default function Configuracoes() {
                 >
                   <Send className="h-4 w-4" />
                   Iniciar fila
+                </Button>
+              </DialogFooter>
+            </DialogContent>
+          </Dialog>
+
+          <Dialog open={lembreteModalOpen} onOpenChange={setLembreteModalOpen}>
+            <DialogContent className="sm:max-w-xl max-h-[90vh] overflow-y-auto">
+              <DialogHeader>
+                <DialogTitle>Enviar lembretes de pagamento</DialogTitle>
+                <DialogDescription>
+                  Clientes com vencimento em {formatPreviewDate(lembreteTargetYmd)} (
+                  {lembreteDaysNum === 0
+                    ? "hoje"
+                    : lembreteDaysNum === 1
+                      ? "amanhã"
+                      : `daqui a ${lembreteDaysNum} dias`}
+                  )
+                </DialogDescription>
+              </DialogHeader>
+
+              <div className="flex flex-wrap items-end gap-3">
+                <div className="w-[120px]">
+                  <Label className="text-xs">Dias depois</Label>
+                  <Input
+                    type="number"
+                    min={0}
+                    max={90}
+                    value={lembreteDaysAhead}
+                    onChange={(e) => setLembreteDaysAhead(e.target.value)}
+                    className="h-8 mt-1"
+                  />
+                </div>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={handleReloadLembreteList}
+                  disabled={loadingLembreteLoans}
+                >
+                  <RefreshCw className="h-3 w-3 mr-1" />
+                  Atualizar lista
+                </Button>
+              </div>
+
+              {loadingLembreteLoans ? (
+                <p className="text-sm text-muted-foreground py-4">Buscando clientes...</p>
+              ) : !lembreteLoans?.length ? (
+                <p className="text-sm text-muted-foreground py-4">
+                  Nenhum empréstimo ou parcelamento com vencimento em {formatPreviewDate(lembreteTargetYmd)}.
+                  Ajuste os dias depois e clique em Atualizar lista.
+                </p>
+              ) : (
+                <>
+                  <div className="space-y-2">
+                    <Label htmlFor="lembrete-delay" className="text-xs">
+                      Intervalo entre envios (minutos)
+                    </Label>
+                    <Input
+                      id="lembrete-delay"
+                      type="number"
+                      min={0}
+                      step={0.5}
+                      value={lembreteDelayMinutes}
+                      onChange={(e) => setLembreteDelayMinutes(e.target.value)}
+                      className="h-9"
+                    />
+                  </div>
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <Label className="text-xs">
+                      Destinatários ({filteredLembreteFila.length})
+                    </Label>
+                    <div className="flex gap-2">
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        className="h-7 text-xs"
+                        onClick={() => setLembreteSelection(filteredLembreteFila.map((l) => l.id))}
+                      >
+                        Marcar todos
+                      </Button>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        className="h-7 text-xs"
+                        onClick={() => setLembreteSelection([])}
+                      >
+                        Desmarcar
+                      </Button>
+                    </div>
+                  </div>
+                  <Input
+                    placeholder="Buscar por nome ou telefone..."
+                    value={lembreteSearch}
+                    onChange={(e) => setLembreteSearch(e.target.value)}
+                    className="h-8 text-xs"
+                  />
+                  <ScrollArea className="h-[min(280px,40vh)] rounded border">
+                    <div className="p-2 space-y-1">
+                      {filteredLembreteFila.map((item) => (
+                        <label
+                          key={item.id}
+                          className="flex items-start gap-2 rounded-md p-2 hover:bg-muted/50 cursor-pointer text-xs"
+                        >
+                          <Checkbox
+                            checked={lembreteSelection.includes(item.id)}
+                            onCheckedChange={(checked) => {
+                              if (checked) {
+                                setLembreteSelection((prev) =>
+                                  prev.includes(item.id) ? prev : [...prev, item.id],
+                                );
+                              } else {
+                                setLembreteSelection((prev) => prev.filter((x) => x !== item.id));
+                              }
+                            }}
+                          />
+                          <span className="min-w-0 flex-1">
+                            <span className="font-medium text-foreground">{item.loan.client_name}</span>
+                            <span className="text-muted-foreground">
+                              {" "}
+                              · {item.source === "installment" ? "Parcelamento" : "Empréstimo"}
+                            </span>
+                            <span className="block text-muted-foreground mt-0.5">
+                              Venc. {formatPreviewDate(item.loan.due_date)} ·{" "}
+                              {formatPreviewCurrency(item.loan.amount)}
+                              {!item.loan.client_phone?.trim() ? (
+                                <span className="text-amber-600 dark:text-amber-500"> · sem telefone</span>
+                              ) : null}
+                            </span>
+                          </span>
+                        </label>
+                      ))}
+                    </div>
+                  </ScrollArea>
+                </>
+              )}
+
+              <DialogFooter className="gap-2 sm:gap-0">
+                <Button variant="outline" onClick={() => setLembreteModalOpen(false)}>
+                  Cancelar
+                </Button>
+                <Button
+                  onClick={handleConfirmLembreteSend}
+                  className="gap-2"
+                  disabled={loadingLembreteLoans || !lembreteLoans?.length || lembreteSelection.length === 0}
+                >
+                  <Bell className="h-4 w-4" />
+                  Enviar lembretes
                 </Button>
               </DialogFooter>
             </DialogContent>
