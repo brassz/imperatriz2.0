@@ -513,6 +513,56 @@ export async function sendWhatsAppTextWithInstance(
   }
 }
 
+export async function sendWhatsAppDocumentWithInstance(
+  number: string,
+  opts: {
+    base64: string;
+    fileName: string;
+    caption?: string;
+    instance: string;
+    apiKey: string;
+    baseUrl?: string;
+  },
+): Promise<{ ok: boolean; error?: string }> {
+  const num = normalizePhone(number);
+  const base = normalizeBaseUrl(opts.baseUrl || getEvolutionConfig().baseUrl);
+  const instance = String(opts.instance || "").trim();
+  const apiKey = String(opts.apiKey || "").trim();
+  if (!instance) return { ok: false, error: "Instância não informada" };
+  if (!apiKey) return { ok: false, error: "API key não informada" };
+
+  try {
+    assertNoMixedContent(base);
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : "Configuração inválida" };
+  }
+
+  const url = `${base}/message/sendMedia/${encodeURIComponent(instance)}`;
+  const body: Record<string, string> = {
+    number: num,
+    mediatype: "document",
+    mimetype: "application/pdf",
+    media: opts.base64,
+    fileName: opts.fileName?.trim() || "documento.pdf",
+    caption: opts.caption ?? "",
+  };
+
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", apikey: apiKey },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      const err = await res.text();
+      return { ok: false, error: err || `HTTP ${res.status}` };
+    }
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : "Erro de conexão" };
+  }
+}
+
 export async function fetchEvolutionChatsForInstance(opts: {
   instance: string;
   apiKey: string;

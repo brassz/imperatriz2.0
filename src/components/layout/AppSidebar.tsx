@@ -2,7 +2,7 @@ import { memo } from "react";
 import {
   LayoutDashboard, Users, Search, Landmark, CalendarCheck, CalendarDays, CreditCard,
   AlertTriangle, Wallet, Receipt, TrendingUp, History, IdCard, Sparkles,
-  BarChart3, FileText, Settings, UserCog, ChevronLeft, LogOut, MessageCircle
+  BarChart3, FileText, Settings, UserCog, ChevronLeft, LogOut, Gavel
 } from "lucide-react";
 import { NavLink } from "@/components/NavLink";
 import { useAuth } from "@/contexts/AuthContext";
@@ -21,10 +21,10 @@ const mainItems = [
   { title: "Calendário", url: "/calendario", icon: CalendarDays },
   { title: "Funcionários", url: "/funcionarios", icon: IdCard },
   { title: "Pagamentos", url: "/pagamentos", icon: CreditCard },
-  { title: "Atendimento", url: "/atendimento", icon: MessageCircle },
   { title: "Multas", url: "/multas", icon: AlertTriangle },
   { title: "Histórico", url: "/historico", icon: History },
   { title: "Remarketing", url: "/remarketing", icon: Sparkles },
+  { title: "Advocacia", url: "/advocacia", icon: Gavel },
 ];
 
 const financialItems = [

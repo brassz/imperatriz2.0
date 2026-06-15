@@ -30,6 +30,8 @@ export const EVOLUTION_INSTANCE_API_KEYS: Record<string, string> = {
   novixcred: "C6C119E91CEF-4A96-8336-18AAD15E84C6",
   nobrega: "D879B3B8ED95-4D6E-9174-AC081E4351C3",
   luciana: "AF9F4C62CC87-4B2A-B4DF-EF3F8CDF5C77",
+  advocacianexus1: "BD6CAFED22C2-4A58-A4E6-3D0E568F6BA5",
+  advocacianexus2: "21BF47876816-45E0-B896-47940EB69C9F",
 };
 
 export const EVOLUTION_INSTANCE_IDS = [
@@ -41,6 +43,9 @@ export const EVOLUTION_INSTANCE_IDS = [
   "novixcred",
   "luciana",
 ] as const;
+
+/** Instâncias WhatsApp da aba Advocacia (Capital Advocacia). */
+export const ADVOCACIA_INSTANCE_IDS = ["advocacianexus1", "advocacianexus2"] as const;
 
 const DEFAULT_PROFILE_INSTANCE: Record<EvolutionProfileId, string> = {
   cobranca: "vinicius",
