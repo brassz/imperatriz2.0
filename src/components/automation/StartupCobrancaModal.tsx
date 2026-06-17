@@ -9,6 +9,7 @@ import { useAutomationQueue } from "@/contexts/AutomationQueueContext";
 import {
   buildCobrancaMessage,
   buildCobrancaParcelamentoMessage,
+  resolvePixInfoForMessages,
   type PixInfo,
 } from "@/lib/whatsapp-messages";
 import {
@@ -112,11 +113,11 @@ export function StartupCobrancaModal() {
       | { bank: string; holder: string; key: string }
       | undefined;
     if (!pix) return null;
-    return {
+    return resolvePixInfoForMessages({
       tipo: pix.bank || "CNPJ",
       titular: pix.holder || "",
       chave: pix.key || "",
-    };
+    });
   }, [pixKeys, selectedPixId]);
 
   const sendTypes = useMemo(

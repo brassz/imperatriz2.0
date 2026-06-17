@@ -40,6 +40,7 @@ import { fetchClientsForSelect } from "@/api/clients";
 import { fetchClientLoansForParcelamentoLink } from "@/api/loans";
 import { fetchPixKeys } from "@/api/pix-keys";
 import { sendWhatsAppMessage } from "@/api/evolution";
+import { resolvePixTitularForMessages } from "@/lib/whatsapp-messages";
 import { useState, useMemo } from "react";
 import { toast } from "sonner";
 
@@ -295,7 +296,10 @@ export default function Parcelamentos() {
     const pix = pixKeys.length > 0 ? (pixKeys as Array<{ bank: string; key: string; holder: string }>)[0] : null;
     let msg = `Olá ${inst.client_name}, lembrete de parcelamento.\n\nValor da parcela: ${formatCurrency(amt)}`;
     if (next) msg += `\nPróximo vencimento: ${formatDate(next.due_date)}`;
-    if (pix) msg += `\n\nChave PIX (${pix.bank} - ${pix.holder}):\n${pix.key}`;
+    if (pix) {
+      const titular = resolvePixTitularForMessages(pix.holder);
+      msg += `\n\nChave PIX (${pix.bank} - ${titular}):\n${pix.key}`;
+    }
     const phone = (inst.client_phone || "").trim();
     if (!phone) {
       toast.error("Cliente sem telefone cadastrado");

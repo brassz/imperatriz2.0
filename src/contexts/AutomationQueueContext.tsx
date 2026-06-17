@@ -51,7 +51,7 @@ type AutomationQueueApi = AutomationQueueState & {
 
 const AutomationQueueContext = createContext<AutomationQueueApi | null>(null);
 
-function interruptibleDelay(ms: number, shouldAbort: () => boolean): Promise<void> {
+export function interruptibleDelay(ms: number, shouldAbort: () => boolean): Promise<void> {
   if (ms <= 0) return Promise.resolve();
   return new Promise((resolve) => {
     const start = Date.now();

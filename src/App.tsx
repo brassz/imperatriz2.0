@@ -24,7 +24,7 @@ import PDFs from "./pages/PDFs";
 import Historico from "./pages/Historico";
 import Remarketing from "./pages/Remarketing";
 import GestaoTrafego from "./pages/GestaoTrafego";
-import Advocacia from "./pages/Advocacia";
+import Renegociacoes from "./pages/Renegociacoes";
 import Configuracoes from "./pages/Configuracoes";
 import Usuarios from "./pages/Usuarios";
 import Login from "./pages/Login";
@@ -59,7 +59,8 @@ const App = () => (
                   <Route path="/pdfs" element={<AppLayout><PDFs /></AppLayout>} />
                   <Route path="/historico" element={<AppLayout><Historico /></AppLayout>} />
                   <Route path="/remarketing" element={<AppLayout><Remarketing /></AppLayout>} />
-                  <Route path="/advocacia" element={<AppLayout><Advocacia /></AppLayout>} />
+                  <Route path="/renegociacoes" element={<AppLayout><Renegociacoes /></AppLayout>} />
+                  <Route path="/advocacia" element={<AppLayout><Renegociacoes /></AppLayout>} />
                   <Route path="/gestao-trafego" element={<AppLayout><GestaoTrafego /></AppLayout>} />
                   <Route path="/configuracoes" element={<AppLayout><Configuracoes /></AppLayout>} />
                   <Route path="/usuarios" element={<AppLayout><Usuarios /></AppLayout>} />

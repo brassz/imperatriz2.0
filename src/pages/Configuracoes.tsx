@@ -79,6 +79,7 @@ import {
   buildLembreteHojeMessage,
   buildLembreteMessage,
   buildLembretePagamentoMessage,
+  resolvePixInfoForMessages,
   type PixInfo,
 } from "@/lib/whatsapp-messages";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -639,7 +640,7 @@ export default function Configuracoes() {
   const [pixForm, setPixForm] = useState({
     bank_name: "",
     account_holder: "",
-    pix_key_type: "CNPJ",
+    pix_key_type: "cnpj",
     pix_key: "",
   });
   const [commDateFrom, setCommDateFrom] = useState(() => {
@@ -819,11 +820,11 @@ export default function Configuracoes() {
       | { bank: string; holder: string; key: string }
       | undefined;
     if (!pix) return null;
-    return {
+    return resolvePixInfoForMessages({
       tipo: pix.bank || "CNPJ",
       titular: pix.holder || "",
       chave: pix.key || "",
-    };
+    });
   }, [pixKeys, selectedPixId]);
 
   useEffect(() => {
@@ -2584,11 +2585,11 @@ export default function Configuracoes() {
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
-                      <SelectItem value="CPF">CPF</SelectItem>
-                      <SelectItem value="CNPJ">CNPJ</SelectItem>
-                      <SelectItem value="Email">Email</SelectItem>
-                      <SelectItem value="Telefone">Telefone</SelectItem>
-                      <SelectItem value="Aleatoria">Aleatória</SelectItem>
+                      <SelectItem value="cpf">CPF</SelectItem>
+                      <SelectItem value="cnpj">CNPJ</SelectItem>
+                      <SelectItem value="email">E-mail</SelectItem>
+                      <SelectItem value="phone">Telefone</SelectItem>
+                      <SelectItem value="random">Aleatória</SelectItem>
                     </SelectContent>
                   </Select>
                 </div>
@@ -2617,7 +2618,7 @@ export default function Configuracoes() {
                       toast.success("Chave PIX adicionada");
                       queryClient.invalidateQueries({ queryKey: ["pix-keys"] });
                       setPixModalOpen(false);
-                      setPixForm({ bank_name: "", account_holder: "", pix_key_type: "CNPJ", pix_key: "" });
+                      setPixForm({ bank_name: "", account_holder: "", pix_key_type: "cnpj", pix_key: "" });
                     } catch (e) {
                       toast.error(e instanceof Error ? e.message : "Erro ao adicionar chave PIX");
                     }

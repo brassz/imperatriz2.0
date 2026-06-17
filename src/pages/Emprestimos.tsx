@@ -73,6 +73,7 @@ import {
 } from "@/api/loan-notes-search";
 import { calculateLoanRemaining, calculateNextDueDate, type LoanRemainingResult } from "@/api/loan-calc";
 import { fetchPixKeys } from "@/api/pix-keys";
+import { fetchRenegotiatedClientIds } from "@/api/renegotiations";
 import { sendWhatsAppComprovante, sendWhatsAppMessage } from "@/api/evolution";
 import { buildCobrancaMessage, buildComprovanteMessage, buildLoanCreationNotificationMessage } from "@/lib/whatsapp-messages";
 import { createFine, fetchFinesForClient, deleteFine } from "@/api/fines";
@@ -81,7 +82,7 @@ import { fetchClientTags, createClientTag, deleteClientTag, type ClientTagRow } 
 import { fetchGuarantors, fetchEmergencyContacts } from "@/api/contacts";
 import { fetchCapitalRaises, type CapitalRaise } from "@/api/captacao";
 import { supabase } from "@/lib/supabase";
-import { useState } from "react";
+import { useState, useMemo } from "react";
 import { toast } from "sonner";
 import { jsPDF } from "jspdf";
 import { addPdfHeader, addPdfFooter, getPdfMargin, PDF_BRAND } from "@/lib/pdf-utils";
@@ -381,6 +382,19 @@ export default function Emprestimos() {
     queryFn: fetchPixKeys,
     enabled: whatsappOpen,
   });
+
+  const { data: renegotiatedClientIdList = [] } = useQuery({
+    queryKey: ["renegotiated-client-ids"],
+    queryFn: fetchRenegotiatedClientIds,
+    staleTime: 60_000,
+  });
+
+  const renegotiatedClientIds = useMemo(
+    () => new Set(renegotiatedClientIdList),
+    [renegotiatedClientIdList],
+  );
+
+  const isRenegotiatedClient = (clientId: string) => renegotiatedClientIds.has(clientId);
 
   const { data: loanFull } = useQuery({
     queryKey: ["loan-full", selectedLoan?.id],
@@ -1719,7 +1733,15 @@ export default function Emprestimos() {
                         >
                           <td className="p-4 text-sm font-medium text-foreground">
                             <div className="relative inline-flex items-center pr-20">
-                              <span className="truncate max-w-[240px]">{inst.client_name}</span>
+                              <span
+                                className={`truncate max-w-[240px] ${
+                                  isRenegotiatedClient(String(inst.client_id))
+                                    ? "text-orange-600 dark:text-orange-400"
+                                    : ""
+                                }`}
+                              >
+                                {inst.client_name}
+                              </span>
                               {(() => {
                                 const cid = String(inst.client_id || "");
                                 const score = clientScoreById[cid]?.score;
@@ -1825,7 +1847,17 @@ export default function Emprestimos() {
                           <td className="p-4 text-sm font-medium text-foreground">
                             <div className="flex flex-col gap-1 min-w-0">
                               <div className="relative inline-flex items-center pr-20 min-w-0">
-                                <span className="truncate max-w-[240px]">{String(loan.client_name)}</span>
+                                <span
+                                  className={`truncate max-w-[240px] ${
+                                    isRenegotiatedClient(
+                                      String((loan as { client_id?: string | number }).client_id || ""),
+                                    )
+                                      ? "text-orange-600 dark:text-orange-400"
+                                      : ""
+                                  }`}
+                                >
+                                  {String(loan.client_name)}
+                                </span>
                                 {(() => {
                                   const cid = String((loan as { client_id?: string | number }).client_id || "");
                                   const score = clientScoreById[cid]?.score;

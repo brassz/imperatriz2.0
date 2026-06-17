@@ -2,7 +2,7 @@ import { memo } from "react";
 import {
   LayoutDashboard, Users, Search, Landmark, CalendarCheck, CalendarDays, CreditCard,
   AlertTriangle, Wallet, Receipt, TrendingUp, History, IdCard, Sparkles,
-  BarChart3, FileText, Settings, UserCog, ChevronLeft, LogOut, Gavel
+  BarChart3, FileText, Settings, UserCog, ChevronLeft, LogOut, Handshake
 } from "lucide-react";
 import { NavLink } from "@/components/NavLink";
 import { useAuth } from "@/contexts/AuthContext";
@@ -24,7 +24,7 @@ const mainItems = [
   { title: "Multas", url: "/multas", icon: AlertTriangle },
   { title: "Histórico", url: "/historico", icon: History },
   { title: "Remarketing", url: "/remarketing", icon: Sparkles },
-  { title: "Advocacia", url: "/advocacia", icon: Gavel },
+  { title: "Renegociações", url: "/renegociacoes", icon: Handshake },
 ];
 
 const financialItems = [

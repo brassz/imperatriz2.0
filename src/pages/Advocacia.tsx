@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { motion } from "framer-motion";
 import {
@@ -53,9 +53,17 @@ import {
   generateNotificacaoExtrajudicialPdf,
   notificacaoPdfToBase64,
 } from "@/lib/notificacao-extrajudicial-pdf";
+import { interruptibleDelay } from "@/contexts/AutomationQueueContext";
 
 const CONTACT_STORAGE_KEY = "nexus_advocacia_contact_phone";
 const INSTANCE_STORAGE_KEY = "nexus_advocacia_instance";
+const DELAY_STORAGE_KEY = "nexus_advocacia_delay_seconds";
+
+function parseDelaySeconds(raw: string): number {
+  const n = parseFloat(String(raw).replace(",", "."));
+  if (!Number.isFinite(n) || n < 0) return 0;
+  return Math.round(n * 1000);
+}
 
 function formatCurrency(n: number) {
   return "R$ " + n.toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -78,9 +86,11 @@ export default function Advocacia() {
   const [instance, setInstance] = useState(() => loadStored(INSTANCE_STORAGE_KEY, ADVOCACIA_INSTANCE_IDS[0]));
   const [contactPhone, setContactPhone] = useState(() => loadStored(CONTACT_STORAGE_KEY, ""));
   const [selectedPixId, setSelectedPixId] = useState("");
-  const [delaySeconds, setDelaySeconds] = useState("3");
+  const [delaySeconds, setDelaySeconds] = useState(() => loadStored(DELAY_STORAGE_KEY, "3"));
   const [previewItem, setPreviewItem] = useState<AdvocaciaOverdueLoan | null>(null);
   const [sending, setSending] = useState(false);
+  const [sendStatus, setSendStatus] = useState("");
+  const abortRef = useRef(false);
 
   const evolutionBase = getEvolutionConfig().baseUrl;
 
@@ -143,6 +153,11 @@ export default function Advocacia() {
       contactWhatsApp: contactPhone,
     });
 
+  const waitInterval = async (delayMs: number) => {
+    if (delayMs <= 0) return;
+    await interruptibleDelay(delayMs, () => abortRef.current);
+  };
+
   const sendOne = async (item: AdvocaciaOverdueLoan, opts?: { silent?: boolean }) => {
     const phone = item.loan.client_phone?.trim();
     if (!phone) {
@@ -186,6 +201,8 @@ export default function Advocacia() {
       return false;
     }
 
+    if (abortRef.current) return false;
+
     const docRes = await sendWhatsAppDocumentWithInstance(phone, {
       base64: b64,
       fileName,
@@ -203,34 +220,71 @@ export default function Advocacia() {
     return true;
   };
 
-  const handleSendSelected = async () => {
-    const list = rows.filter((r) => selected.includes(r.id) && r.loan.client_phone?.trim());
+  const runSendQueue = async (list: AdvocaciaOverdueLoan[], opts?: { silent?: boolean }) => {
     if (list.length === 0) {
       toast.error("Selecione ao menos um cliente com telefone");
       return;
     }
-    const delay = Math.max(0, parseFloat(String(delaySeconds).replace(",", ".")) || 0) * 1000;
+    const delayMs = parseDelaySeconds(delaySeconds);
+    abortRef.current = false;
     setSending(true);
     let ok = 0;
     let fail = 0;
     try {
       for (let i = 0; i < list.length; i++) {
-        const sent = await sendOne(list[i], { silent: true });
+        if (abortRef.current) break;
+
+        const item = list[i];
+        const next = list[i + 1];
+        setSendStatus(
+          `Enviando ${i + 1}/${list.length}: ${item.loan.client_name}${
+            next ? ` — próximo: ${next.loan.client_name}` : ""
+          }`,
+        );
+
+        const sent = await sendOne(item, { silent: true });
         if (sent) ok++;
         else fail++;
-        if (i < list.length - 1 && delay > 0) {
-          await new Promise((r) => setTimeout(r, delay));
+
+        if (abortRef.current) break;
+        if (i < list.length - 1 && delayMs > 0) {
+          setSendStatus(
+            `Aguardando intervalo (${Math.round(delayMs / 1000)}s) antes de ${next.loan.client_name}…`,
+          );
+          await waitInterval(delayMs);
         }
       }
-      toast.message(`Fila concluída: ${ok} enviado(s)${fail > 0 ? `, ${fail} falha(s)` : ""}`);
+      if (!opts?.silent) {
+        toast.message(`Fila concluída: ${ok} enviado(s)${fail > 0 ? `, ${fail} falha(s)` : ""}`);
+      }
     } finally {
       setSending(false);
+      setSendStatus("");
+    }
+  };
+
+  const handleSendSelected = async () => {
+    const list = rows.filter((r) => selected.includes(r.id) && r.loan.client_phone?.trim());
+    await runSendQueue(list);
+  };
+
+  const handleSendOne = async (item: AdvocaciaOverdueLoan) => {
+    if (sending) return;
+    abortRef.current = false;
+    setSending(true);
+    setSendStatus(`Enviando: ${item.loan.client_name}`);
+    try {
+      await sendOne(item);
+    } finally {
+      setSending(false);
+      setSendStatus("");
     }
   };
 
   const savePrefs = () => {
     localStorage.setItem(CONTACT_STORAGE_KEY, contactPhone.trim());
     localStorage.setItem(INSTANCE_STORAGE_KEY, instance);
+    localStorage.setItem(DELAY_STORAGE_KEY, delaySeconds.trim() || "3");
     toast.success("Preferências salvas");
   };
 
@@ -312,6 +366,7 @@ export default function Advocacia() {
               className="mt-1 h-9 text-xs"
               type="number"
               min={0}
+              step={1}
               value={delaySeconds}
               onChange={(e) => setDelaySeconds(e.target.value)}
             />
@@ -345,6 +400,16 @@ export default function Advocacia() {
             para enviar mensagens pela instância {instance}.
           </p>
         ) : null}
+        {sendStatus ? (
+          <p className="text-xs text-muted-foreground flex items-center gap-2">
+            <Loader2 className="h-3.5 w-3.5 animate-spin shrink-0" />
+            {sendStatus}
+          </p>
+        ) : (
+          <p className="text-[10px] text-muted-foreground">
+            O intervalo vale apenas entre cada cliente na fila (texto e PDF do mesmo cliente são enviados em sequência).
+          </p>
+        )}
       </motion.div>
 
       <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.05 }} className="glass-card p-5">
@@ -442,7 +507,7 @@ export default function Advocacia() {
                           className="h-7 w-7"
                           title="Enviar"
                           disabled={sending || !item.loan.client_phone}
-                          onClick={() => void sendOne(item)}
+                          onClick={() => void handleSendOne(item)}
                         >
                           <MessageCircle className="h-3.5 w-3.5" />
                         </Button>

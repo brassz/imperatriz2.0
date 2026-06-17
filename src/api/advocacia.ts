@@ -5,8 +5,30 @@ import {
   DAILY_OVERDUE_FINE_BRL,
   listOverdueFineCalendarDates,
 } from "@/lib/loan-overdue-fine";
-import { computeLoanRemainingFromData } from "./loan-calc";
+import { computeLoanRemainingFromData, effectiveLoanPrincipal, amortizationWaterfall, type AmortizationPayment } from "./loan-calc";
 import type { LoanForMessage } from "@/lib/whatsapp-messages";
+
+export type RenegotiationDebtDetails = {
+  total_paid: number;
+  /** Empréstimo */
+  original_amount?: number;
+  loan_amount?: number;
+  interest_rate?: number;
+  loan_date?: string;
+  capital_remaining?: number;
+  interest_remaining?: number;
+  capital_paid?: number;
+  interest_paid?: number;
+  fines_paid?: number;
+  /** Parcelamento */
+  total_installments?: number;
+  installment_amount?: number;
+  first_due_date?: string;
+  paid_installments?: number;
+  pending_installments?: number;
+  pending_amount?: number;
+  linked_loan_id?: string | null;
+};
 
 export type AdvocaciaOverdueLoan = {
   id: string;
@@ -14,6 +36,7 @@ export type AdvocaciaOverdueLoan = {
   loan: LoanForMessage;
   days_overdue: number;
   source: "loan" | "installment";
+  details: RenegotiationDebtDetails;
 };
 
 function daysBetweenYmd(fromYmd: string, toYmd: string): number {
@@ -25,15 +48,49 @@ function daysBetweenYmd(fromYmd: string, toYmd: string): number {
   return Math.floor((b - a) / 86_400_000);
 }
 
+function buildLoanPaymentDetails(
+  row: Record<string, unknown>,
+  payments: Array<{ amount: unknown; payment_type?: unknown; fine_amount?: unknown }>,
+  rem: { capital: number; interestAmount: number; totalAmount: number },
+): RenegotiationDebtDetails {
+  const originalCapital = effectiveLoanPrincipal({
+    original_amount: row.original_amount,
+    amount: row.amount,
+  });
+  const interestRate = parseFloat(String(row.interest_rate || 0));
+  const rows: AmortizationPayment[] = payments.map((p) => ({
+    amount: parseFloat(String(p.amount || 0)),
+    payment_type: String(p.payment_type || ""),
+    fine_amount: parseFloat(String(p.fine_amount || 0)),
+  }));
+  const w = amortizationWaterfall(originalCapital, interestRate, rows);
+  const finesPaid = rows.reduce((s, p) => s + (p.fine_amount || 0), 0);
+  const paymentsSum = rows.filter((p) => p.amount > 0).reduce((s, p) => s + p.amount, 0);
+
+  return {
+    total_paid: paymentsSum + finesPaid,
+    original_amount: originalCapital,
+    loan_amount: parseFloat(String(row.amount || 0)),
+    interest_rate: interestRate,
+    loan_date: String(row.loan_date || "").split("T")[0],
+    capital_remaining: rem.capital,
+    interest_remaining: rem.interestAmount,
+    capital_paid: w.capitalPaid,
+    interest_paid: w.interestPaid,
+    fines_paid: finesPaid,
+  };
+}
+
 function buildLoanRow(
   row: Record<string, unknown>,
   client: { name: string; phone: string },
   paymentsByLoan: Record<string, Array<{ amount: unknown; payment_type?: unknown; fine_amount?: unknown }>>,
   waiverByLoan: Map<string, Set<string>>,
   today: string,
-): LoanForMessage {
+): { loan: LoanForMessage; details: RenegotiationDebtDetails } {
   const id = String(row.id);
   const due = String(row.due_date || "").split("T")[0];
+  const loanPayments = paymentsByLoan[id] || [];
 
   let rem: { capital: number; interestAmount: number; totalAmount: number; minimumPayment: number };
   try {
@@ -62,18 +119,21 @@ function buildLoanRow(
   const fine = overdueDates.length > 0 ? computeOverdueDailyFineBrl(overdueDates, waived) : 0;
 
   return {
-    client_name: client.name,
-    client_phone: client.phone,
-    amount: rem.totalAmount + fine,
-    capital: rem.capital,
-    interest: rem.interestAmount,
-    fine,
-    due_date: due,
-    minimumPayment: rem.minimumPayment,
+    loan: {
+      client_name: client.name,
+      client_phone: client.phone,
+      amount: rem.totalAmount + fine,
+      capital: rem.capital,
+      interest: rem.interestAmount,
+      fine,
+      due_date: due,
+      minimumPayment: rem.minimumPayment,
+    },
+    details: buildLoanPaymentDetails(row, loanPayments, rem),
   };
 }
 
-/** Empréstimos vencidos há mais de 30 dias (exclui exatamente 30). */
+/** Empréstimos e parcelamentos vencidos há mais de N dias (padrão 30; Renegociações usa 60). */
 export async function fetchAdvocaciaOverdueLoans(options?: {
   requirePhone?: boolean;
   minDaysOverdue?: number;
@@ -85,7 +145,7 @@ export async function fetchAdvocaciaOverdueLoans(options?: {
 
   const { data: loans, error } = await supabase
     .from("loans")
-    .select("id, client_id, amount, interest_rate, due_date, status, original_amount")
+    .select("id, client_id, amount, interest_rate, due_date, loan_date, status, original_amount")
     .in("status", ["active", "overdue", "partial_paid"])
     .lt("due_date", maxDueDate)
     .order("due_date", { ascending: true });
@@ -161,10 +221,13 @@ export async function fetchAdvocaciaOverdueLoans(options?: {
     const daysOverdue = daysBetweenYmd(due, today);
     if (daysOverdue <= minDays) continue;
 
+    const built = buildLoanRow(r, client, paymentsByLoan, waiverByLoan, today);
+
     result.push({
       id: String(r.id),
       client_id: String(r.client_id || ""),
-      loan: buildLoanRow(r, client, paymentsByLoan, waiverByLoan, today),
+      loan: built.loan,
+      details: built.details,
       days_overdue: daysOverdue,
       source: "loan",
     });
@@ -176,8 +239,13 @@ export async function fetchAdvocaciaOverdueLoans(options?: {
       `
       id,
       client_id,
+      total_amount,
+      total_installments,
+      installment_amount,
+      first_due_date,
+      loan_id,
       clients (name, phone),
-      installment_payments (id, status, due_date, amount)
+      installment_payments (id, status, due_date, amount, paid_amount)
     `,
     )
     .eq("status", "active");
@@ -204,8 +272,24 @@ export async function fetchAdvocaciaOverdueLoans(options?: {
     if (requirePhone && !clientPhone) continue;
 
     const amt = parseFloat(String(next.amount || 0));
-    const instOverdue = due < today ? listOverdueFineCalendarDates(due, today) : [];
-    const instFine = instOverdue.length > 0 ? instOverdue.length * DAILY_OVERDUE_FINE_BRL : 0;
+    const totalContract = parseFloat(String(inst.total_amount || 0));
+    const pendingSum = pending.reduce((sum, p) => sum + parseFloat(String(p.amount || 0)), 0);
+    const paidRows = payments.filter((p) => {
+      const st = String(p.status || "");
+      return st === "paid" || st === "partial";
+    });
+    const totalPaidInstallments = paidRows.reduce(
+      (sum, p) => sum + parseFloat(String(p.paid_amount ?? p.amount ?? 0)),
+      0,
+    );
+    let instFine = 0;
+    for (const p of pending) {
+      const pDue = String(p.due_date || "").split("T")[0];
+      if (pDue && pDue < today) {
+        instFine +=
+          listOverdueFineCalendarDates(pDue, today).length * DAILY_OVERDUE_FINE_BRL;
+      }
+    }
 
     const instId = String(inst.id || "");
     const payId = String(next.id || "");
@@ -216,12 +300,22 @@ export async function fetchAdvocaciaOverdueLoans(options?: {
       loan: {
         client_name: clientName,
         client_phone: clientPhone,
-        amount: amt + instFine,
-        capital: amt,
+        amount: pendingSum + instFine,
+        capital: totalContract > 0 ? totalContract : pendingSum,
         interest: 0,
         fine: instFine,
         due_date: due,
         minimumPayment: amt,
+      },
+      details: {
+        total_paid: totalPaidInstallments,
+        total_installments: Number(inst.total_installments || 0),
+        installment_amount: parseFloat(String(inst.installment_amount || 0)),
+        first_due_date: String(inst.first_due_date || "").split("T")[0],
+        paid_installments: paidRows.length,
+        pending_installments: pending.length,
+        pending_amount: pendingSum,
+        linked_loan_id: inst.loan_id ? String(inst.loan_id) : null,
       },
       days_overdue: daysOverdue,
       source: "installment",

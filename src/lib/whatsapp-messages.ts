@@ -12,6 +12,19 @@ export type PixInfo = {
   chave: string;
 };
 
+/** Titular exibido nas mensagens de cobrança da NOVIX CRED (empresa1). */
+export const NOVIX_PIX_TITULAR = "RESOLVA SOLUCOES ASSESSORIA E CONSULTORIA LTDA";
+
+export function resolvePixTitularForMessages(titular: string): string {
+  if (getSupabaseCompany() === "empresa1") return NOVIX_PIX_TITULAR;
+  return titular;
+}
+
+export function resolvePixInfoForMessages(pix: PixInfo): PixInfo {
+  const titular = resolvePixTitularForMessages(pix.titular);
+  return titular === pix.titular ? pix : { ...pix, titular };
+}
+
 export type LoanForMessage = {
   client_name: string;
   client_phone: string;
@@ -50,6 +63,7 @@ export function buildCobrancaMessage(
   pix: PixInfo,
   multaDiaria = 50
 ): string {
+  const p = resolvePixInfoForMessages(pix);
   const title = getMessageBrandTitle();
   const venc = formatDateBr(loan.due_date);
   const valor = formatCurrency(loan.amount);
@@ -63,9 +77,9 @@ export function buildCobrancaMessage(
 Cliente: ${loan.client_name}
 Valor: ${valor} (Cap.: ${cap} • Aluguel: ${juros} • Multa: ${multa})
 
-💳 PIX – ${pix.tipo}
-Titular: ${pix.titular}
-Chave: ${pix.chave}
+💳 PIX – ${p.tipo}
+Titular: ${p.titular}
+Chave: ${p.chave}
 
 ⚠️ Após vencimento: multa diária R$ ${multaDiaria}. Enviar comprovante (obrigatório se pago em outra titularidade).`;
 }
@@ -78,6 +92,7 @@ export function buildCobrancaParcelamentoMessage(
   pix: PixInfo,
   multaDiaria = 50,
 ): string {
+  const p = resolvePixInfoForMessages(pix);
   const title = getMessageBrandTitle();
   const venc = formatDateBr(loan.due_date);
   const valor = formatCurrency(loan.amount);
@@ -90,15 +105,16 @@ export function buildCobrancaParcelamentoMessage(
 Cliente: ${loan.client_name}
 Valor: ${valor} (Parcela: ${parcela} • Multa: ${multa})
 
-💳 PIX – ${pix.tipo}
-Titular: ${pix.titular}
-Chave: ${pix.chave}
+💳 PIX – ${p.tipo}
+Titular: ${p.titular}
+Chave: ${p.chave}
 
 ⚠️ Após vencimento: multa diária R$ ${multaDiaria}. Enviar comprovante (obrigatório se pago em outra titularidade).`;
 }
 
 /** Mensagem de LEMBRETE (vence hoje) */
 export function buildLembreteHojeMessage(loan: LoanForMessage, pix: PixInfo): string {
+  const p = resolvePixInfoForMessages(pix);
   const title = getMessageBrandTitle();
   const venc = formatDateBr(loan.due_date);
   const valor = formatCurrency(loan.amount);
@@ -115,9 +131,9 @@ Cliente: ${loan.client_name}
 💳 Pagamento mínimo: ${minimo}
 
 💳 PIX
-* Banco: ${pix.tipo}
-* Titular: ${pix.titular}
-* Chave: ${pix.chave}`;
+* Banco: ${p.tipo}
+* Titular: ${p.titular}
+* Chave: ${p.chave}`;
 }
 
 export type ComprovanteScoreInfo = {
@@ -228,6 +244,7 @@ export function buildLembretePagamentoMessage(
   pix: PixInfo,
   _daysUntilDue = 1,
 ): string {
+  const p = resolvePixInfoForMessages(pix);
   const title = getMessageBrandTitle();
   const venc = formatDateBr(loan.due_date);
   const valor = formatCurrency(loan.amount);
@@ -245,9 +262,9 @@ Cliente: ${loan.client_name}
 💵 Valor da parcela: ${valor}
 
 💳 PIX
-* Banco: ${pix.tipo}
-* Titular: ${pix.titular}
-* Chave: ${pix.chave}
+* Banco: ${p.tipo}
+* Titular: ${p.titular}
+* Chave: ${p.chave}
 
 Por favor, organize o pagamento até a data de vencimento.`;
   }
@@ -262,9 +279,9 @@ Cliente: ${loan.client_name}
 💳 Pagamento mínimo: ${minimo}
 
 💳 PIX
-* Banco: ${pix.tipo}
-* Titular: ${pix.titular}
-* Chave: ${pix.chave}
+* Banco: ${p.tipo}
+* Titular: ${p.titular}
+* Chave: ${p.chave}
 
 Por favor, organize o pagamento até a data de vencimento.`;
 }
