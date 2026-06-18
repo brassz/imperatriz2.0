@@ -58,3 +58,27 @@ Para negociação imediata, entre em contato pelo WhatsApp ${contato}.
 ${CAPITAL_ADVOCACIA_NAME}
 Departamento de Recuperação de Crédito.`;
 }
+
+export type ProtestWarningMessageParams = {
+  clientName: string;
+  creditorName?: string;
+  contactWhatsApp: string;
+  deadline: string;
+};
+
+/** Aviso de protesto para clientes que ainda não entraram em contato. */
+export function buildProtestWarningWhatsAppMessage(p: ProtestWarningMessageParams): string {
+  const credor = p.creditorName?.trim() || getCreditorCompanyName();
+  const nome = p.clientName.trim() || "Cliente";
+  const contato = p.contactWhatsApp.trim() || "(informar contato)";
+  const prazo = p.deadline.trim() || "(informar data)";
+
+  return `Prezado(a) Sr(a). ${nome},
+
+A *${CAPITAL_ADVOCACIA_NAME}*, em nome de ${credor}, informa que, caso *não haja manifestação ou contato* até o dia *${prazo}*, será dada entrada no *protesto* do débito, juntamente ao *Cartório de São Paulo*.
+
+Caso tenha interesse em *regularizar ou renegociar* a pendência, responda esta mensagem ou entre em contato pelo WhatsApp *${contato}* antes do prazo informado.
+
+${CAPITAL_ADVOCACIA_NAME}
+Departamento de Renegociação.`;
+}

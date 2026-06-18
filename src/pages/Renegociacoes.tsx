@@ -13,6 +13,10 @@ import {
   List,
   PlusCircle,
   Eye,
+  Send,
+  AlertTriangle,
+  MessageCircle,
+  Gavel,
 } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
@@ -33,14 +37,17 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { ScrollArea } from "@/components/ui/scroll-area";
 import { fetchAdvocaciaOverdueLoans, type AdvocaciaOverdueLoan } from "@/api/advocacia";
+import { fetchPixKeys } from "@/api/pix-keys";
 import {
   buildRenegotiationWhatsAppMessage,
   convertRenegotiationToLoan,
   fetchRenegotiationProposals,
   finalizeRenegotiationProposal,
   saveRenegotiationProposal,
+  formatRenegotiationDraftDeadline,
+  isDraftProposalExpired,
+  RENEGOTIATION_DRAFT_VALIDITY_DAYS,
   type RenegotiationProposal,
 } from "@/api/renegotiations";
 import {
@@ -53,7 +60,12 @@ import {
   getApiKeyForEvolutionInstance,
   getEvolutionConfig,
 } from "@/lib/evolution-settings";
-import { getCreditorCompanyName } from "@/lib/advocacia-messages";
+import { getCreditorCompanyName, buildProtestWarningWhatsAppMessage } from "@/lib/advocacia-messages";
+import {
+  buildExtrajudicialPackage,
+  sendExtrajudicialNotification,
+} from "@/lib/advocacia-extrajudicial-send";
+import { interruptibleDelay } from "@/contexts/AutomationQueueContext";
 import {
   calcRenegotiationProposal,
   renegotiationAgreementTotal,
@@ -63,10 +75,21 @@ import {
 import {
   generatePropostaRenegociacaoPdf,
   propostaRenegociacaoPdfToBase64,
+  type PropostaRenegociacaoParams,
 } from "@/lib/proposta-renegociacao-pdf";
+import { addCalendarDays, calendarDateInBrazil } from "@/lib/brazil-date";
 
 const CONTACT_STORAGE_KEY = "nexus_renegociacoes_contact_phone";
 const INSTANCE_STORAGE_KEY = "nexus_renegociacoes_instance";
+const DELAY_STORAGE_KEY = "nexus_renegociacoes_delay_seconds";
+const PROTEST_DEADLINE_STORAGE_KEY = "nexus_renegociacoes_protest_deadline";
+const PIX_STORAGE_KEY = "nexus_renegociacoes_pix_id";
+
+function parseDelayMinutes(raw: string): number {
+  const n = parseFloat(String(raw).replace(",", "."));
+  if (!Number.isFinite(n) || n < 0) return 0;
+  return n;
+}
 
 function formatCurrency(n: number) {
   return "R$ " + n.toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -83,14 +106,69 @@ function loadStored(key: string, fallback: string) {
   return localStorage.getItem(key) || fallback;
 }
 
-function proposalStatusLabel(status: RenegotiationProposal["status"]) {
-  if (status === "finalized") return "Finalizada";
-  if (status === "converted") return "Em empréstimos";
-  return "Rascunho";
+function proposalStatusLabel(proposal: RenegotiationProposal) {
+  if (proposal.status === "finalized") return "Finalizada";
+  if (proposal.status === "converted") return "Em empréstimos";
+  if (isDraftProposalExpired(proposal)) return "Rascunho expirado";
+  return `Rascunho até ${formatRenegotiationDraftDeadline(proposal.created_at)}`;
 }
 
 function renegotiationBaseLabel(source: AdvocaciaOverdueLoan["source"]) {
   return source === "installment" ? "Valor total" : "Capital";
+}
+
+function buildProposalPackage(
+  item: AdvocaciaOverdueLoan,
+  calc: NonNullable<ReturnType<typeof calcRenegotiationProposal>>,
+  mode: RenegotiationMode,
+  contactPhone: string,
+  preview: boolean,
+  downPaymentDueDate?: string,
+  draftValidUntil?: string,
+) {
+  const creditor = getCreditorCompanyName();
+  const debtDescription =
+    item.source === "installment" ? "parcelamento de dívida" : "contrato de empréstimo pessoal";
+  const entradaDueLabel =
+    mode === "parcelado_entrada" && downPaymentDueDate ? formatDate(downPaymentDueDate) : "";
+  const pdfParams: PropostaRenegociacaoParams = {
+    clientName: item.loan.client_name,
+    creditorName: creditor,
+    debtDescription,
+    originalDueDate: item.loan.due_date,
+    calc,
+    mode,
+    contactPhone: contactPhone.trim(),
+    preview,
+    downPaymentDueDate: entradaDueLabel || undefined,
+    draftValidUntil: preview ? draftValidUntil : undefined,
+  };
+  const text = buildRenegotiationWhatsAppMessage({
+    clientName: item.loan.client_name,
+    creditorName: creditor,
+    calc,
+    mode,
+    contactPhone: contactPhone.trim(),
+    preview,
+    downPaymentDueDate: entradaDueLabel || undefined,
+    draftValidUntil: preview ? draftValidUntil : undefined,
+  });
+  const pdf = generatePropostaRenegociacaoPdf(pdfParams);
+  const slug = item.loan.client_name.replace(/\s+/g, "-").slice(0, 40);
+  const fileName = preview
+    ? `previa-proposta-renegociacao-${slug}.pdf`
+    : `proposta-renegociacao-${slug}.pdf`;
+  return {
+    creditor,
+    debtDescription,
+    text,
+    pdf,
+    b64: propostaRenegociacaoPdfToBase64(pdf),
+    fileName,
+    caption: preview
+      ? "Prévia da proposta de renegociação — Capital Advocacia"
+      : "Proposta de renegociação — Capital Advocacia",
+  };
 }
 
 function DebtDetailsPanel({ item }: { item: AdvocaciaOverdueLoan }) {
@@ -155,11 +233,26 @@ export default function Renegociacoes() {
   const [mode, setMode] = useState<RenegotiationMode>("avista");
   const [discountPercent, setDiscountPercent] = useState("20");
   const [downPayment, setDownPayment] = useState("");
+  const [downPaymentDueDate, setDownPaymentDueDate] = useState("");
   const [installmentCount, setInstallmentCount] = useState("3");
   const [installmentAmount, setInstallmentAmount] = useState("");
   const [installmentAmountManual, setInstallmentAmountManual] = useState(false);
+  const [previewOpen, setPreviewOpen] = useState(false);
+  const [protestPreviewOpen, setProtestPreviewOpen] = useState(false);
+  const [protestDeadlineDate, setProtestDeadlineDate] = useState(() =>
+    loadStored(PROTEST_DEADLINE_STORAGE_KEY, ""),
+  );
+  const [selectedPixId, setSelectedPixId] = useState(() => loadStored(PIX_STORAGE_KEY, ""));
+  const [extrajudicialPreviewItem, setExtrajudicialPreviewItem] = useState<AdvocaciaOverdueLoan | null>(null);
+  const [extrajudicialBulkPreviewOpen, setExtrajudicialBulkPreviewOpen] = useState(false);
+  const [delayMinutes, setDelayMinutes] = useState(() => loadStored(DELAY_STORAGE_KEY, "1"));
   const [saving, setSaving] = useState(false);
-  const abortRef = useRef(false);
+  const [sendingProtest, setSendingProtest] = useState(false);
+  const [sendingExtrajudicial, setSendingExtrajudicial] = useState(false);
+  const [protestSendStatus, setProtestSendStatus] = useState("");
+  const [extrajudicialSendStatus, setExtrajudicialSendStatus] = useState("");
+  const abortProtestRef = useRef(false);
+  const abortExtrajudicialRef = useRef(false);
 
   const evolutionBase = getEvolutionConfig().baseUrl;
   const apiKey = getApiKeyForEvolutionInstance(instance);
@@ -175,6 +268,27 @@ export default function Renegociacoes() {
     queryFn: fetchRenegotiationProposals,
     staleTime: 30_000,
   });
+
+  const { data: pixKeys = [] } = useQuery({
+    queryKey: ["pix-keys"],
+    queryFn: fetchPixKeys,
+  });
+
+  const selectedPix = useMemo(() => {
+    const p = (pixKeys as Array<Record<string, unknown>>).find((x) => String(x.id) === selectedPixId);
+    if (!p) return null;
+    return {
+      bank: String(p.bank || "PIX"),
+      holder: String(p.holder || ""),
+      key: String(p.key || ""),
+    };
+  }, [pixKeys, selectedPixId]);
+
+  useEffect(() => {
+    if (selectedPixId || !(pixKeys as Array<Record<string, unknown>>).length) return;
+    const firstId = String((pixKeys as Array<Record<string, unknown>>)[0].id || "");
+    if (firstId) setSelectedPixId(firstId);
+  }, [pixKeys, selectedPixId]);
 
   const { data: connectionState } = useQuery({
     queryKey: ["renegociacoes-connection", instance],
@@ -215,6 +329,41 @@ export default function Renegociacoes() {
         r.loan.client_phone.toLowerCase().includes(q),
     );
   }, [rows, search]);
+
+  const clientsWithoutContact = useMemo(() => {
+    return filtered.filter((item) => {
+      const prop = proposalByDebt.get(item.id);
+      if (prop?.status === "finalized" || prop?.status === "converted") return false;
+      return !!item.loan.client_phone?.trim();
+    });
+  }, [filtered, proposalByDebt]);
+
+  const clientsForExtrajudicial = useMemo(
+    () => filtered.filter((item) => !!item.loan.client_phone?.trim()),
+    [filtered],
+  );
+
+  const sampleExtrajudicialMessage = useMemo(() => {
+    const sample = clientsForExtrajudicial[0];
+    if (!sample || !selectedPix?.key) return "";
+    return buildExtrajudicialPackage(sample, contactPhone, selectedPix).text;
+  }, [clientsForExtrajudicial, contactPhone, selectedPix]);
+
+  const protestDeadlineLabel = useMemo(
+    () => (protestDeadlineDate ? formatDate(protestDeadlineDate) : ""),
+    [protestDeadlineDate],
+  );
+
+  const sampleProtestMessage = useMemo(() => {
+    const sample = clientsWithoutContact[0] || filtered[0];
+    if (!sample || !protestDeadlineLabel) return "";
+    return buildProtestWarningWhatsAppMessage({
+      clientName: sample.loan.client_name,
+      creditorName: getCreditorCompanyName(),
+      contactWhatsApp: contactPhone,
+      deadline: protestDeadlineLabel,
+    });
+  }, [clientsWithoutContact, filtered, contactPhone, protestDeadlineLabel]);
 
   const autoCalc = useMemo(() => {
     if (!proposalItem) return null;
@@ -258,12 +407,46 @@ export default function Renegociacoes() {
     };
   }, [autoCalc, installmentAmount]);
 
+  const currentDraftProposal = useMemo(() => {
+    if (!proposalItem) return null;
+    return proposalByDebt.get(proposalItem.id) ?? null;
+  }, [proposalItem, proposalByDebt]);
+
+  const draftDeadlineLabel = useMemo(() => {
+    if (!proposalItem) return "";
+    const base = currentDraftProposal?.created_at || new Date().toISOString();
+    return formatRenegotiationDraftDeadline(base);
+  }, [proposalItem, currentDraftProposal]);
+
+  const isCurrentDraftExpired = useMemo(
+    () => (currentDraftProposal ? isDraftProposalExpired(currentDraftProposal) : false),
+    [currentDraftProposal],
+  );
+
+  const previewPackage = useMemo(() => {
+    if (!proposalItem || !calc) return null;
+    return buildProposalPackage(
+      proposalItem,
+      calc,
+      mode,
+      contactPhone,
+      true,
+      downPaymentDueDate,
+      draftDeadlineLabel,
+    );
+  }, [proposalItem, calc, mode, contactPhone, downPaymentDueDate, draftDeadlineLabel]);
+
   const openProposal = (item: AdvocaciaOverdueLoan) => {
     const existing = proposalByDebt.get(item.id);
     setProposalItem(item);
     setMode(existing?.proposal_mode || "avista");
     setDiscountPercent(String(existing?.discount_percent ?? 20));
     setDownPayment(existing?.down_payment ? String(existing.down_payment) : "");
+    const proposalMode = existing?.proposal_mode || "avista";
+    setDownPaymentDueDate(
+      existing?.down_payment_due_date ||
+        (proposalMode === "parcelado_entrada" ? addCalendarDays(calendarDateInBrazil(), 7) : ""),
+    );
     setInstallmentCount(String(existing?.installment_count || 3));
     if (existing?.installment_count && existing.installment_amount > 0) {
       setInstallmentAmount(String(existing.installment_amount));
@@ -276,9 +459,11 @@ export default function Renegociacoes() {
 
   const resetProposalDialog = () => {
     setProposalItem(null);
+    setPreviewOpen(false);
     setMode("avista");
     setDiscountPercent("20");
     setDownPayment("");
+    setDownPaymentDueDate("");
     setInstallmentCount("3");
     setInstallmentAmount("");
     setInstallmentAmountManual(false);
@@ -287,14 +472,200 @@ export default function Renegociacoes() {
   const savePrefs = () => {
     localStorage.setItem(CONTACT_STORAGE_KEY, contactPhone.trim());
     localStorage.setItem(INSTANCE_STORAGE_KEY, instance);
+    localStorage.setItem(DELAY_STORAGE_KEY, delayMinutes.trim() || "1");
+    localStorage.setItem(PROTEST_DEADLINE_STORAGE_KEY, protestDeadlineDate);
+    localStorage.setItem(PIX_STORAGE_KEY, selectedPixId);
     toast.success("Preferências salvas");
   };
 
-  const finalizeAndSend = async () => {
+  const openProtestPreview = () => {
+    if (!protestDeadlineDate) {
+      toast.error("Selecione a data limite para o aviso de protesto");
+      return;
+    }
+    setProtestPreviewOpen(true);
+  };
+
+  const validateProposalSend = (): string | null => {
+    if (!proposalItem || !calc) return "Monte a proposta antes de enviar";
+    if (mode === "parcelado_entrada" && !downPaymentDueDate) {
+      return "Informe a data limite para pagamento da entrada";
+    }
+    if (!proposalItem.loan.client_phone?.trim()) return "Cliente sem telefone cadastrado";
+    if (!contactPhone.trim()) return "Informe o WhatsApp da Capital Advocacia";
+    if (!apiKey) return `Configure a API key da instância ${instance}`;
+    return null;
+  };
+
+  const openPdfPreview = () => {
+    if (!previewPackage) return;
+    const blob = previewPackage.pdf.output("blob");
+    const url = URL.createObjectURL(blob);
+    window.open(url, "_blank", "noopener,noreferrer");
+    setTimeout(() => URL.revokeObjectURL(url), 120_000);
+  };
+
+  const sendProposal = async (opts: { finalize: boolean; preview: boolean }) => {
     if (!proposalItem || !calc) return;
-    const phone = proposalItem.loan.client_phone?.trim();
-    if (!phone) {
-      toast.error("Cliente sem telefone cadastrado");
+    const validationError = validateProposalSend();
+    if (validationError) {
+      toast.error(validationError);
+      return;
+    }
+
+    const phone = proposalItem.loan.client_phone!.trim();
+    const existing = proposalByDebt.get(proposalItem.id);
+
+    setSaving(true);
+    try {
+      const saved = await saveRenegotiationProposal({
+        id: existing?.id,
+        client_id: proposalItem.client_id,
+        debt_ref: proposalItem.id,
+        source_type: proposalItem.source,
+        client_name: proposalItem.loan.client_name,
+        client_phone: phone,
+        proposal_mode: mode,
+        base_capital: calc.baseCapital,
+        discount_percent: calc.discountPercent,
+        total_amount: calc.totalAmount,
+        down_payment: calc.downPayment,
+        down_payment_due_date: mode === "parcelado_entrada" ? downPaymentDueDate || null : null,
+        installment_count: calc.installmentCount,
+        installment_amount: calc.installmentAmount,
+        status: "draft",
+      });
+
+      const pkg = buildProposalPackage(
+        proposalItem,
+        calc,
+        mode,
+        contactPhone,
+        opts.preview,
+        downPaymentDueDate,
+        opts.preview ? formatRenegotiationDraftDeadline(saved.created_at) : undefined,
+      );
+
+      const textRes = await sendWhatsAppTextWithInstance(phone, pkg.text, {
+        instance,
+        apiKey,
+        baseUrl: evolutionBase,
+      });
+      if (!textRes.ok) {
+        toast.error(textRes.error || "Falha ao enviar mensagem");
+        return;
+      }
+
+      const docRes = await sendWhatsAppDocumentWithInstance(phone, {
+        base64: pkg.b64,
+        fileName: pkg.fileName,
+        caption: pkg.caption,
+        instance,
+        apiKey,
+        baseUrl: evolutionBase,
+      });
+      if (!docRes.ok) {
+        toast.error(docRes.error || "Mensagem enviada, mas falha ao enviar PDF");
+        return;
+      }
+
+      await queryClient.invalidateQueries({ queryKey: ["renegotiation-proposals"] });
+
+      if (opts.finalize) {
+        await finalizeRenegotiationProposal(saved.id);
+        await queryClient.invalidateQueries({ queryKey: ["renegotiated-client-ids"] });
+        toast.success(`Proposta finalizada e enviada para ${proposalItem.loan.client_name}`);
+        resetProposalDialog();
+      } else {
+        toast.success(
+          opts.preview
+            ? `Prévia enviada para ${proposalItem.loan.client_name} (rascunho salvo)`
+            : `Proposta enviada para ${proposalItem.loan.client_name}`,
+        );
+        setPreviewOpen(false);
+      }
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "Erro ao enviar proposta");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const finalizeAndSend = () => sendProposal({ finalize: true, preview: false });
+
+  const extrajudicialPreviewPackage = useMemo(() => {
+    if (!extrajudicialPreviewItem || !selectedPix?.key) return null;
+    return buildExtrajudicialPackage(extrajudicialPreviewItem, contactPhone, selectedPix);
+  }, [extrajudicialPreviewItem, contactPhone, selectedPix]);
+
+  const openExtrajudicialPdfPreview = () => {
+    if (!extrajudicialPreviewPackage) return;
+    const blob = extrajudicialPreviewPackage.pdf.output("blob");
+    const url = URL.createObjectURL(blob);
+    window.open(url, "_blank", "noopener,noreferrer");
+    setTimeout(() => URL.revokeObjectURL(url), 120_000);
+  };
+
+  const handleSendExtrajudicial = async (
+    item: AdvocaciaOverdueLoan,
+    opts?: { silent?: boolean },
+  ): Promise<boolean> => {
+    if (!selectedPix?.key) {
+      if (!opts?.silent) toast.error("Selecione uma chave PIX");
+      return false;
+    }
+    if (!contactPhone.trim()) {
+      if (!opts?.silent) toast.error("Informe o WhatsApp da Capital Advocacia");
+      return false;
+    }
+    if (!apiKey) {
+      if (!opts?.silent) toast.error(`Configure a API key da instância ${instance}`);
+      return false;
+    }
+
+    const result = await sendExtrajudicialNotification({
+      item,
+      contactPhone,
+      pix: selectedPix,
+      instance,
+      apiKey,
+      baseUrl: evolutionBase,
+    });
+    if (!result.ok) {
+      if (!opts?.silent) toast.error(result.error);
+      return false;
+    }
+    if (!opts?.silent) {
+      toast.success(`Notificação extrajudicial enviada para ${item.loan.client_name}`);
+      setExtrajudicialPreviewItem(null);
+    }
+    return true;
+  };
+
+  const openExtrajudicialBulkPreview = () => {
+    if (!selectedPix?.key) {
+      toast.error("Selecione uma chave PIX");
+      return;
+    }
+    if (!contactPhone.trim()) {
+      toast.error("Informe o WhatsApp da Capital Advocacia");
+      return;
+    }
+    if (clientsForExtrajudicial.length === 0) {
+      toast.error("Nenhum cliente com telefone na lista");
+      return;
+    }
+    setExtrajudicialBulkPreviewOpen(true);
+  };
+
+  const runExtrajudicialQueue = async () => {
+    const list = clientsForExtrajudicial;
+    if (list.length === 0) {
+      toast.error("Nenhum cliente com telefone na lista");
+      return;
+    }
+    if (!selectedPix?.key) {
+      toast.error("Selecione uma chave PIX");
       return;
     }
     if (!contactPhone.trim()) {
@@ -306,81 +677,134 @@ export default function Renegociacoes() {
       return;
     }
 
-    setSaving(true);
-    abortRef.current = false;
+    const delayMs = parseDelayMinutes(delayMinutes) * 60 * 1000;
+    abortExtrajudicialRef.current = false;
+    setSendingExtrajudicial(true);
+    let ok = 0;
+    let fail = 0;
+
     try {
-      const saved = await saveRenegotiationProposal({
-        client_id: proposalItem.client_id,
-        debt_ref: proposalItem.id,
-        source_type: proposalItem.source,
-        client_name: proposalItem.loan.client_name,
-        client_phone: phone,
-        proposal_mode: mode,
-        base_capital: calc.baseCapital,
-        discount_percent: calc.discountPercent,
-        total_amount: calc.totalAmount,
-        down_payment: calc.downPayment,
-        installment_count: calc.installmentCount,
-        installment_amount: calc.installmentAmount,
-        status: "draft",
-      });
+      for (let i = 0; i < list.length; i++) {
+        if (abortExtrajudicialRef.current) break;
 
-      const creditor = getCreditorCompanyName();
-      const debtDescription =
-        proposalItem.source === "installment" ? "parcelamento de dívida" : "contrato de empréstimo pessoal";
+        const item = list[i];
+        const next = list[i + 1];
+        setExtrajudicialSendStatus(
+          `Enviando extrajudicial ${i + 1}/${list.length}: ${item.loan.client_name}${
+            next ? ` — próximo: ${next.loan.client_name}` : ""
+          }`,
+        );
 
-      const text = buildRenegotiationWhatsAppMessage({
-        clientName: proposalItem.loan.client_name,
-        creditorName: creditor,
-        calc,
-        mode,
-        contactPhone: contactPhone.trim(),
-      });
+        const sent = await handleSendExtrajudicial(item, { silent: true });
+        if (sent) ok++;
+        else fail++;
 
-      const pdf = generatePropostaRenegociacaoPdf({
-        clientName: proposalItem.loan.client_name,
-        creditorName: creditor,
-        debtDescription,
-        originalDueDate: proposalItem.loan.due_date,
-        calc,
-        mode,
-        contactPhone: contactPhone.trim(),
-      });
-      const b64 = propostaRenegociacaoPdfToBase64(pdf);
-      const fileName = `proposta-renegociacao-${proposalItem.loan.client_name.replace(/\s+/g, "-").slice(0, 40)}.pdf`;
-
-      const textRes = await sendWhatsAppTextWithInstance(phone, text, {
-        instance,
-        apiKey,
-        baseUrl: evolutionBase,
-      });
-      if (!textRes.ok) {
-        toast.error(textRes.error || "Falha ao enviar mensagem");
-        return;
+        if (abortExtrajudicialRef.current) break;
+        if (i < list.length - 1 && delayMs > 0) {
+          setExtrajudicialSendStatus(
+            `Aguardando intervalo (${parseDelayMinutes(delayMinutes)} min) antes de ${next!.loan.client_name}…`,
+          );
+          await interruptibleDelay(delayMs, () => abortExtrajudicialRef.current);
+        }
       }
-
-      const docRes = await sendWhatsAppDocumentWithInstance(phone, {
-        base64: b64,
-        fileName,
-        caption: "Proposta de renegociação — Capital Advocacia",
-        instance,
-        apiKey,
-        baseUrl: evolutionBase,
-      });
-      if (!docRes.ok) {
-        toast.error(docRes.error || "Mensagem enviada, mas falha ao enviar PDF");
-        return;
-      }
-
-      await finalizeRenegotiationProposal(saved.id);
-      await queryClient.invalidateQueries({ queryKey: ["renegotiation-proposals"] });
-      await queryClient.invalidateQueries({ queryKey: ["renegotiated-client-ids"] });
-      toast.success(`Proposta finalizada e enviada para ${proposalItem.loan.client_name}`);
-      resetProposalDialog();
-    } catch (e) {
-      toast.error(e instanceof Error ? e.message : "Erro ao finalizar proposta");
+      toast.message(`Extrajudicial: ${ok} enviado(s)${fail > 0 ? `, ${fail} falha(s)` : ""}`);
+      setExtrajudicialBulkPreviewOpen(false);
     } finally {
-      setSaving(false);
+      setSendingExtrajudicial(false);
+      setExtrajudicialSendStatus("");
+    }
+  };
+
+  const sendProtestWarningOne = async (item: AdvocaciaOverdueLoan, opts?: { silent?: boolean }) => {
+    const phone = item.loan.client_phone?.trim();
+    if (!phone) return false;
+    if (!protestDeadlineLabel) {
+      if (!opts?.silent) toast.error("Selecione a data limite para o aviso de protesto");
+      return false;
+    }
+    if (!apiKey) {
+      if (!opts?.silent) toast.error(`Configure a API key da instância ${instance}`);
+      return false;
+    }
+    if (!contactPhone.trim()) {
+      if (!opts?.silent) toast.error("Informe o WhatsApp da Capital Advocacia");
+      return false;
+    }
+
+    const text = buildProtestWarningWhatsAppMessage({
+      clientName: item.loan.client_name,
+      creditorName: getCreditorCompanyName(),
+      contactWhatsApp: contactPhone.trim(),
+      deadline: protestDeadlineLabel,
+    });
+
+    const textRes = await sendWhatsAppTextWithInstance(phone, text, {
+      instance,
+      apiKey,
+      baseUrl: evolutionBase,
+    });
+    if (!textRes.ok) {
+      if (!opts?.silent) toast.error(textRes.error || "Falha ao enviar aviso");
+      return false;
+    }
+    if (!opts?.silent) toast.success(`Aviso enviado para ${item.loan.client_name}`);
+    return true;
+  };
+
+  const runProtestWarningQueue = async () => {
+    const list = clientsWithoutContact;
+    if (!protestDeadlineLabel) {
+      toast.error("Selecione a data limite para o aviso de protesto");
+      return;
+    }
+    if (list.length === 0) {
+      toast.error("Nenhum cliente sem contato com telefone cadastrado");
+      return;
+    }
+    if (!apiKey) {
+      toast.error(`Configure a API key da instância ${instance}`);
+      return;
+    }
+    if (!contactPhone.trim()) {
+      toast.error("Informe o WhatsApp da Capital Advocacia");
+      return;
+    }
+
+    const delayMs = parseDelayMinutes(delayMinutes) * 60 * 1000;
+    abortProtestRef.current = false;
+    setSendingProtest(true);
+    let ok = 0;
+    let fail = 0;
+
+    try {
+      for (let i = 0; i < list.length; i++) {
+        if (abortProtestRef.current) break;
+
+        const item = list[i];
+        const next = list[i + 1];
+        setProtestSendStatus(
+          `Enviando aviso ${i + 1}/${list.length}: ${item.loan.client_name}${
+            next ? ` — próximo: ${next.loan.client_name}` : ""
+          }`,
+        );
+
+        const sent = await sendProtestWarningOne(item, { silent: true });
+        if (sent) ok++;
+        else fail++;
+
+        if (abortProtestRef.current) break;
+        if (i < list.length - 1 && delayMs > 0) {
+          setProtestSendStatus(
+            `Aguardando intervalo (${parseDelayMinutes(delayMinutes)} min) antes de ${next!.loan.client_name}…`,
+          );
+          await interruptibleDelay(delayMs, () => abortProtestRef.current);
+        }
+      }
+      toast.message(`Avisos de protesto: ${ok} enviado(s)${fail > 0 ? `, ${fail} falha(s)` : ""}`);
+      setProtestPreviewOpen(false);
+    } finally {
+      setSendingProtest(false);
+      setProtestSendStatus("");
     }
   };
 
@@ -443,6 +867,27 @@ export default function Renegociacoes() {
               </Badge>
             )
           ) : null}
+          <div className="min-w-[200px]">
+            <Label className="text-xs">Chave PIX (notificação)</Label>
+            <Select
+              value={selectedPixId}
+              onValueChange={(v) => {
+                setSelectedPixId(v);
+                localStorage.setItem(PIX_STORAGE_KEY, v);
+              }}
+            >
+              <SelectTrigger className="mt-1 h-9 text-xs">
+                <SelectValue placeholder="Selecione PIX" />
+              </SelectTrigger>
+              <SelectContent>
+                {(pixKeys as Array<Record<string, unknown>>).map((p) => (
+                  <SelectItem key={String(p.id)} value={String(p.id)}>
+                    {String(p.bank)} – {String(p.holder)}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
           <div className="min-w-[160px] flex-1">
             <Label className="text-xs">WhatsApp Capital Advocacia</Label>
             <Input
@@ -450,6 +895,29 @@ export default function Renegociacoes() {
               placeholder="Ex: 16999999999"
               value={contactPhone}
               onChange={(e) => setContactPhone(e.target.value)}
+            />
+          </div>
+          <div className="w-[110px]">
+            <Label className="text-xs">Intervalo (min)</Label>
+            <Input
+              className="mt-1 h-9 text-xs"
+              type="number"
+              min={0}
+              step={1}
+              value={delayMinutes}
+              onChange={(e) => setDelayMinutes(e.target.value)}
+            />
+          </div>
+          <div className="w-[148px]">
+            <Label className="text-xs">Data limite protesto</Label>
+            <Input
+              className="mt-1 h-9 text-xs"
+              type="date"
+              value={protestDeadlineDate}
+              onChange={(e) => {
+                setProtestDeadlineDate(e.target.value);
+                localStorage.setItem(PROTEST_DEADLINE_STORAGE_KEY, e.target.value);
+              }}
             />
           </div>
           <Button variant="outline" size="sm" className="h-9" onClick={savePrefs}>
@@ -463,7 +931,38 @@ export default function Renegociacoes() {
             <List className="h-3.5 w-3.5" />
             Ver propostas ({proposals.length})
           </Button>
+          <Button
+            size="sm"
+            className="h-9 gap-1 bg-orange-600 text-white hover:bg-orange-700"
+            disabled={sendingExtrajudicial || clientsForExtrajudicial.length === 0}
+            onClick={openExtrajudicialBulkPreview}
+          >
+            {sendingExtrajudicial ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Gavel className="h-3.5 w-3.5" />}
+            Extrajudicial ({clientsForExtrajudicial.length})
+          </Button>
+          <Button
+            variant="destructive"
+            size="sm"
+            className="h-9 gap-1"
+            disabled={sendingProtest || clientsWithoutContact.length === 0 || !protestDeadlineDate}
+            onClick={openProtestPreview}
+          >
+            {sendingProtest ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <AlertTriangle className="h-3.5 w-3.5" />}
+            Avisar protesto ({clientsWithoutContact.length})
+          </Button>
         </div>
+        {protestSendStatus || extrajudicialSendStatus ? (
+          <p className="text-xs text-muted-foreground flex items-center gap-2">
+            <Loader2 className="h-3.5 w-3.5 animate-spin shrink-0" />
+            {protestSendStatus || extrajudicialSendStatus}
+          </p>
+        ) : (
+          <p className="text-[10px] text-muted-foreground">
+            <strong className="text-orange-600">Extrajudicial</strong> envia mensagem + PDF com valor com multas para todos com telefone.
+            <strong className="text-destructive"> Avisar protesto</strong> exige data limite e atinge só quem não finalizou renegociação.
+            O intervalo é em <strong>minutos</strong> entre cada cliente na fila.
+          </p>
+        )}
       </motion.div>
 
       <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.05 }} className="glass-card p-5">
@@ -497,18 +996,18 @@ export default function Renegociacoes() {
             Nenhum empréstimo ou parcelamento vencido há mais de 60 dias.
           </div>
         ) : (
-          <ScrollArea className="h-[min(520px,60vh)] rounded-lg border">
-            <table className="w-full text-xs">
+          <div className="h-[min(520px,60vh)] overflow-y-auto overflow-x-hidden rounded-lg border">
+            <table className="w-full text-xs table-fixed">
               <thead className="sticky top-0 bg-muted/80 backdrop-blur z-10">
                 <tr className="border-b">
-                  <th className="text-left p-3 font-semibold">Cliente</th>
-                  <th className="text-left p-3 font-semibold">Tipo</th>
-                  <th className="text-left p-3 font-semibold">Vencimento</th>
-                  <th className="text-right p-3 font-semibold">Dias</th>
-                  <th className="text-right p-3 font-semibold">Valor sem multas</th>
-                  <th className="text-right p-3 font-semibold">Total pago</th>
-                  <th className="text-right p-3 font-semibold text-muted-foreground">Com multas</th>
-                  <th className="p-3 w-44" />
+                  <th className="text-left p-3 font-semibold w-[18%]">Cliente</th>
+                  <th className="text-left p-3 font-semibold w-[10%]">Tipo</th>
+                  <th className="text-left p-3 font-semibold w-[10%]">Vencimento</th>
+                  <th className="text-right p-3 font-semibold w-[7%]">Dias</th>
+                  <th className="text-right p-3 font-semibold w-[14%]">Valor sem multas</th>
+                  <th className="text-right p-3 font-semibold w-[12%]">Total pago</th>
+                  <th className="text-right p-3 font-semibold w-[11%] text-muted-foreground">Com multas</th>
+                  <th className="p-3 w-[20%]" />
                 </tr>
               </thead>
               <tbody>
@@ -517,11 +1016,11 @@ export default function Renegociacoes() {
                   const isRenegotiated = renegotiatedClientIds.has(item.client_id);
                   return (
                     <tr key={item.id} className="border-b border-border/40 hover:bg-muted/30">
-                      <td className={`p-3 font-medium ${isRenegotiated ? "text-orange-600 dark:text-orange-400" : ""}`}>
+                      <td className={`p-3 font-medium truncate ${isRenegotiated ? "text-orange-600 dark:text-orange-400" : ""}`}>
                         {item.loan.client_name}
                         {prop ? (
                           <Badge variant="outline" className="ml-2 text-[9px]">
-                            {proposalStatusLabel(prop.status)}
+                            {proposalStatusLabel(prop)}
                           </Badge>
                         ) : null}
                       </td>
@@ -541,11 +1040,11 @@ export default function Renegociacoes() {
                       <td className="p-3 text-right tabular-nums text-green-700 dark:text-green-400 font-medium">
                         {formatCurrency(item.details.total_paid)}
                       </td>
-                      <td className="p-3 text-right tabular-nums text-muted-foreground line-through">
+                      <td className="p-3 text-right tabular-nums font-medium text-foreground">
                         {formatCurrency(item.loan.amount)}
                       </td>
                       <td className="p-3">
-                        <div className="flex gap-1 justify-end">
+                        <div className="flex flex-wrap gap-1 justify-end">
                           <Button
                             type="button"
                             variant="ghost"
@@ -555,6 +1054,17 @@ export default function Renegociacoes() {
                             onClick={() => setDetailsItem(item)}
                           >
                             <Eye className="h-3.5 w-3.5" />
+                          </Button>
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="icon"
+                            className="h-7 w-7"
+                            title="Notificação extrajudicial"
+                            disabled={sendingExtrajudicial || !item.loan.client_phone}
+                            onClick={() => setExtrajudicialPreviewItem(item)}
+                          >
+                            <Gavel className="h-3.5 w-3.5" />
                           </Button>
                           <Button
                             type="button"
@@ -573,17 +1083,17 @@ export default function Renegociacoes() {
                 })}
               </tbody>
             </table>
-          </ScrollArea>
+          </div>
         )}
       </motion.div>
 
       <Dialog open={!!proposalItem} onOpenChange={(open) => !open && resetProposalDialog()}>
-        <DialogContent className="sm:max-w-lg max-h-[90vh] overflow-y-auto">
+        <DialogContent className="w-[min(96vw,52rem)] sm:max-w-none max-h-[90vh] overflow-y-auto overflow-x-hidden">
           <DialogHeader>
             <DialogTitle>Proposta de renegociação</DialogTitle>
           </DialogHeader>
           {proposalItem && calc ? (
-            <div className="space-y-4 text-sm">
+            <div className="space-y-4 text-sm min-w-0 overflow-x-hidden">
               <div className="space-y-2">
                 <p className="font-medium">{proposalItem.loan.client_name}</p>
                 <DebtDetailsPanel item={proposalItem} />
@@ -599,8 +1109,12 @@ export default function Renegociacoes() {
                 <Select
                   value={mode}
                   onValueChange={(v) => {
-                    setMode(v as RenegotiationMode);
+                    const nextMode = v as RenegotiationMode;
+                    setMode(nextMode);
                     setInstallmentAmountManual(false);
+                    if (nextMode === "parcelado_entrada" && !downPaymentDueDate) {
+                      setDownPaymentDueDate(addCalendarDays(calendarDateInBrazil(), 7));
+                    }
                   }}
                 >
                   <SelectTrigger className="h-9 text-xs">
@@ -632,18 +1146,29 @@ export default function Renegociacoes() {
               ) : null}
 
               {mode === "parcelado_entrada" ? (
-                <div className="space-y-1">
-                  <Label className="text-xs">Valor da entrada (R$)</Label>
-                  <Input
-                    className="h-9"
-                    value={downPayment}
-                    onChange={(e) => {
-                      setDownPayment(e.target.value);
-                      setInstallmentAmountManual(false);
-                    }}
-                    placeholder="0,00"
-                  />
-                </div>
+                <>
+                  <div className="space-y-1">
+                    <Label className="text-xs">Valor da entrada (R$)</Label>
+                    <Input
+                      className="h-9"
+                      value={downPayment}
+                      onChange={(e) => {
+                        setDownPayment(e.target.value);
+                        setInstallmentAmountManual(false);
+                      }}
+                      placeholder="0,00"
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <Label className="text-xs">Data limite da entrada</Label>
+                    <Input
+                      className="h-9"
+                      type="date"
+                      value={downPaymentDueDate}
+                      onChange={(e) => setDownPaymentDueDate(e.target.value)}
+                    />
+                  </div>
+                </>
               ) : null}
 
               {mode === "parcelado_entrada" || mode === "parcelado_total" ? (
@@ -701,29 +1226,271 @@ export default function Renegociacoes() {
                 <p>Modalidade: {renegotiationModeLabel(mode)}</p>
                 {mode === "avista_desconto" ? <p>Desconto: {calc.discountPercent}%</p> : null}
                 <p>Total do acordo: {formatCurrency(calc.totalAmount)}</p>
-                {calc.downPayment > 0 ? <p>Entrada: {formatCurrency(calc.downPayment)}</p> : null}
+                {calc.downPayment > 0 ? (
+                  <p>
+                    Entrada: {formatCurrency(calc.downPayment)}
+                    {mode === "parcelado_entrada" && downPaymentDueDate
+                      ? ` (vencimento: ${formatDate(downPaymentDueDate)})`
+                      : ""}
+                  </p>
+                ) : null}
                 {calc.installmentCount > 0 ? (
                   <p>
                     Parcelas: {calc.installmentCount}x de {formatCurrency(calc.installmentAmount)}
                   </p>
                 ) : null}
+                <p className={isCurrentDraftExpired ? "text-destructive font-medium" : "text-muted-foreground"}>
+                  {isCurrentDraftExpired
+                    ? `Rascunho expirado — enviar prévia renova o prazo de ${RENEGOTIATION_DRAFT_VALIDITY_DAYS} dias`
+                    : `Validade do rascunho: até ${draftDeadlineLabel} (${RENEGOTIATION_DRAFT_VALIDITY_DAYS} dias)`}
+                </p>
               </div>
             </div>
           ) : null}
-          <DialogFooter className="gap-2">
-            <Button variant="outline" onClick={resetProposalDialog}>
+          <DialogFooter className="flex flex-wrap gap-2 justify-end sm:space-x-0">
+            <Button variant="outline" className="flex-1 sm:flex-none" onClick={resetProposalDialog}>
               Cancelar
             </Button>
-            <Button disabled={saving || !proposalItem} onClick={() => void finalizeAndSend()}>
+            <Button
+              variant="outline"
+              className="flex-1 sm:flex-none"
+              disabled={!proposalItem || !calc}
+              onClick={() => setPreviewOpen(true)}
+            >
+              Ver prévia
+            </Button>
+            <Button
+              variant="secondary"
+              className="flex-1 sm:flex-none"
+              disabled={saving || !proposalItem}
+              onClick={() => void sendProposal({ finalize: false, preview: true })}
+            >
+              {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
+              Enviar prévia
+            </Button>
+            <Button className="flex-1 sm:flex-none" disabled={saving || !proposalItem} onClick={() => void finalizeAndSend()}>
               {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
-              Finalizar e enviar PDF
+              Finalizar e enviar
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={previewOpen} onOpenChange={setPreviewOpen}>
+        <DialogContent className="w-[min(96vw,44rem)] sm:max-w-none max-h-[90vh] overflow-y-auto overflow-x-hidden">
+          <DialogHeader>
+            <DialogTitle>Prévia da proposta</DialogTitle>
+          </DialogHeader>
+          {proposalItem && calc && previewPackage ? (
+            <div className="space-y-4 text-sm min-w-0 overflow-x-hidden">
+              <div className="rounded-md border bg-muted/30 p-3 space-y-1 text-xs">
+                <p className="font-semibold">Resumo</p>
+                <p>Cliente: {proposalItem.loan.client_name}</p>
+                <p>Modalidade: {renegotiationModeLabel(mode)}</p>
+                <p>Total do acordo: {formatCurrency(calc.totalAmount)}</p>
+                {calc.downPayment > 0 ? (
+                  <p>
+                    Entrada: {formatCurrency(calc.downPayment)}
+                    {mode === "parcelado_entrada" && downPaymentDueDate
+                      ? ` (vencimento: ${formatDate(downPaymentDueDate)})`
+                      : ""}
+                  </p>
+                ) : null}
+                {calc.installmentCount > 0 ? (
+                  <p>
+                    Parcelas: {calc.installmentCount}x de {formatCurrency(calc.installmentAmount)}
+                  </p>
+                ) : null}
+                <p className={isCurrentDraftExpired ? "text-destructive font-medium" : "text-muted-foreground"}>
+                  {isCurrentDraftExpired
+                    ? `Rascunho expirado — enviar prévia renova o prazo de ${RENEGOTIATION_DRAFT_VALIDITY_DAYS} dias`
+                    : `Validade da prévia: até ${draftDeadlineLabel}`}
+                </p>
+              </div>
+                <div className="max-h-56 overflow-y-auto overflow-x-hidden rounded-md border bg-muted/20 p-3">
+                  <pre className="text-[11px] whitespace-pre-wrap break-words font-sans">{previewPackage.text}</pre>
+                </div>
+              </div>
+
+              <Button type="button" variant="outline" size="sm" className="gap-1" onClick={openPdfPreview}>
+                <FileText className="h-3.5 w-3.5" />
+                Abrir PDF da prévia
+              </Button>
+            </div>
+          ) : null}
+          <DialogFooter className="flex flex-wrap gap-2 justify-end sm:space-x-0">
+            <Button variant="outline" className="flex-1 sm:flex-none" onClick={() => setPreviewOpen(false)}>
+              Fechar
+            </Button>
+            <Button
+              className="flex-1 sm:flex-none"
+              disabled={saving}
+              onClick={() => void sendProposal({ finalize: false, preview: true })}
+            >
+              {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
+              Enviar prévia ao cliente
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={protestPreviewOpen} onOpenChange={setProtestPreviewOpen}>
+        <DialogContent className="w-[min(96vw,44rem)] sm:max-w-none max-h-[90vh] overflow-y-auto overflow-x-hidden">
+          <DialogHeader>
+            <DialogTitle>Aviso de protesto{protestDeadlineLabel ? ` — ${protestDeadlineLabel}` : ""}</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-4 text-sm min-w-0 overflow-x-hidden">
+            <div className="space-y-1">
+              <Label className="text-xs">Data limite para contato</Label>
+              <Input
+                className="h-9 text-xs"
+                type="date"
+                value={protestDeadlineDate}
+                onChange={(e) => {
+                  setProtestDeadlineDate(e.target.value);
+                  localStorage.setItem(PROTEST_DEADLINE_STORAGE_KEY, e.target.value);
+                }}
+              />
+            </div>
+            <p className="text-xs text-muted-foreground">
+              Será enviado para <strong className="text-foreground">{clientsWithoutContact.length}</strong> cliente(s)
+              que ainda não finalizaram renegociação e possuem telefone cadastrado.
+            </p>
+            {sampleProtestMessage ? (
+              <div className="space-y-2">
+                <Label className="text-xs">Texto da mensagem</Label>
+                <div className="max-h-64 overflow-y-auto overflow-x-hidden rounded-md border bg-muted/20 p-3">
+                  <pre className="text-[11px] whitespace-pre-wrap break-words font-sans">{sampleProtestMessage}</pre>
+                </div>
+              </div>
+            ) : null}
+          </div>
+          <DialogFooter className="flex flex-wrap gap-2 justify-end sm:space-x-0">
+            <Button variant="outline" className="flex-1 sm:flex-none" onClick={() => setProtestPreviewOpen(false)}>
+              Cancelar
+            </Button>
+            <Button
+              variant="destructive"
+              className="flex-1 sm:flex-none"
+              disabled={sendingProtest || clientsWithoutContact.length === 0 || !protestDeadlineDate}
+              onClick={() => void runProtestWarningQueue()}
+            >
+              {sendingProtest ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
+              Enviar aviso ({clientsWithoutContact.length})
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={!!extrajudicialPreviewItem} onOpenChange={(open) => !open && setExtrajudicialPreviewItem(null)}>
+        <DialogContent className="w-[min(96vw,44rem)] sm:max-w-none max-h-[90vh] overflow-y-auto overflow-x-hidden">
+          <DialogHeader>
+            <DialogTitle>Notificação extrajudicial</DialogTitle>
+          </DialogHeader>
+          {extrajudicialPreviewItem ? (
+            <div className="space-y-4 text-sm min-w-0 overflow-x-hidden">
+              <div className="rounded-md border bg-muted/30 p-3 space-y-1 text-xs">
+                <p className="font-semibold">{extrajudicialPreviewItem.loan.client_name}</p>
+                <p>Credor: {getCreditorCompanyName()}</p>
+                <p>Valor com multas: {formatCurrency(extrajudicialPreviewItem.loan.amount)}</p>
+                <p>Vencimento: {formatDate(extrajudicialPreviewItem.loan.due_date)}</p>
+                {!extrajudicialPreviewItem.loan.client_phone ? (
+                  <p className="text-destructive">Cliente sem telefone cadastrado</p>
+                ) : null}
+                {!selectedPix?.key ? (
+                  <p className="text-destructive">Selecione uma chave PIX no topo da página</p>
+                ) : null}
+              </div>
+
+              {extrajudicialPreviewPackage ? (
+                <>
+                  <div className="space-y-2">
+                    <Label className="text-xs">Mensagem WhatsApp</Label>
+                    <div className="max-h-56 overflow-y-auto overflow-x-hidden rounded-md border bg-muted/20 p-3">
+                      <pre className="text-[11px] whitespace-pre-wrap break-words font-sans">
+                        {extrajudicialPreviewPackage.text}
+                      </pre>
+                    </div>
+                  </div>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    className="gap-1"
+                    onClick={openExtrajudicialPdfPreview}
+                  >
+                    <FileText className="h-3.5 w-3.5" />
+                    Abrir PDF extrajudicial
+                  </Button>
+                </>
+              ) : null}
+            </div>
+          ) : null}
+          <DialogFooter className="flex flex-wrap gap-2 justify-end sm:space-x-0">
+            <Button variant="outline" className="flex-1 sm:flex-none" onClick={() => setExtrajudicialPreviewItem(null)}>
+              Cancelar
+            </Button>
+            <Button
+              className="flex-1 sm:flex-none gap-1"
+              disabled={
+                sendingExtrajudicial ||
+                !extrajudicialPreviewItem?.loan.client_phone ||
+                !selectedPix?.key
+              }
+              onClick={() => {
+                if (!extrajudicialPreviewItem) return;
+                setSendingExtrajudicial(true);
+                void handleSendExtrajudicial(extrajudicialPreviewItem).finally(() => setSendingExtrajudicial(false));
+              }}
+            >
+              {sendingExtrajudicial ? (
+                <Loader2 className="h-4 w-4 animate-spin" />
+              ) : (
+                <MessageCircle className="h-4 w-4" />
+              )}
+              Enviar extrajudicial
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={extrajudicialBulkPreviewOpen} onOpenChange={setExtrajudicialBulkPreviewOpen}>
+        <DialogContent className="w-[min(96vw,44rem)] sm:max-w-none max-h-[90vh] overflow-y-auto overflow-x-hidden">
+          <DialogHeader>
+            <DialogTitle>Enviar notificação extrajudicial</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-4 text-sm min-w-0 overflow-x-hidden">
+            <p className="text-xs text-muted-foreground">
+              Será enviado para <strong className="text-foreground">{clientsForExtrajudicial.length}</strong> cliente(s)
+              com telefone. Valor utilizado: <strong className="text-foreground">total com multas</strong>.
+            </p>
+            {sampleExtrajudicialMessage ? (
+              <div className="space-y-2">
+                <Label className="text-xs">Exemplo de mensagem</Label>
+                <div className="max-h-64 overflow-y-auto overflow-x-hidden rounded-md border bg-muted/20 p-3">
+                  <pre className="text-[11px] whitespace-pre-wrap break-words font-sans">{sampleExtrajudicialMessage}</pre>
+                </div>
+              </div>
+            ) : null}
+          </div>
+          <DialogFooter className="flex flex-wrap gap-2 justify-end sm:space-x-0">
+            <Button variant="outline" className="flex-1 sm:flex-none" onClick={() => setExtrajudicialBulkPreviewOpen(false)}>
+              Cancelar
+            </Button>
+            <Button
+              className="flex-1 sm:flex-none gap-1 bg-orange-600 text-white hover:bg-orange-700"
+              disabled={sendingExtrajudicial || clientsForExtrajudicial.length === 0}
+              onClick={() => void runExtrajudicialQueue()}
+            >
+              {sendingExtrajudicial ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
+              Enviar ({clientsForExtrajudicial.length})
             </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
 
       <Dialog open={!!detailsItem} onOpenChange={(open) => !open && setDetailsItem(null)}>
-        <DialogContent className="sm:max-w-2xl max-h-[90vh] overflow-y-auto">
+        <DialogContent className="w-[min(96vw,48rem)] sm:max-w-none max-h-[90vh] overflow-y-auto overflow-x-hidden">
           <DialogHeader>
             <DialogTitle>Detalhes do {detailsItem?.source === "installment" ? "parcelamento" : "empréstimo"}</DialogTitle>
           </DialogHeader>
@@ -747,22 +1514,22 @@ export default function Renegociacoes() {
       </Dialog>
 
       <Dialog open={proposalsOpen} onOpenChange={setProposalsOpen}>
-        <DialogContent className="sm:max-w-2xl max-h-[90vh] overflow-y-auto">
+        <DialogContent className="w-[min(96vw,48rem)] sm:max-w-none max-h-[90vh] overflow-y-auto overflow-x-hidden">
           <DialogHeader>
             <DialogTitle>Propostas de renegociação</DialogTitle>
           </DialogHeader>
           {proposals.length === 0 ? (
             <p className="text-sm text-muted-foreground py-4">Nenhuma proposta registrada.</p>
           ) : (
-            <ScrollArea className="h-[min(400px,55vh)]">
-              <div className="space-y-2 pr-2">
+            <div className="h-[min(400px,55vh)] overflow-y-auto overflow-x-hidden pr-1">
+              <div className="space-y-2">
                 {proposals.map((p) => (
                   <div key={p.id} className="rounded-lg border p-3 text-xs space-y-2">
                     <div className="flex flex-wrap items-center justify-between gap-2">
                       <span className={`font-semibold ${p.status !== "draft" ? "text-orange-600 dark:text-orange-400" : ""}`}>
                         {p.client_name}
                       </span>
-                      <Badge variant="outline">{proposalStatusLabel(p.status)}</Badge>
+                      <Badge variant="outline">{proposalStatusLabel(p)}</Badge>
                     </div>
                     <p className="text-muted-foreground">
                       {renegotiationModeLabel(p.proposal_mode)} · Total {formatCurrency(p.total_amount)}
@@ -770,6 +1537,13 @@ export default function Renegociacoes() {
                         ? ` · ${p.installment_count}x ${formatCurrency(p.installment_amount)}`
                         : ""}
                     </p>
+                    {p.status === "draft" ? (
+                      <p className={isDraftProposalExpired(p) ? "text-destructive" : "text-muted-foreground"}>
+                        {isDraftProposalExpired(p)
+                          ? "Prazo de 5 dias expirado — envie nova prévia para renovar"
+                          : `Válida até ${formatRenegotiationDraftDeadline(p.created_at)}`}
+                      </p>
+                    ) : null}
                     {p.status === "finalized" ? (
                       <Button
                         size="sm"
@@ -788,7 +1562,7 @@ export default function Renegociacoes() {
                   </div>
                 ))}
               </div>
-            </ScrollArea>
+            </div>
           )}
           <DialogFooter>
             <Button variant="outline" onClick={() => void refetchProposals()}>

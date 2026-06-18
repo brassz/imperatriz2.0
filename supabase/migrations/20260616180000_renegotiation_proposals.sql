@@ -11,6 +11,7 @@ create table if not exists public.renegotiation_proposals (
   discount_percent numeric(5, 2) not null default 0,
   total_amount numeric(12, 2) not null,
   down_payment numeric(12, 2) not null default 0,
+  down_payment_due_date date,
   installment_count int not null default 0,
   installment_amount numeric(12, 2) not null default 0,
   status text not null default 'draft' check (status in ('draft', 'finalized', 'converted')),

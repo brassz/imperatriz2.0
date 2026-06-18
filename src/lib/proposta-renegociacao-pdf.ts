@@ -13,6 +13,12 @@ export type PropostaRenegociacaoParams = {
   mode: RenegotiationMode;
   contactPhone: string;
   contactEmail?: string;
+  /** Prévia enviada antes da finalização oficial */
+  preview?: boolean;
+  /** Data limite da entrada (dd/mm/aaaa) — parcelado com entrada */
+  downPaymentDueDate?: string;
+  /** Validade do rascunho/prévia (dd/mm/aaaa) */
+  draftValidUntil?: string;
 };
 
 function wrapParagraph(doc: jsPDF, text: string, x: number, y: number, maxWidth: number, lineHeight = 5.5): number {
@@ -36,7 +42,10 @@ function buildTerms(params: PropostaRenegociacaoParams): string[] {
   } else if (mode === "avista") {
     lines.push(`Valor para quitação à vista: ${formatCurrency(calc.totalAmount)}`);
   } else if (mode === "parcelado_entrada") {
-    lines.push(`Entrada: ${formatCurrency(calc.downPayment)}`);
+    const entradaLine = params.downPaymentDueDate
+      ? `Entrada: ${formatCurrency(calc.downPayment)} (vencimento: ${params.downPaymentDueDate})`
+      : `Entrada: ${formatCurrency(calc.downPayment)}`;
+    lines.push(entradaLine);
     lines.push(`Saldo parcelado: ${calc.installmentCount}x de ${formatCurrency(calc.installmentAmount)}`);
     lines.push(`Total do acordo: ${formatCurrency(calc.totalAmount)}`);
   } else {
@@ -56,7 +65,7 @@ export function generatePropostaRenegociacaoPdf(params: PropostaRenegociacaoPara
 
   doc.setFont("helvetica", "bold");
   doc.setFontSize(12);
-  doc.text("PROPOSTA DE RENEGOCIAÇÃO", m, y);
+  doc.text(params.preview ? "PRÉVIA DE PROPOSTA DE RENEGOCIAÇÃO" : "PROPOSTA DE RENEGOCIAÇÃO", m, y);
   y += 6;
   doc.setFontSize(10);
   doc.text(CAPITAL_ADVOCACIA_NAME.toUpperCase(), m, y);
@@ -89,12 +98,20 @@ export function generatePropostaRenegociacaoPdf(params: PropostaRenegociacaoPara
   y += 4;
   y = wrapParagraph(
     doc,
-    "Esta proposta tem validade de 48 horas a partir do recebimento. A aceitação deve ser confirmada por resposta neste WhatsApp ou pelos canais oficiais da Capital Advocacia.",
+    params.preview
+      ? params.draftValidUntil
+        ? `Documento preliminar válido por 5 dias, até ${params.draftValidUntil}. Os valores e condições podem ser ajustados antes da proposta oficial.`
+        : "Documento preliminar para análise. Os valores e condições abaixo podem ser ajustados antes da proposta oficial."
+      : "Esta proposta tem validade de 48 horas a partir do recebimento. A aceitação deve ser confirmada por resposta neste WhatsApp ou pelos canais oficiais da Capital Advocacia.",
     m,
     y,
     maxW,
   );
-  y += 6;
+  if (!params.preview) {
+    y += 6;
+  } else {
+    y += 4;
+  }
 
   doc.setFont("helvetica", "bold");
   doc.text("Contato para aceite:", m, y);
