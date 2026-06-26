@@ -306,7 +306,8 @@ export default function Parcelamentos() {
       return;
     }
     const res = await sendWhatsAppMessage(phone, msg);
-    if (res.via === "api") toast.success("Mensagem enviada");
+    if (res.ok && res.via === "api") toast.success("Mensagem enviada");
+    else if (res.error) toast.error(res.error);
   };
 
   if (isLoading) {

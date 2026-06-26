@@ -327,13 +327,108 @@ export async function fetchEvolutionQrCodeForInstance(opts: {
   }
 }
 
+function extractEvolutionErrorMessage(data: unknown, fallback: string): string {
+  if (!data || typeof data !== "object") return fallback;
+  const d = data as Record<string, unknown>;
+  const nested = d.response;
+  if (nested && typeof nested === "object") {
+    const msg = (nested as Record<string, unknown>).message;
+    if (Array.isArray(msg)) return msg.map(String).join(" — ");
+    if (typeof msg === "string" && msg.trim()) return msg;
+  }
+  if (typeof d.message === "string" && d.message.trim()) return d.message;
+  if (typeof d.error === "string" && d.error.trim()) return d.error;
+  return fallback;
+}
+
+/** Valida se a Evolution API realmente aceitou o envio (evita falso positivo só com HTTP 200). */
+async function parseEvolutionSendResponse(
+  res: Response,
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  const text = await res.text();
+  let data: unknown = null;
+  if (text.trim()) {
+    try {
+      data = JSON.parse(text);
+    } catch {
+      if (!res.ok) return { ok: false, error: text || `HTTP ${res.status}` };
+      return { ok: false, error: "Resposta inválida da Evolution API (não é JSON)" };
+    }
+  }
+
+  if (!res.ok) {
+    return {
+      ok: false,
+      error: extractEvolutionErrorMessage(data, text || `HTTP ${res.status}`),
+    };
+  }
+
+  if (data && typeof data === "object") {
+    const d = data as Record<string, unknown>;
+    const httpLikeStatus = Number(d.status);
+    if (Number.isFinite(httpLikeStatus) && httpLikeStatus >= 400) {
+      return {
+        ok: false,
+        error: extractEvolutionErrorMessage(data, `Evolution API retornou status ${httpLikeStatus}`),
+      };
+    }
+    if (d.error && !d.key) {
+      return { ok: false, error: extractEvolutionErrorMessage(data, String(d.error)) };
+    }
+    const key = d.key as Record<string, unknown> | undefined;
+    if (!key?.id) {
+      return {
+        ok: false,
+        error:
+          "Evolution API não confirmou o envio (sem ID da mensagem). Reconecte a instância no painel Evolution.",
+      };
+    }
+  }
+
+  return { ok: true };
+}
+
+async function ensureEvolutionInstanceConnected(opts: {
+  instance: string;
+  apiKey: string;
+  baseUrl?: string;
+}): Promise<{ ok: true } | { ok: false; error: string }> {
+  const state = await fetchConnectionStateForInstance(opts);
+  if (!state.ok) return { ok: false, error: state.error || "Não foi possível verificar a instância WhatsApp" };
+  if (!state.connected) {
+    return {
+      ok: false,
+      error: `Instância "${opts.instance}" desconectada. Escaneie o QR Code no painel Evolution antes de enviar.`,
+    };
+  }
+  return { ok: true };
+}
+
 export function getQrImageUrl(code: string): string {
   return `https://api.qrserver.com/v1/create-qr-code/?size=280x280&data=${encodeURIComponent(code)}`;
 }
 
+/** Normaliza telefone BR para Evolution (DDI 55 + DDD + 9 dígitos móvel). */
 export function normalizePhone(phone: string): string {
-  const digits = phone.replace(/\D/g, "");
-  return digits.startsWith("55") ? digits : "55" + digits;
+  let digits = String(phone || "").replace(/\D/g, "");
+  if (!digits) return digits;
+  if (digits.startsWith("0")) digits = digits.slice(1);
+
+  if (!digits.startsWith("55")) {
+    digits = `55${digits}`;
+  }
+
+  const national = digits.slice(2);
+  // DDD + 8 dígitos sem o 9 do celular → insere o 9
+  if (national.length === 10) {
+    const ddd = national.slice(0, 2);
+    const subscriber = national.slice(2);
+    if (/^[6-9]/.test(subscriber)) {
+      return `55${ddd}9${subscriber}`;
+    }
+  }
+
+  return digits;
 }
 
 export function buildWhatsAppLink(phone: string, text: string): string {
@@ -351,8 +446,7 @@ export async function sendWhatsAppMessage(phone: string, text: string): Promise<
   if (state.ok && state.connected) {
     const res = await sendWhatsAppText(phone, text);
     if (res.ok) return { ok: true, via: "api" };
-    window.open(buildWhatsAppLink(phone, text), "_blank");
-    return { ok: true, via: "link" };
+    return { ok: false, via: "api", error: res.error || "Falha ao enviar pela Evolution API" };
   }
   window.open(buildWhatsAppLink(phone, text), "_blank");
   return { ok: true, via: "link" };
@@ -386,6 +480,9 @@ export async function sendWhatsAppDocument(
   };
 
   try {
+    const connected = await ensureEvolutionInstanceConnected({ instance, apiKey, baseUrl: base });
+    if (!connected.ok) return connected;
+
     const res = await fetch(url, {
       method: "POST",
       headers: {
@@ -395,11 +492,7 @@ export async function sendWhatsAppDocument(
       body: JSON.stringify(body),
     });
 
-    if (!res.ok) {
-      const err = await res.text();
-      return { ok: false, error: err || `HTTP ${res.status}` };
-    }
-    return { ok: true };
+    return parseEvolutionSendResponse(res);
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "Erro de conexão" };
   }
@@ -422,14 +515,7 @@ export async function sendWhatsAppComprovante(
       caption,
     });
     if (res.ok) return { ok: true, via: "api" };
-    window.open(
-      buildWhatsAppLink(
-        phone,
-        `${caption}\n\n(Baixe o PDF gerado neste computador e anexe na conversa, se necessário.)`,
-      ),
-      "_blank",
-    );
-    return { ok: true, via: "link" };
+    return { ok: false, via: "api", error: res.error || "Falha ao enviar PDF pela Evolution API" };
   }
   window.open(
     buildWhatsAppLink(
@@ -450,9 +536,12 @@ export async function sendWhatsAppText(number: string, text: string): Promise<{ 
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "Configuração inválida" };
   }
-  const url = `${base}/message/sendText/${instance}`;
+  const url = `${base}/message/sendText/${encodeURIComponent(instance)}`;
 
   try {
+    const connected = await ensureEvolutionInstanceConnected({ instance, apiKey, baseUrl: base });
+    if (!connected.ok) return connected;
+
     const res = await fetch(url, {
       method: "POST",
       headers: {
@@ -462,11 +551,7 @@ export async function sendWhatsAppText(number: string, text: string): Promise<{ 
       body: JSON.stringify({ number: num, text }),
     });
 
-    if (!res.ok) {
-      const err = await res.text();
-      return { ok: false, error: err || `HTTP ${res.status}` };
-    }
-    return { ok: true };
+    return parseEvolutionSendResponse(res);
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "Erro de conexão" };
   }
@@ -495,6 +580,9 @@ export async function sendWhatsAppTextWithInstance(
   const url = `${base}/message/sendText/${encodeURIComponent(instance)}`;
 
   try {
+    const connected = await ensureEvolutionInstanceConnected({ instance, apiKey, baseUrl: base });
+    if (!connected.ok) return connected;
+
     const res = await fetch(url, {
       method: "POST",
       headers: {
@@ -503,11 +591,7 @@ export async function sendWhatsAppTextWithInstance(
       },
       body: JSON.stringify({ number: num, text }),
     });
-    if (!res.ok) {
-      const err = await res.text();
-      return { ok: false, error: err || `HTTP ${res.status}` };
-    }
-    return { ok: true };
+    return parseEvolutionSendResponse(res);
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "Erro de conexão" };
   }
@@ -548,16 +632,15 @@ export async function sendWhatsAppDocumentWithInstance(
   };
 
   try {
+    const connected = await ensureEvolutionInstanceConnected({ instance, apiKey, baseUrl: base });
+    if (!connected.ok) return connected;
+
     const res = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json", apikey: apiKey },
       body: JSON.stringify(body),
     });
-    if (!res.ok) {
-      const err = await res.text();
-      return { ok: false, error: err || `HTTP ${res.status}` };
-    }
-    return { ok: true };
+    return parseEvolutionSendResponse(res);
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "Erro de conexão" };
   }

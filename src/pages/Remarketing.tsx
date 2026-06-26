@@ -109,7 +109,8 @@ export default function Remarketing() {
     setSendingId(row.paidLoanId);
     try {
       const res = await sendWhatsAppMessage(phone, text);
-      if (res.via === "api") toast.success("Mensagem enviada pelo WhatsApp");
+      if (res.ok && res.via === "api") toast.success("Mensagem enviada pelo WhatsApp");
+      else if (res.error) toast.error(res.error);
       else toast.success("WhatsApp aberto — envie a mensagem no app");
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Falha ao enviar");

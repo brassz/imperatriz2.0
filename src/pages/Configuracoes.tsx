@@ -2076,8 +2076,8 @@ export default function Configuracoes() {
                         { wch: 48 },
                       ];
 
-                      const teal = "14B8A6";
-                      const tealDark = "0D9488";
+                      const teal = "00BFFF";
+                      const tealDark = "008CCC";
                       const softBg = "F8FAFC";
                       const grid = "E2E8F0";
                       const headerFont = { bold: true, color: { rgb: "000000" } };

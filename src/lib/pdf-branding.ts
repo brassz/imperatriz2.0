@@ -46,8 +46,8 @@ export const PDF_BRAND = {
   branch: BRANCH,
   foro: import.meta.env.VITE_COMPANY_FORO || FORO_BY_BRANCH[BRANCH] || `Comarca de ${BRANCH}/SP`,
   colors: {
-    primary: { r: 20, g: 184, b: 166 },   // #14B8A6 - Teal principal
-    primaryDark: { r: 13, g: 148, b: 136 }, // #0D9488
+    primary: { r: 0, g: 191, b: 255 },   // #00BFFF - Azul neon
+    primaryDark: { r: 0, g: 140, b: 204 }, // #008CCC
     text: { r: 30, g: 41, b: 59 },        // #1E293B
     textMuted: { r: 100, g: 116, b: 139 }, // #64748B
     line: { r: 226, g: 232, b: 240 },     // #E2E8F0

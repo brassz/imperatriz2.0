@@ -1328,7 +1328,8 @@ export default function Emprestimos() {
       };
       const msg = buildCobrancaMessage(loanForMsg, pixInfo, 50);
       const res = await sendWhatsAppMessage(phone, msg);
-      if (res.via === "api") toast.success("Mensagem enviada");
+      if (res.ok && res.via === "api") toast.success("Mensagem enviada");
+      else if (res.error) toast.error(res.error);
       setWhatsappOpen(false);
       return;
     }
@@ -1350,7 +1351,8 @@ export default function Emprestimos() {
     };
     const msg = buildCobrancaMessage(loanForMsg, pixInfo, 50);
     const res = await sendWhatsAppMessage(phone, msg);
-    if (res.via === "api") toast.success("Mensagem enviada");
+    if (res.ok && res.via === "api") toast.success("Mensagem enviada");
+    else if (res.error) toast.error(res.error);
     setWhatsappOpen(false);
   };
 
@@ -1388,7 +1390,8 @@ export default function Emprestimos() {
       return;
     }
     const res = await sendWhatsAppMessage(phone, msg);
-    if (res.via === "api") toast.success("Mensagem enviada");
+    if (res.ok && res.via === "api") toast.success("Mensagem enviada");
+    else if (res.error) toast.error(res.error);
   };
 
   const handleContract = async (loan: LoanRow) => {
@@ -3422,8 +3425,9 @@ export default function Emprestimos() {
                       const b64 = comprovantePdfToBase64(doc);
                       // Mantém a legenda do PDF enxuta; a colinha de saldo vai como msg separada quando via API.
                       const res = await sendWhatsAppComprovante(comprovanteData.clientPhone, colinha, b64, fileName);
-                      if (res.via === "api") toast.success("PDF e mensagem enviados pelo WhatsApp");
-                      else toast.success("PDF baixado. Abra o WhatsApp e anexe o arquivo se necessário.");
+                      if (res.ok && res.via === "api") toast.success("PDF e mensagem enviados pelo WhatsApp");
+                      else if (res.ok && res.via === "link") toast.success("PDF baixado. Abra o WhatsApp e anexe o arquivo se necessário.");
+                      else toast.error(res.error || "Falha ao enviar pelo WhatsApp");
                       setComprovanteOpen(false);
                     } catch (e) {
                       toast.error(e instanceof Error ? e.message : "Erro ao gerar ou enviar comprovante");
