@@ -14,10 +14,9 @@ interface CompanyContextValue {
 const CompanyContext = createContext<CompanyContextValue | null>(null);
 
 function loadInitialCompany(): CompanyId {
-  if (typeof window === "undefined") return "empresa1";
+  if (typeof window === "undefined") return "imperatriz";
   const stored = localStorage.getItem(STORAGE_KEY) as CompanyId | null;
-  const valid: CompanyId[] = ["empresa1", "empresa2", "empresa3", "empresa4"];
-  return stored && valid.includes(stored) ? stored : "empresa1";
+  return stored === "imperatriz" ? stored : "imperatriz";
 }
 
 export function CompanyProvider({ children }: { children: React.ReactNode }) {
@@ -34,7 +33,7 @@ export function CompanyProvider({ children }: { children: React.ReactNode }) {
     [companyId, queryClient]
   );
 
-  const companyName = COMPANIES.find((c) => c.id === companyId)?.name ?? "NOVIX CRED";
+  const companyName = COMPANIES.find((c) => c.id === companyId)?.name ?? "CRED CARD - IMPERATRIZ";
   const value = useMemo(
     () => ({
       companyId,

@@ -36,7 +36,6 @@ const financialItems = [
 const systemItems = [
   { title: "Relatórios", url: "/relatorios", icon: BarChart3 },
   { title: "PDFs", url: "/pdfs", icon: FileText },
-  { title: "Gestão de Tráfego", url: "/gestao-trafego", icon: BarChart3 },
   { title: "Configurações", url: "/configuracoes", icon: Settings },
   { title: "Usuários", url: "/usuarios", icon: UserCog },
 ];
@@ -99,8 +98,8 @@ export function AppSidebar() {
             </div>
             {!collapsed && (
               <div>
-                <h1 className="text-sm font-bold text-foreground tracking-tight">NEXUS</h1>
-                <p className="text-[10px] text-muted-foreground">Gestão Financeira</p>
+                <h1 className="text-sm font-bold text-foreground tracking-tight">CRED CARD</h1>
+                <p className="text-[10px] text-muted-foreground">Imperatriz</p>
               </div>
             )}
           </div>

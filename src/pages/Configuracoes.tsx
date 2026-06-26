@@ -74,9 +74,9 @@ import {
   fetchConnectionStateForInstance,
 } from "@/api/evolution";
 import {
-  buildCobrancaMessage,
+  buildAutomationCobrancaMessage,
+  buildAutomationLembreteMessage,
   buildCobrancaParcelamentoMessage,
-  buildLembreteHojeMessage,
   buildLembreteMessage,
   buildLembretePagamentoMessage,
   resolvePixInfoForMessages,
@@ -1029,16 +1029,10 @@ export default function Configuracoes() {
   };
 
   const buildAutomationMessage = (item: AutomationLoan, pixInfo: PixInfo): string => {
-    const cobranca =
-      item.source === "installment"
-        ? buildCobrancaParcelamentoMessage(item.loan, pixInfo, 50)
-        : buildCobrancaMessage(item.loan, pixInfo, 50);
-    if (item.type === "cobranca") return cobranca;
-    if (item.type === "lembrete_hoje") {
-      // Vencem hoje também são tratados como cobrança
-      return cobranca;
+    if (item.type === "cobranca" || item.type === "lembrete_hoje") {
+      return buildAutomationCobrancaMessage(item.loan, pixInfo, 50, undefined, item.source);
     }
-    return buildLembreteMessage(item.loan, pixInfo);
+    return buildAutomationLembreteMessage(item.loan, pixInfo, item.days_until_due ?? 1);
   };
 
   const handleConfirmDelayAndStartQueue = async () => {

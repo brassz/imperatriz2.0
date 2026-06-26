@@ -4,7 +4,15 @@
  */
 
 import { PDF_BRAND } from "./pdf-branding";
-import { getSupabaseCompany } from "@/lib/supabase";
+import type { CompanyId } from "@/lib/companies";
+import {
+  formatOverdueWeeksLabel,
+  formatUnaiCurrencyBr,
+  formatUnaiDateBr,
+  formatUnaiWeeklyScheduleTable,
+  type UnaiWeeklyMessageContext,
+} from "@/lib/unai-cred";
+import { calendarDateInBrazil } from "@/lib/brazil-date";
 
 export type PixInfo = {
   tipo: string;
@@ -12,16 +20,12 @@ export type PixInfo = {
   chave: string;
 };
 
-/** Titular exibido nas mensagens de cobrança da NOVIX CRED (empresa1). */
-export const NOVIX_PIX_TITULAR = "RESOLVA SOLUCOES ASSESSORIA E CONSULTORIA LTDA";
-
-export function resolvePixTitularForMessages(titular: string): string {
-  if (getSupabaseCompany() === "empresa1") return NOVIX_PIX_TITULAR;
+export function resolvePixTitularForMessages(titular: string, _companyId?: CompanyId): string {
   return titular;
 }
 
-export function resolvePixInfoForMessages(pix: PixInfo): PixInfo {
-  const titular = resolvePixTitularForMessages(pix.titular);
+export function resolvePixInfoForMessages(pix: PixInfo, companyId?: CompanyId): PixInfo {
+  const titular = resolvePixTitularForMessages(pix.titular, companyId);
   return titular === pix.titular ? pix : { ...pix, titular };
 }
 
@@ -34,6 +38,8 @@ export type LoanForMessage = {
   fine: number;
   due_date: string;
   minimumPayment?: number;
+  /** Cronograma semanal Unaí Cred (semanal_1 / semanal_2). */
+  unai_weekly?: UnaiWeeklyMessageContext;
 };
 
 function formatDateBr(s: string) {
@@ -50,21 +56,22 @@ function formatCurrency(n: number) {
  * Nome da empresa nas mensagens (alinhado ao PDF / VITE_* / filial).
  * Mantém overrides por `company` no Supabase quando existirem.
  */
-function getMessageBrandTitle(): string {
-  const companyId = getSupabaseCompany();
-  if (companyId === "empresa2") return "LITORALCRED";
-  if (companyId === "empresa4") return "CREDCAR";
-  return PDF_BRAND.companyDisplayName;
+function getMessageBrandTitle(_companyId?: CompanyId): string {
+  return PDF_BRAND.companyDisplayName || "CRED CARD - IMPERATRIZ";
 }
 
 /** Mensagem de COBRANÇA (vencidos e vence hoje) */
 export function buildCobrancaMessage(
   loan: LoanForMessage,
   pix: PixInfo,
-  multaDiaria = 50
+  multaDiaria = 50,
+  companyId?: CompanyId,
 ): string {
-  const p = resolvePixInfoForMessages(pix);
-  const title = getMessageBrandTitle();
+  if (loan.unai_weekly) {
+    return buildUnaiWeeklyCobrancaMessage(loan, pix, multaDiaria, companyId);
+  }
+  const p = resolvePixInfoForMessages(pix, companyId);
+  const title = getMessageBrandTitle(companyId);
   const venc = formatDateBr(loan.due_date);
   const valor = formatCurrency(loan.amount);
   const cap = formatCurrency(loan.capital);
@@ -84,6 +91,104 @@ Chave: ${p.chave}
 ⚠️ Após vencimento: multa diária R$ ${multaDiaria}. Enviar comprovante (obrigatório se pago em outra titularidade).`;
 }
 
+/** Cobrança empréstimo semanal Unaí Cred — indica semana(s) em atraso + cronograma. */
+export function buildUnaiWeeklyCobrancaMessage(
+  loan: LoanForMessage,
+  pix: PixInfo,
+  multaDiaria = 50,
+  companyId?: CompanyId,
+): string {
+  const weekly = loan.unai_weekly!;
+  const p = resolvePixInfoForMessages(pix, companyId);
+  const title = getMessageBrandTitle(companyId);
+  const today = calendarDateInBrazil();
+  const table = formatUnaiWeeklyScheduleTable(weekly.installments, today);
+  const parcelas = formatUnaiCurrencyBr(weekly.weeks_amount_due);
+  const multa = formatUnaiCurrencyBr(weekly.fine);
+  const total = formatUnaiCurrencyBr(weekly.weeks_amount_due + weekly.fine);
+  const venc = formatUnaiDateBr(weekly.primary_due_date);
+
+  const overdueLine =
+    weekly.overdue_weeks.length > 0
+      ? `⚠️ ${formatOverdueWeeksLabel(weekly.overdue_weeks)} (venc. ${venc})`
+      : `📅 Semana ${weekly.focus_week} — venc.: ${venc}`;
+
+  return `🔴 COBRANÇA – ${title}
+
+Cliente: ${loan.client_name}
+${overdueLine}
+
+💵 Valor da(s) semana(s) em aberto: ${parcelas}
+💰 Multa: ${multa}
+💳 Total a pagar: ${total}
+
+${table}
+
+💳 PIX – ${p.tipo}
+Titular: ${p.titular}
+Chave: ${p.chave}
+
+⚠️ Após vencimento: multa diária R$ ${multaDiaria}. Enviar comprovante (obrigatório se pago em outra titularidade).`;
+}
+
+/** Lembrete semanal Unaí Cred (vence hoje / amanhã). */
+export function buildUnaiWeeklyLembreteMessage(
+  loan: LoanForMessage,
+  pix: PixInfo,
+  companyId?: CompanyId,
+): string {
+  const weekly = loan.unai_weekly!;
+  const p = resolvePixInfoForMessages(pix, companyId);
+  const title = getMessageBrandTitle(companyId);
+  const today = calendarDateInBrazil();
+  const table = formatUnaiWeeklyScheduleTable(weekly.installments, today);
+  const venc = formatUnaiDateBr(weekly.primary_due_date);
+  const valor = formatUnaiCurrencyBr(weekly.weeks_amount_due);
+
+  return `🔔 LEMBRETE DE PAGAMENTO – ${title}
+
+Cliente: ${loan.client_name}
+📅 Semana ${weekly.focus_week} — vencimento: ${venc}
+
+💵 Valor da semana: ${valor}
+
+${table}
+
+💳 PIX
+* Banco: ${p.tipo}
+* Titular: ${p.titular}
+* Chave: ${p.chave}
+
+Por favor, organize o pagamento até a data de vencimento.`;
+}
+
+/** Roteia cobrança automática (empréstimo, parcelamento ou semanal Unaí). */
+export function buildAutomationCobrancaMessage(
+  loan: LoanForMessage,
+  pix: PixInfo,
+  multaDiaria = 50,
+  companyId?: CompanyId,
+  source?: "loan" | "installment",
+): string {
+  if (source === "installment") {
+    return buildCobrancaParcelamentoMessage(loan, pix, multaDiaria, companyId);
+  }
+  return buildCobrancaMessage(loan, pix, multaDiaria, companyId);
+}
+
+/** Roteia lembrete automático. */
+export function buildAutomationLembreteMessage(
+  loan: LoanForMessage,
+  pix: PixInfo,
+  daysUntilDue = 1,
+  companyId?: CompanyId,
+): string {
+  if (loan.unai_weekly) {
+    return buildUnaiWeeklyLembreteMessage(loan, pix, companyId);
+  }
+  return buildLembretePagamentoMessage(loan, pix, daysUntilDue, companyId);
+}
+
 /**
  * Cobrança para parcelamento: valor da parcela (campo `capital` no modelo), sem linha de juros — só multa.
  */
@@ -91,9 +196,10 @@ export function buildCobrancaParcelamentoMessage(
   loan: LoanForMessage,
   pix: PixInfo,
   multaDiaria = 50,
+  companyId?: CompanyId,
 ): string {
-  const p = resolvePixInfoForMessages(pix);
-  const title = getMessageBrandTitle();
+  const p = resolvePixInfoForMessages(pix, companyId);
+  const title = getMessageBrandTitle(companyId);
   const venc = formatDateBr(loan.due_date);
   const valor = formatCurrency(loan.amount);
   const parcela = formatCurrency(loan.capital);
@@ -233,9 +339,10 @@ _Equipe ${brandUpper}_`;
 /** Mensagem de LEMBRETE (1 dia antes - vence amanhã) */
 export function buildLembreteMessage(
   loan: LoanForMessage,
-  pix: PixInfo
+  pix: PixInfo,
+  companyId?: CompanyId,
 ): string {
-  return buildLembretePagamentoMessage(loan, pix, 1);
+  return buildLembretePagamentoMessage(loan, pix, 1, companyId);
 }
 
 /** Lembrete de pagamento (data de vencimento sem texto relativo). */
@@ -243,15 +350,20 @@ export function buildLembretePagamentoMessage(
   loan: LoanForMessage,
   pix: PixInfo,
   _daysUntilDue = 1,
+  companyId?: CompanyId,
 ): string {
-  const p = resolvePixInfoForMessages(pix);
-  const title = getMessageBrandTitle();
+  const p = resolvePixInfoForMessages(pix, companyId);
+  const title = getMessageBrandTitle(companyId);
   const venc = formatDateBr(loan.due_date);
   const valor = formatCurrency(loan.amount);
   const juros = formatCurrency(loan.interest);
   const minimo = formatCurrency(loan.minimumPayment ?? loan.interest);
 
   const isParcel = loan.interest === 0 && loan.fine === 0 && loan.capital === loan.amount;
+
+  if (loan.unai_weekly) {
+    return buildUnaiWeeklyLembreteMessage(loan, pix, companyId);
+  }
 
   if (isParcel) {
     return `🔔 LEMBRETE DE PAGAMENTO – ${title}

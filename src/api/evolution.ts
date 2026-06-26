@@ -474,7 +474,7 @@ export async function sendWhatsAppText(number: string, text: string): Promise<{ 
 
 /**
  * Envia texto pela Evolution usando instância + apiKey informados (bypassa config do usuário).
- * Usado para login via token (instância "nexuslogin").
+ * Usado para login via token (instância credcardlogin).
  */
 export async function sendWhatsAppTextWithInstance(
   number: string,

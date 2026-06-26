@@ -2,40 +2,30 @@ import { createClient, SupabaseClient } from "@supabase/supabase-js";
 import type { CompanyId } from "./companies";
 import { STORAGE_KEY } from "./companies";
 
-const envKeys: Record<CompanyId, { url: string; key: string }> = {
-  empresa1: {
-    url: import.meta.env.VITE_SUPABASE_URL_EMPRESA1 || import.meta.env.VITE_SUPABASE_URL,
-    key: import.meta.env.VITE_SUPABASE_ANON_KEY_EMPRESA1 || import.meta.env.VITE_SUPABASE_ANON_KEY,
-  },
-  empresa2: {
-    url: import.meta.env.VITE_SUPABASE_URL_EMPRESA2,
-    key: import.meta.env.VITE_SUPABASE_ANON_KEY_EMPRESA2,
-  },
-  empresa3: {
-    url: import.meta.env.VITE_SUPABASE_URL_EMPRESA3,
-    key: import.meta.env.VITE_SUPABASE_ANON_KEY_EMPRESA3,
-  },
-  empresa4: {
-    url: import.meta.env.VITE_SUPABASE_URL_EMPRESA4,
-    key: import.meta.env.VITE_SUPABASE_ANON_KEY_EMPRESA4,
-  },
-};
+const SUPABASE_URL =
+  import.meta.env.VITE_SUPABASE_URL ||
+  import.meta.env.VITE_SUPABASE_URL_EMPRESA1 ||
+  "";
+const SUPABASE_ANON_KEY =
+  import.meta.env.VITE_SUPABASE_ANON_KEY ||
+  import.meta.env.VITE_SUPABASE_ANON_KEY_EMPRESA1 ||
+  "";
 
-function createClientForCompany(companyId: CompanyId): SupabaseClient {
-  const { url, key } = envKeys[companyId] || envKeys.empresa1;
-  if (!url || !key) {
+function createClientForCompany(_companyId: CompanyId): SupabaseClient {
+  if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
     console.warn(
-      `Supabase não configurado para ${companyId}. Configure VITE_SUPABASE_URL_EMPRESA* e VITE_SUPABASE_ANON_KEY_EMPRESA* no .env`
+      "Supabase não configurado. Configure VITE_SUPABASE_URL e VITE_SUPABASE_ANON_KEY no .env"
     );
   }
-  return createClient(url || "", key || "");
+  return createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 }
 
-const validIds: CompanyId[] = ["empresa1", "empresa2", "empresa3", "empresa4"];
+const DEFAULT_COMPANY: CompanyId = "imperatriz";
+
 function loadStoredCompany(): CompanyId {
-  if (typeof window === "undefined") return "empresa1";
+  if (typeof window === "undefined") return DEFAULT_COMPANY;
   const stored = localStorage.getItem(STORAGE_KEY) as CompanyId | null;
-  return stored && validIds.includes(stored) ? stored : "empresa1";
+  return stored === "imperatriz" ? stored : DEFAULT_COMPANY;
 }
 
 let currentCompanyId: CompanyId = loadStoredCompany();
@@ -52,6 +42,18 @@ export function setSupabaseCompany(companyId: CompanyId): void {
 
 export function getSupabaseCompany(): CompanyId {
   return currentCompanyId;
+}
+
+const clientCache = new Map<CompanyId, SupabaseClient>();
+
+/** Cliente Supabase de uma empresa sem alterar a empresa ativa da sessão. */
+export function getSupabaseClientForCompany(companyId: CompanyId): SupabaseClient {
+  let client = clientCache.get(companyId);
+  if (!client) {
+    client = createClientForCompany(companyId);
+    clientCache.set(companyId, client);
+  }
+  return client;
 }
 
 export const supabase = new Proxy(currentClient, {

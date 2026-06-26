@@ -6,7 +6,6 @@ import { Navigate } from "react-router-dom";
 import { motion } from "framer-motion";
 import { useAuth } from "@/contexts/AuthContext";
 import { useCompany } from "@/contexts/CompanyContext";
-import { CompanySelector } from "@/components/CompanySelector";
 import { InteractiveAppBackground } from "@/components/InteractiveAppBackground";
 import { toast } from "sonner";
 
@@ -16,7 +15,7 @@ export default function Login() {
   const [step, setStep] = useState<"email" | "token">("email");
   const [isSubmitting, setIsSubmitting] = useState(false);
   const { requestToken, verifyToken, isAuthenticated } = useAuth();
-  const { companyId } = useCompany();
+  const { companyId, companyName } = useCompany();
 
   if (isAuthenticated) return <Navigate to="/" replace />;
 
@@ -70,21 +69,17 @@ export default function Login() {
             <div className="h-12 w-12 rounded-xl bg-primary/20 flex items-center justify-center mx-auto">
               <Landmark className="h-6 w-6 text-primary" />
             </div>
-            <h1 className="text-xl font-bold text-foreground tracking-tight">NEXUS</h1>
-            <p className="text-xs text-muted-foreground">Gestão Financeira</p>
+            <h1 className="text-xl font-bold text-foreground tracking-tight">CRED CARD</h1>
+            <p className="text-xs text-muted-foreground">{companyName}</p>
           </div>
 
           <form onSubmit={step === "email" ? handleRequestToken : handleVerifyToken} className="space-y-4">
-            <div className="space-y-1.5 w-full">
-              <label className="text-xs font-medium text-muted-foreground block text-center">Empresa</label>
-              <CompanySelector />
-            </div>
             <div className="space-y-1.5">
               <label className="text-xs font-medium text-muted-foreground">Email</label>
               <Input
                 type="email"
                 autoComplete="email"
-                placeholder="admin@nexus.com"
+                placeholder="admin@credcard.com"
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
                 className="nexus-input"
@@ -126,7 +121,7 @@ export default function Login() {
           </form>
 
           <p className="text-[10px] text-center text-muted-foreground">
-            © 2026 NEXUS Gestão Financeira
+            © 2026 CRED CARD - Imperatriz
           </p>
         </div>
       </motion.div>

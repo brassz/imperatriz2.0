@@ -7,8 +7,7 @@ import { fetchPixKeys } from "@/api/pix-keys";
 import { useAuth } from "@/contexts/AuthContext";
 import { useAutomationQueue } from "@/contexts/AutomationQueueContext";
 import {
-  buildCobrancaMessage,
-  buildCobrancaParcelamentoMessage,
+  buildAutomationCobrancaMessage,
   resolvePixInfoForMessages,
   type PixInfo,
 } from "@/lib/whatsapp-messages";
@@ -149,10 +148,7 @@ export function StartupCobrancaModal() {
         delayMs,
         pixInfo,
         sendTypes,
-        buildMessage: (item, p) =>
-          item.source === "installment"
-            ? buildCobrancaParcelamentoMessage(item.loan, p, 50)
-            : buildCobrancaMessage(item.loan, p, 50),
+        buildMessage: (item, p) => buildAutomationCobrancaMessage(item.loan, p, 50, undefined, item.source),
       });
       toast.success("Fila de cobranças iniciada. Acompanhe no canto da tela.");
     } catch (e) {

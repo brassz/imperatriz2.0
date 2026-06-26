@@ -19,38 +19,36 @@ export const EVOLUTION_PROFILE_LABELS: Record<EvolutionProfileId, string> = {
   cobranca: "Cobrança",
 };
 
-const FIXED_EVOLUTION_BASE_URL = "https://sapphiredev.com.br";
+export const FIXED_EVOLUTION_BASE_URL = "https://sapphiredev.com.br";
 
-/** Instâncias oficiais e API key correspondente (header apikey). */
+/** Instância dedicada ao envio de token de login. */
+export const LOGIN_EVOLUTION_INSTANCE = "credcardlogin";
+
+/** Instâncias oficiais CRED CARD - IMPERATRIZ e API key correspondente (header apikey). */
 export const EVOLUTION_INSTANCE_API_KEYS: Record<string, string> = {
-  vinicius: "142CE646BFB4-49A2-9BB5-D775F2B4FD22",
-  litoral: "94CF7A25C270-4057-8A92-194B4B9A7B81",
-  imperatriz: "DC1496386FE8-4B2F-B871-D96689DFBC4E",
-  imperatriz2: "5BB9A2339955-4264-8FC3-80CB32EA14E6",
-  rafael: "2D8DE0E7FE94-4441-A004-EF88849900E7",
-  novixcred: "C6C119E91CEF-4A96-8336-18AAD15E84C6",
-  nobrega: "D879B3B8ED95-4D6E-9174-AC081E4351C3",
-  luciana: "AF9F4C62CC87-4B2A-B4DF-EF3F8CDF5C77",
-  advocacianexus1: "BD6CAFED22C2-4A58-A4E6-3D0E568F6BA5",
-  advocacianexus2: "21BF47876816-45E0-B896-47940EB69C9F",
+  credcardlogin: "0F3BD7C3CA06-4C2E-B415-241CB195C60E",
+  imperatrizcredcard: "0B30A3953B15-42E5-B48C-01E49BAF3889",
+  imperatrizcredcard2: "A1DF53512E58-4CD2-B917-8D905028F969",
 };
 
 export const EVOLUTION_INSTANCE_IDS = [
-  "vinicius",
-  "nobrega",
-  "litoral",
-  "imperatriz",
-  "imperatriz2",
-  "rafael",
-  "novixcred",
-  "luciana",
+  "imperatrizcredcard",
+  "imperatrizcredcard2",
 ] as const;
 
-/** Instâncias WhatsApp da aba Advocacia (Capital Advocacia). */
-export const ADVOCACIA_INSTANCE_IDS = ["advocacianexus1", "advocacianexus2"] as const;
+/** Instâncias WhatsApp da aba Advocacia (desativadas nesta operação). */
+export const ADVOCACIA_INSTANCE_IDS = [] as const;
+
+/** Instância dedicada à automação 24HORAS (desativada por enquanto). */
+export const COBRANCA_24H_INSTANCE_IDS = [] as const;
 
 const DEFAULT_PROFILE_INSTANCE: Record<EvolutionProfileId, string> = {
-  cobranca: "vinicius",
+  cobranca: "imperatrizcredcard",
+};
+
+/** Instância padrão de cobrança por empresa (quando ainda não há preferência salva). */
+const COMPANY_DEFAULT_INSTANCE: Partial<Record<string, string>> = {
+  imperatriz: "imperatrizcredcard",
 };
 
 export function normalizeEvolutionInstanceId(id: string): string {
@@ -67,7 +65,8 @@ export function getApiKeyForEvolutionInstance(instance: string): string {
 }
 
 function getDefaultEvolutionConfig(profile: EvolutionProfileId): EvolutionConfig {
-  const instance = DEFAULT_PROFILE_INSTANCE[profile];
+  const companyId = getSupabaseCompany();
+  const instance = COMPANY_DEFAULT_INSTANCE[companyId] || DEFAULT_PROFILE_INSTANCE[profile];
   return {
     baseUrl: FIXED_EVOLUTION_BASE_URL,
     apiKey: getApiKeyForEvolutionInstance(instance),

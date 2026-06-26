@@ -1,20 +1,10 @@
-import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import type { User } from "@/api/auth";
 import { getStoredUser } from "@/api/auth";
 import { fetchEmployeesWithPaymentToday } from "@/api/employees";
 import { toast } from "@/hooks/use-toast";
-
-interface AuthContextValue {
-  user: User | null;
-  isAuthenticated: boolean;
-  isLoading: boolean;
-  requestToken: (companyId: string, email: string) => Promise<void>;
-  verifyToken: (companyId: string, email: string, token: string) => Promise<void>;
-  logout: () => void;
-}
-
-const AuthContext = createContext<AuthContextValue | null>(null);
+import { AuthContext, type AuthContextValue } from "@/contexts/auth-context";
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
@@ -88,7 +78,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     navigate("/login");
   }, [navigate]);
 
-  const value = useMemo(
+  const value = useMemo<AuthContextValue>(
     () => ({
       user,
       isAuthenticated: !!user,
@@ -103,8 +93,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 }
 
-export function useAuth() {
-  const ctx = useContext(AuthContext);
+export function useAuth(): AuthContextValue {
+  const ctx = React.useContext(AuthContext);
   if (!ctx) throw new Error("useAuth must be used within AuthProvider");
   return ctx;
 }

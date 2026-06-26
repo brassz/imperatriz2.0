@@ -151,6 +151,24 @@ export async function fetchClientById(id: string) {
   return data;
 }
 
+/** Mapa client_id → endereço (lote). */
+export async function fetchClientAddressesByIds(ids: string[]): Promise<Record<string, string>> {
+  const unique = [...new Set(ids.map((id) => String(id || "").trim()).filter(Boolean))];
+  if (!unique.length) return {};
+
+  const map: Record<string, string> = {};
+  const CHUNK = 100;
+  for (let i = 0; i < unique.length; i += CHUNK) {
+    const chunk = unique.slice(i, i + CHUNK);
+    const { data, error } = await supabase.from("clients").select("id, address").in("id", chunk);
+    if (error) throw error;
+    for (const row of (data || []) as Array<Record<string, unknown>>) {
+      map[String(row.id)] = String(row.address || "");
+    }
+  }
+  return map;
+}
+
 export async function fetchClientByPhone(phone: string) {
   const target = normalizePhoneDigits(phone);
   if (!target) return null;

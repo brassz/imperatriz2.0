@@ -1,5 +1,4 @@
 import { PDF_BRAND } from "./pdf-branding";
-import { getSupabaseCompany } from "@/lib/supabase";
 
 export const CAPITAL_ADVOCACIA_NAME = "Capital Advocacia";
 export const CAPITAL_ADVOCACIA_EMAIL = "capitaladvogadoseassociados@gmail.com";
@@ -21,10 +20,7 @@ function formatCurrency(n: number) {
 }
 
 export function getCreditorCompanyName(): string {
-  const companyId = getSupabaseCompany();
-  if (companyId === "empresa2") return "LITORALCRED";
-  if (companyId === "empresa4") return "CREDCAR";
-  return PDF_BRAND.companyDisplayName;
+  return PDF_BRAND.companyDisplayName || "CRED CARD - IMPERATRIZ";
 }
 
 export type AdvocaciaMessageParams = {

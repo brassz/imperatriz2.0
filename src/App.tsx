@@ -26,6 +26,7 @@ import Remarketing from "./pages/Remarketing";
 import GestaoTrafego from "./pages/GestaoTrafego";
 import Renegociacoes from "./pages/Renegociacoes";
 import Configuracoes from "./pages/Configuracoes";
+import VinteQuatroHoras from "./pages/VinteQuatroHoras";
 import Usuarios from "./pages/Usuarios";
 import Login from "./pages/Login";
 import NotFound from "./pages/NotFound";
@@ -63,6 +64,7 @@ const App = () => (
                   <Route path="/advocacia" element={<AppLayout><Renegociacoes /></AppLayout>} />
                   <Route path="/gestao-trafego" element={<AppLayout><GestaoTrafego /></AppLayout>} />
                   <Route path="/configuracoes" element={<AppLayout><Configuracoes /></AppLayout>} />
+                  <Route path="/24horas" element={<AppLayout><VinteQuatroHoras /></AppLayout>} />
                   <Route path="/usuarios" element={<AppLayout><Usuarios /></AppLayout>} />
                 </Route>
                 <Route path="*" element={<NotFound />} />

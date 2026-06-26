@@ -4,9 +4,11 @@ import type { User } from "@/api/auth";
 import { sendWhatsAppTextWithInstance } from "@/api/evolution";
 import { calculateLoanRemaining } from "@/api/loan-calc";
 import { calendarDateInBrazil, tomorrowCalendarDateBrazil } from "@/lib/brazil-date";
-
-const LOGIN_INSTANCE = "nexuslogin";
-const LOGIN_INSTANCE_APIKEY = "52BA96F8052A-416A-9EB2-D9A189857294";
+import {
+  FIXED_EVOLUTION_BASE_URL,
+  getApiKeyForEvolutionInstance,
+  LOGIN_EVOLUTION_INSTANCE,
+} from "@/lib/evolution-settings";
 
 const TOKEN_TTL_MIN = 10;
 
@@ -137,7 +139,7 @@ async function buildLoginConfirmedDailySummaryMessage(): Promise<string> {
   const bar = progressBarText(progressPct);
 
   return (
-    `✅ *NEXUS — Acesso confirmado*\n\n` +
+    `✅ *CRED CARD — Acesso confirmado*\n\n` +
     `Segue informações do dia de hoje (*${todayLabel}*):\n\n` +
     `*Valor total a receber:* ${fmtBrl(totalJurosHoje)}\n\n` +
     `*Empréstimos que vencem hoje:* ${qtdEmprestimos}\n\n` +
@@ -145,6 +147,33 @@ async function buildLoginConfirmedDailySummaryMessage(): Promise<string> {
     `${bar}\n` +
     `(${paidLoansToday}/${qtdEmprestimos} pagos hoje)`
   );
+}
+
+function supabaseUserError(error: { message?: string; code?: string }): string {
+  const msg = String(error.message || "");
+  if (error.code === "42703" || msg.includes("phone")) {
+    return "Banco sem coluna phone. Execute a migração 20260625130000_imperatriz_whatsapp_token_login.sql no Supabase.";
+  }
+  if (error.code === "PGRST205" || msg.includes("login_tokens")) {
+    return "Tabela login_tokens ausente. Execute a migração de login no Supabase.";
+  }
+  return msg ? `Erro ao buscar usuário: ${msg}` : "Erro ao buscar usuário";
+}
+
+function formatWhatsappSendError(raw: string | undefined): string {
+  const text = String(raw || "").trim();
+  if (!text) return `Falha ao enviar token no WhatsApp (instância ${LOGIN_EVOLUTION_INSTANCE})`;
+  try {
+    const parsed = JSON.parse(text) as { message?: string | string[]; error?: string };
+    const m = parsed.message;
+    if (Array.isArray(m)) return m.join(" — ");
+    if (typeof m === "string" && m.trim()) return m;
+    if (parsed.error) return String(parsed.error);
+  } catch {
+    // texto puro da API
+  }
+  if (text.length > 180) return `${text.slice(0, 180)}…`;
+  return text;
 }
 
 export async function requestWhatsappLoginToken(companyId: string, email: string): Promise<{ ok: true } | { ok: false; error: string }> {
@@ -157,12 +186,17 @@ export async function requestWhatsappLoginToken(companyId: string, email: string
     .select("id, full_name, email, role, is_active, phone")
     .eq("email", normEmail)
     .maybeSingle();
-  if (error) return { ok: false, error: "Erro ao buscar usuário" };
-  if (!data) return { ok: false, error: "Usuário não encontrado" };
+  if (error) return { ok: false, error: supabaseUserError(error) };
+  if (!data) return { ok: false, error: "Usuário não encontrado. Use o e-mail cadastrado no sistema (ex.: admin@credcard.com)." };
   if ((data as any).is_active === false) return { ok: false, error: "Usuário inativo" };
 
   const phone = String((data as any).phone || "").trim();
-  if (!phone) return { ok: false, error: "Usuário sem telefone cadastrado para receber token" };
+  if (!phone) {
+    return {
+      ok: false,
+      error: `Usuário sem telefone cadastrado (${normEmail}). Cadastre o WhatsApp na tabela users.phone.`,
+    };
+  }
 
   const token = randomToken();
   const tokenHash = await sha256Hex(`${normEmail}:${token}`);
@@ -181,7 +215,7 @@ export async function requestWhatsappLoginToken(companyId: string, email: string
   if (insErr) return { ok: false, error: "Erro ao gerar token" };
 
   const msg =
-    `🔐 *NEXUS — Token de acesso*\n\n` +
+    `🔐 *CRED CARD — Token de acesso*\n\n` +
     `*CÓDIGO DE ACESSO:*\n\n` +
     `${token}\n\n` +
     `⏳ Validade: *${TOKEN_TTL_MIN} minutos*\n` +
@@ -189,10 +223,16 @@ export async function requestWhatsappLoginToken(companyId: string, email: string
     `✅ Se você não solicitou, ignore esta mensagem.`;
 
   const send = await sendWhatsAppTextWithInstance(phone, msg, {
-    instance: LOGIN_INSTANCE,
-    apiKey: LOGIN_INSTANCE_APIKEY,
+    instance: LOGIN_EVOLUTION_INSTANCE,
+    apiKey: getApiKeyForEvolutionInstance(LOGIN_EVOLUTION_INSTANCE),
+    baseUrl: FIXED_EVOLUTION_BASE_URL,
   });
-  if (!send.ok) return { ok: false, error: send.error || "Falha ao enviar token no WhatsApp" };
+  if (!send.ok) {
+    return {
+      ok: false,
+      error: formatWhatsappSendError(send.error) || `Falha ao enviar token no WhatsApp (verifique se ${LOGIN_EVOLUTION_INSTANCE} está conectada)`,
+    };
+  }
 
   return { ok: true };
 }
@@ -250,8 +290,9 @@ export async function verifyWhatsappLoginToken(
   if (phone) {
     const confirmMsg = await buildLoginConfirmedDailySummaryMessage();
     const sendConfirm = await sendWhatsAppTextWithInstance(phone, confirmMsg, {
-      instance: LOGIN_INSTANCE,
-      apiKey: LOGIN_INSTANCE_APIKEY,
+      instance: LOGIN_EVOLUTION_INSTANCE,
+      apiKey: getApiKeyForEvolutionInstance(LOGIN_EVOLUTION_INSTANCE),
+      baseUrl: FIXED_EVOLUTION_BASE_URL,
     });
     if (!sendConfirm.ok) {
       console.warn("[login] Falha ao enviar WhatsApp de confirmação:", sendConfirm.error);

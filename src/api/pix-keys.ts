@@ -1,4 +1,5 @@
 import { supabase } from "@/lib/supabase";
+import type { SupabaseClient } from "@supabase/supabase-js";
 
 const PIX_KEY_TYPE_DB_VALUES = ["cpf", "cnpj", "email", "phone", "random"] as const;
 export type PixKeyTypeDb = (typeof PIX_KEY_TYPE_DB_VALUES)[number];
@@ -58,9 +59,9 @@ function supabasePixErrorMessage(error: { message?: string; details?: string; co
   return error.message || "Erro ao salvar chave PIX";
 }
 
-export async function fetchPixKeys() {
+export async function fetchPixKeysForClient(client: SupabaseClient) {
   try {
-    const { data, error } = await supabase
+    const { data, error } = await client
       .from("pix_keys")
       .select("*")
       .eq("is_active", true)
@@ -78,6 +79,10 @@ export async function fetchPixKeys() {
   } catch {
     return [];
   }
+}
+
+export async function fetchPixKeys() {
+  return fetchPixKeysForClient(supabase);
 }
 
 export type PixKeyInput = {

@@ -17,6 +17,7 @@ import {
   AlertTriangle,
   MessageCircle,
   Gavel,
+  FileDown,
 } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
@@ -38,6 +39,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { fetchAdvocaciaOverdueLoans, type AdvocaciaOverdueLoan } from "@/api/advocacia";
+import { fetchClientById, fetchClientAddressesByIds } from "@/api/clients";
 import { fetchPixKeys } from "@/api/pix-keys";
 import {
   buildRenegotiationWhatsAppMessage,
@@ -78,6 +80,17 @@ import {
   type PropostaRenegociacaoParams,
 } from "@/lib/proposta-renegociacao-pdf";
 import { addCalendarDays, calendarDateInBrazil } from "@/lib/brazil-date";
+import {
+  generateRenegociacaoClientePdf,
+  safeRenegociacaoClienteFileName,
+} from "@/lib/renegociacao-cliente-pdf";
+import {
+  detectClientCity,
+  RENEGOCIACAO_CITY_OPTIONS,
+  renegociacaoCityLabel,
+  type RenegociacaoCityFilter,
+} from "@/lib/renegociacao-client-city";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 
 const CONTACT_STORAGE_KEY = "nexus_renegociacoes_contact_phone";
 const INSTANCE_STORAGE_KEY = "nexus_renegociacoes_instance";
@@ -225,6 +238,7 @@ function DebtDetailsPanel({ item }: { item: AdvocaciaOverdueLoan }) {
 export default function Renegociacoes() {
   const queryClient = useQueryClient();
   const [search, setSearch] = useState("");
+  const [cityFilter, setCityFilter] = useState<RenegociacaoCityFilter>("all");
   const [instance, setInstance] = useState(() => loadStored(INSTANCE_STORAGE_KEY, ADVOCACIA_INSTANCE_IDS[0]));
   const [contactPhone, setContactPhone] = useState(() => loadStored(CONTACT_STORAGE_KEY, ""));
   const [proposalItem, setProposalItem] = useState<AdvocaciaOverdueLoan | null>(null);
@@ -249,6 +263,7 @@ export default function Renegociacoes() {
   const [saving, setSaving] = useState(false);
   const [sendingProtest, setSendingProtest] = useState(false);
   const [sendingExtrajudicial, setSendingExtrajudicial] = useState(false);
+  const [clientPdfLoadingId, setClientPdfLoadingId] = useState<string | null>(null);
   const [protestSendStatus, setProtestSendStatus] = useState("");
   const [extrajudicialSendStatus, setExtrajudicialSendStatus] = useState("");
   const abortProtestRef = useRef(false);
@@ -320,15 +335,48 @@ export default function Renegociacoes() {
     [proposals],
   );
 
+  const clientIds = useMemo(() => [...new Set(rows.map((r) => r.client_id))], [rows]);
+
+  const { data: addressByClientId = {} } = useQuery({
+    queryKey: ["renegociacoes-client-addresses", clientIds.join(",")],
+    queryFn: () => fetchClientAddressesByIds(clientIds),
+    enabled: clientIds.length > 0,
+    staleTime: 120_000,
+  });
+
+  const cityCounts = useMemo(() => {
+    const counts: Record<RenegociacaoCityFilter, number> = {
+      all: rows.length,
+      praia_grande: 0,
+      sao_vicente: 0,
+      santos: 0,
+      cubatao: 0,
+      outros: 0,
+      sem_endereco: 0,
+    };
+    for (const row of rows) {
+      const city = detectClientCity(addressByClientId[row.client_id]);
+      counts[city] += 1;
+    }
+    return counts;
+  }, [rows, addressByClientId]);
+
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
-    if (!q) return rows;
-    return rows.filter(
+    let list = rows;
+    if (cityFilter !== "all") {
+      list = list.filter(
+        (r) => detectClientCity(addressByClientId[r.client_id]) === cityFilter,
+      );
+    }
+    if (!q) return list;
+    return list.filter(
       (r) =>
         r.loan.client_name.toLowerCase().includes(q) ||
-        r.loan.client_phone.toLowerCase().includes(q),
+        r.loan.client_phone.toLowerCase().includes(q) ||
+        String(addressByClientId[r.client_id] || "").toLowerCase().includes(q),
     );
-  }, [rows, search]);
+  }, [rows, search, cityFilter, addressByClientId]);
 
   const clientsWithoutContact = useMemo(() => {
     return filtered.filter((item) => {
@@ -454,6 +502,33 @@ export default function Renegociacoes() {
     } else {
       setInstallmentAmount("");
       setInstallmentAmountManual(false);
+    }
+  };
+
+  const downloadClientPdf = async (item: AdvocaciaOverdueLoan) => {
+    setClientPdfLoadingId(item.id);
+    try {
+      const clientRow = await fetchClientById(item.client_id);
+      const client = clientRow as Record<string, unknown>;
+      const pdf = generateRenegociacaoClientePdf({
+        item,
+        client: {
+          name: String(client.name || item.loan.client_name),
+          cpf: client.cpf ? String(client.cpf) : null,
+          phone: client.phone ? String(client.phone) : item.loan.client_phone,
+          email: client.email ? String(client.email) : null,
+          address: client.address ? String(client.address) : null,
+          rg: client.rg ? String(client.rg) : null,
+        },
+        creditorName: getCreditorCompanyName(),
+      });
+      const slug = safeRenegociacaoClienteFileName(item.loan.client_name);
+      pdf.save(`ficha-renegociacao-${slug}.pdf`);
+      toast.success(`PDF gerado para ${item.loan.client_name}`);
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "Erro ao gerar PDF");
+    } finally {
+      setClientPdfLoadingId(null);
     }
   };
 
@@ -989,11 +1064,36 @@ export default function Renegociacoes() {
           </div>
         </div>
 
+        <Tabs
+          value={cityFilter}
+          onValueChange={(v) => setCityFilter(v as RenegociacaoCityFilter)}
+          className="mb-4"
+        >
+          <TabsList className="flex flex-wrap h-auto gap-1 bg-muted/40 p-1 w-full justify-start">
+            <TabsTrigger value="all" className="text-[10px] h-8 px-2.5">
+              Todos ({cityCounts.all})
+            </TabsTrigger>
+            {RENEGOCIACAO_CITY_OPTIONS.map((city) => (
+              <TabsTrigger key={city.id} value={city.id} className="text-[10px] h-8 px-2.5">
+                {city.label} ({cityCounts[city.id]})
+              </TabsTrigger>
+            ))}
+            <TabsTrigger value="outros" className="text-[10px] h-8 px-2.5">
+              Outros ({cityCounts.outros})
+            </TabsTrigger>
+            <TabsTrigger value="sem_endereco" className="text-[10px] h-8 px-2.5">
+              Sem endereço ({cityCounts.sem_endereco})
+            </TabsTrigger>
+          </TabsList>
+        </Tabs>
+
         {isLoading ? (
           <div className="py-12 text-center text-sm text-muted-foreground">Carregando...</div>
         ) : filtered.length === 0 ? (
           <div className="py-12 text-center text-sm text-muted-foreground">
-            Nenhum empréstimo ou parcelamento vencido há mais de 60 dias.
+            {cityFilter !== "all"
+              ? `Nenhum cliente em ${renegociacaoCityLabel(cityFilter)} com os filtros atuais.`
+              : "Nenhum empréstimo ou parcelamento vencido há mais de 60 dias."}
           </div>
         ) : (
           <div className="h-[min(520px,60vh)] overflow-y-auto overflow-x-hidden rounded-lg border">
@@ -1016,13 +1116,20 @@ export default function Renegociacoes() {
                   const isRenegotiated = renegotiatedClientIds.has(item.client_id);
                   return (
                     <tr key={item.id} className="border-b border-border/40 hover:bg-muted/30">
-                      <td className={`p-3 font-medium truncate ${isRenegotiated ? "text-orange-600 dark:text-orange-400" : ""}`}>
-                        {item.loan.client_name}
-                        {prop ? (
-                          <Badge variant="outline" className="ml-2 text-[9px]">
-                            {proposalStatusLabel(prop)}
-                          </Badge>
-                        ) : null}
+                      <td className={`p-3 font-medium ${isRenegotiated ? "text-orange-600 dark:text-orange-400" : ""}`}>
+                        <div className="min-w-0">
+                          <div className="flex flex-wrap items-center gap-1">
+                            <span className="truncate">{item.loan.client_name}</span>
+                            {prop ? (
+                              <Badge variant="outline" className="text-[9px] shrink-0">
+                                {proposalStatusLabel(prop)}
+                              </Badge>
+                            ) : null}
+                          </div>
+                          <span className="block text-[9px] text-muted-foreground font-normal truncate">
+                            {renegociacaoCityLabel(detectClientCity(addressByClientId[item.client_id]))}
+                          </span>
+                        </div>
                       </td>
                       <td className="p-3">
                         <Badge variant="outline" className="text-[10px] font-normal">
@@ -1045,6 +1152,21 @@ export default function Renegociacoes() {
                       </td>
                       <td className="p-3">
                         <div className="flex flex-wrap gap-1 justify-end">
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="icon"
+                            className="h-7 w-7"
+                            title="Gerar PDF do cliente"
+                            disabled={clientPdfLoadingId === item.id}
+                            onClick={() => void downloadClientPdf(item)}
+                          >
+                            {clientPdfLoadingId === item.id ? (
+                              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                            ) : (
+                              <FileDown className="h-3.5 w-3.5" />
+                            )}
+                          </Button>
                           <Button
                             type="button"
                             variant="ghost"
@@ -1307,6 +1429,9 @@ export default function Renegociacoes() {
                     : `Validade da prévia: até ${draftDeadlineLabel}`}
                 </p>
               </div>
+
+              <div className="space-y-2">
+                <Label className="text-xs">Mensagem WhatsApp</Label>
                 <div className="max-h-56 overflow-y-auto overflow-x-hidden rounded-md border bg-muted/20 p-3">
                   <pre className="text-[11px] whitespace-pre-wrap break-words font-sans">{previewPackage.text}</pre>
                 </div>

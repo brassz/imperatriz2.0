@@ -15,6 +15,7 @@ import {
   Tag as TagIcon,
   Archive,
   StickyNote,
+  Copy,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -58,6 +59,8 @@ import {
   markLoanAsPaid,
   fetchLoanById,
   finalizeLoan,
+  fetchLoanClientContacts,
+  type LoanClientContact,
   type LoanSortOption,
 } from "@/api/loans";
 import { fetchInstallments, type InstallmentRow } from "@/api/installments";
@@ -94,6 +97,22 @@ import { useAuth } from "@/contexts/AuthContext";
 import { paymentTypeLabel } from "@/lib/payment-type-label";
 import { useCompany } from "@/contexts/CompanyContext";
 import { PaymentFineWaiveDialog } from "@/components/loans/PaymentFineWaiveDialog";
+import { LoanWeeklyInstallmentsTable } from "@/components/loans/LoanWeeklyInstallmentsTable";
+import {
+  fetchLoanWeeklyInstallments,
+  markLoanWeeklyInstallmentPaid,
+  type LoanWeeklyInstallment,
+} from "@/api/loan-weekly-installments";
+import {
+  buildUnaiWeeklyInstallments,
+  computeUnaiDueDate,
+  isWeeklyLoanProduct,
+  resolveUnaiWeeklyForCobranca,
+  IMPERATRIZ_LOAN_PRODUCT_OPTIONS,
+  supportsWeeklyLoanProducts,
+  unaiLoanProductLabel,
+  type UnaiLoanProduct,
+} from "@/lib/unai-cred";
 import { useEffect } from "react";
 import { useSearchParams } from "react-router-dom";
 
@@ -324,6 +343,7 @@ export default function Emprestimos() {
     amount: "",
     interest_rate: "",
     term_days: "30" as "20" | "30",
+    loan_product: "mensal" as UnaiLoanProduct,
     loan_date: toInputDate(new Date().toISOString()),
     due_date: "",
     capital_raise_id: "",
@@ -340,7 +360,8 @@ export default function Emprestimos() {
   >(null);
   const queryClient = useQueryClient();
   const { user } = useAuth();
-  const { companyName } = useCompany();
+  const { companyId, companyName } = useCompany();
+  const isUnaiCred = supportsWeeklyLoanProducts(companyId);
   const [newTagText, setNewTagText] = useState("");
   const [tagDialogOpen, setTagDialogOpen] = useState(false);
   const [tagDialogClientId, setTagDialogClientId] = useState<string | null>(null);
@@ -353,6 +374,10 @@ export default function Emprestimos() {
   const [notesSearchPayments, setNotesSearchPayments] = useState<PaymentNoteHit[]>([]);
   const [notesSearchPaidLoans, setNotesSearchPaidLoans] = useState<PaidLoanNoteHit[]>([]);
   const [notesSearchHasRun, setNotesSearchHasRun] = useState(false);
+  const [contactsExportOpen, setContactsExportOpen] = useState(false);
+  const [contactsExportLoading, setContactsExportLoading] = useState(false);
+  const [loanClientContacts, setLoanClientContacts] = useState<LoanClientContact[]>([]);
+  const [markingWeeklyId, setMarkingWeeklyId] = useState<string | null>(null);
 
   useEffect(() => {
     setSearch(searchFromUrl);
@@ -431,6 +456,11 @@ export default function Emprestimos() {
     queryKey: ["loan-payments", selectedLoan?.id],
     queryFn: () => fetchPaymentsByLoanId(String(selectedLoan?.id)),
     enabled: !!selectedLoan?.id && viewDetailsOpen,
+  });
+  const { data: weeklyInstallments = [], refetch: refetchWeeklyInstallments } = useQuery({
+    queryKey: ["loan-weekly-installments", selectedLoan?.id],
+    queryFn: () => fetchLoanWeeklyInstallments(String(selectedLoan?.id)),
+    enabled: !!selectedLoan?.id && isUnaiCred && (registerPaymentOpen || viewDetailsOpen || whatsappOpen || fineWaiveOpen),
   });
   const { data: detailsGuarantors = [] } = useQuery({
     queryKey: ["loan-client-guarantors", selectedLoan?.client_id],
@@ -562,8 +592,31 @@ export default function Emprestimos() {
     return toInputDate(d.toISOString());
   };
 
+  const newLoanWeeklyPreview = useMemo(() => {
+    if (!isUnaiCred || !isWeeklyLoanProduct(newLoanForm.loan_product)) return [] as LoanWeeklyInstallment[];
+    const amt = parseMoneyInput(newLoanForm.amount);
+    const rate = parseMoneyInput(newLoanForm.interest_rate);
+    if (!newLoanForm.loan_date || Number.isNaN(amt) || amt <= 0 || Number.isNaN(rate)) return [];
+    return buildUnaiWeeklyInstallments(
+      newLoanForm.loan_product,
+      amt,
+      rate,
+      newLoanForm.loan_date,
+    ).map((row) => ({
+      id: `preview-${row.week_number}`,
+      loan_id: "preview",
+      week_number: row.week_number,
+      due_date: row.due_date,
+      amount: row.amount,
+      status: "pending" as const,
+      paid_at: null,
+      payment_id: null,
+    }));
+  }, [isUnaiCred, newLoanForm.loan_product, newLoanForm.amount, newLoanForm.interest_rate, newLoanForm.loan_date]);
+
   const openNewLoan = () => {
     const today = toInputDate(new Date().toISOString());
+    const defaultProduct: UnaiLoanProduct = "mensal";
     setNewLoanClientSearch("");
     setNewLoanForm({
       client_id: "",
@@ -571,8 +624,9 @@ export default function Emprestimos() {
       // Padrão solicitado para contrato: 1% ao mês (editável).
       interest_rate: "1",
       term_days: "30",
+      loan_product: defaultProduct,
       loan_date: today,
-      due_date: computeDueDate(today, 30),
+      due_date: isUnaiCred ? computeUnaiDueDate(defaultProduct, today) : computeDueDate(today, 30),
       capital_raise_id: "",
       capital_raise_capital: "",
       capital_raise_interest: "",
@@ -627,6 +681,7 @@ export default function Emprestimos() {
         interest_rate: rate,
         loan_date: newLoanForm.loan_date,
         due_date: newLoanForm.due_date,
+        loan_product: isUnaiCred ? newLoanForm.loan_product : undefined,
         capital_raise_id: raiseId ? raiseId : null,
         capital_raise_capital: raiseId ? raiseCap : undefined,
         capital_raise_interest: raiseId ? raiseInt : undefined,
@@ -1240,11 +1295,48 @@ export default function Emprestimos() {
       toast.error("Cliente sem telefone cadastrado");
       return;
     }
+    const pixInfo = { tipo: pix.bank, titular: pix.holder, chave: pix.key };
+    const overdueFine = loanRemaining?.overdueDailyFineOwed ?? 0;
+
+    if (isUnaiCred && isWeeklyLoanProduct(selectedLoanProduct) && weeklyInstallments.length > 0) {
+      const today = calendarDateInBrazil();
+      const weeklyCtx = resolveUnaiWeeklyForCobranca(
+        weeklyInstallments.map((w) => ({
+          week_number: w.week_number,
+          due_date: w.due_date,
+          amount: w.amount,
+          status: w.status,
+        })),
+        today,
+        new Set<string>(),
+      );
+      if (!weeklyCtx) {
+        toast.error("Nenhuma parcela semanal pendente para cobrança");
+        return;
+      }
+      if (overdueFine > 0) weeklyCtx.fine = overdueFine;
+      const loanForMsg = {
+        client_name: String(selectedLoan.client_name),
+        client_phone: phone,
+        amount: weeklyCtx.weeks_amount_due + weeklyCtx.fine,
+        capital: weeklyCtx.weeks_amount_due,
+        interest: 0,
+        fine: weeklyCtx.fine,
+        due_date: weeklyCtx.primary_due_date,
+        minimumPayment: weeklyCtx.weeks_amount_due,
+        unai_weekly: weeklyCtx,
+      };
+      const msg = buildCobrancaMessage(loanForMsg, pixInfo, 50);
+      const res = await sendWhatsAppMessage(phone, msg);
+      if (res.via === "api") toast.success("Mensagem enviada");
+      setWhatsappOpen(false);
+      return;
+    }
+
     const amt = Number(selectedLoan.amount ?? 0);
     const rate = Number(selectedLoan.interest_rate ?? 0);
     const capital = loanRemaining?.capital ?? amt;
     const interest = loanRemaining?.interestAmount ?? amt * (rate / 100);
-    const overdueFine = loanRemaining?.overdueDailyFineOwed ?? 0;
     const baseRemaining = loanRemaining?.remainingAmount ?? amt + amt * (rate / 100);
     const loanForMsg = {
       client_name: String(selectedLoan.client_name),
@@ -1256,7 +1348,6 @@ export default function Emprestimos() {
       due_date: String(selectedLoan.due_date),
       minimumPayment: loanRemaining?.minimumPayment ?? interest,
     };
-    const pixInfo = { tipo: pix.bank, titular: pix.holder, chave: pix.key };
     const msg = buildCobrancaMessage(loanForMsg, pixInfo, 50);
     const res = await sendWhatsAppMessage(phone, msg);
     if (res.via === "api") toast.success("Mensagem enviada");
@@ -1560,6 +1651,72 @@ export default function Emprestimos() {
     }
   };
 
+  const contactsExportText = useMemo(
+    () =>
+      loanClientContacts
+        .map((c) => `${c.client_name}\t${c.client_phone || "—"}`)
+        .join("\n"),
+    [loanClientContacts],
+  );
+
+  const openContactsExport = async () => {
+    setContactsExportOpen(true);
+    setContactsExportLoading(true);
+    setLoanClientContacts([]);
+    try {
+      const rows = await fetchLoanClientContacts();
+      setLoanClientContacts(rows);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Erro ao carregar contatos");
+      setContactsExportOpen(false);
+    } finally {
+      setContactsExportLoading(false);
+    }
+  };
+
+  const copyLoanClientContacts = async () => {
+    if (!loanClientContacts.length) return;
+    const header = "Nome\tTelefone";
+    try {
+      await navigator.clipboard.writeText(`${header}\n${contactsExportText}`);
+      toast.success(`${loanClientContacts.length} contato(s) copiado(s)`);
+    } catch {
+      toast.error("Não foi possível copiar para a área de transferência");
+    }
+  };
+
+  const downloadLoanClientContacts = () => {
+    if (!loanClientContacts.length) return;
+    const header = "Nome\tTelefone\n";
+    const blob = new Blob([header + contactsExportText + "\n"], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `contatos-emprestimos-${calendarDateInBrazil()}.txt`;
+    a.click();
+    URL.revokeObjectURL(url);
+    toast.success("Arquivo baixado");
+  };
+
+  const handleMarkWeekPaid = async (row: LoanWeeklyInstallment) => {
+    setMarkingWeeklyId(row.id);
+    try {
+      await markLoanWeeklyInstallmentPaid(row.id);
+      await refetchWeeklyInstallments();
+      toast.success(`${row.week_number}ª semana marcada como paga`);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Erro ao marcar parcela");
+    } finally {
+      setMarkingWeeklyId(null);
+    }
+  };
+
+  const selectedLoanProduct = String(
+    (loanFull as { loan_product?: unknown } | null | undefined)?.loan_product ??
+      (selectedLoan as { loan_product?: unknown } | null | undefined)?.loan_product ??
+      "mensal",
+  );
+
   /** Só tela cheia de loading na carga inicial; com busca, keepPreviousData mantém dados e o input não some. */
   if (!isParcelamentos && isLoading && data === undefined) {
     return (
@@ -1631,6 +1788,17 @@ export default function Emprestimos() {
             <StickyNote className="h-3.5 w-3.5" />
             Notas e observações
           </Button>
+          {!isParcelamentos && (
+            <Button
+              type="button"
+              variant="outline"
+              className="h-8 text-xs gap-1.5 shrink-0"
+              onClick={() => void openContactsExport()}
+            >
+              <Users className="h-3.5 w-3.5" />
+              Contatos dos clientes
+            </Button>
+          )}
           {!isParcelamentos && (
             <Select
               value={loanSort}
@@ -2164,26 +2332,61 @@ export default function Emprestimos() {
               ) : null}
             </div>
             <div className="grid gap-2">
-              <Label>Prazo *</Label>
-              <Select
-                value={newLoanForm.term_days}
-                onValueChange={(v: "20" | "30") => {
-                  setNewLoanForm((f) => ({
-                    ...f,
-                    term_days: v,
-                    due_date: computeDueDate(f.loan_date, parseInt(v) as 20 | 30),
-                  }));
-                }}
-              >
-                <SelectTrigger>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="30">30 dias</SelectItem>
-                  <SelectItem value="20">20 dias</SelectItem>
-                </SelectContent>
-              </Select>
+              <Label>{isUnaiCred ? "Tipo de empréstimo *" : "Prazo *"}</Label>
+              {isUnaiCred ? (
+                <Select
+                  value={newLoanForm.loan_product}
+                  onValueChange={(v: UnaiLoanProduct) => {
+                    setNewLoanForm((f) => ({
+                      ...f,
+                      loan_product: v,
+                      term_days: v === "20_dias" ? "20" : "30",
+                      due_date: computeUnaiDueDate(v, f.loan_date),
+                    }));
+                  }}
+                >
+                  <SelectTrigger>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {IMPERATRIZ_LOAN_PRODUCT_OPTIONS.map((opt) => (
+                      <SelectItem key={opt.id} value={opt.id}>
+                        {opt.label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              ) : (
+                <Select
+                  value={newLoanForm.term_days}
+                  onValueChange={(v: "20" | "30") => {
+                    setNewLoanForm((f) => ({
+                      ...f,
+                      term_days: v,
+                      due_date: computeDueDate(f.loan_date, parseInt(v) as 20 | 30),
+                    }));
+                  }}
+                >
+                  <SelectTrigger>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="30">30 dias</SelectItem>
+                    <SelectItem value="20">20 dias</SelectItem>
+                  </SelectContent>
+                </Select>
+              )}
+              {isUnaiCred ? (
+                <p className="text-[11px] text-muted-foreground leading-snug">
+                  {IMPERATRIZ_LOAN_PRODUCT_OPTIONS.find((o) => o.id === newLoanForm.loan_product)?.description}
+                </p>
+              ) : null}
             </div>
+            {isUnaiCred && newLoanWeeklyPreview.length > 0 ? (
+              <div className="rounded-lg border bg-muted/20 p-3">
+                <LoanWeeklyInstallmentsTable rows={newLoanWeeklyPreview} />
+              </div>
+            ) : null}
             <div className="grid grid-cols-2 gap-4">
               <div className="grid gap-2">
                 <Label>Data do empréstimo *</Label>
@@ -2195,7 +2398,9 @@ export default function Emprestimos() {
                     setNewLoanForm((f) => ({
                       ...f,
                       loan_date: v,
-                      due_date: computeDueDate(v, parseInt(f.term_days) as 20 | 30),
+                      due_date: isUnaiCred
+                        ? computeUnaiDueDate(f.loan_product, v)
+                        : computeDueDate(v, parseInt(f.term_days) as 20 | 30),
                     }));
                   }}
                   required
@@ -2541,6 +2746,12 @@ export default function Emprestimos() {
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-sm">
                   <div><span className="text-muted-foreground">Valor original:</span> <span className="font-semibold">{formatCurrency(Number(selectedLoan.amount ?? 0))}</span></div>
                   <div><span className="text-muted-foreground">Juros:</span> {String(selectedLoan.interest_rate ?? "")}%</div>
+                  {isUnaiCred ? (
+                    <div>
+                      <span className="text-muted-foreground">Tipo:</span>{" "}
+                      <span className="font-medium">{unaiLoanProductLabel(selectedLoanProduct)}</span>
+                    </div>
+                  ) : null}
                   <div><span className="text-muted-foreground">Data do empréstimo:</span> {formatDate(String(selectedLoan.loan_date))}</div>
                   <div><span className="text-muted-foreground">Vencimento:</span> {formatDate(String(selectedLoan.due_date))}</div>
                   {(() => {
@@ -2571,6 +2782,16 @@ export default function Emprestimos() {
                   })()}
                 </div>
               </div>
+              {isUnaiCred &&
+              (isWeeklyLoanProduct(selectedLoanProduct) || weeklyInstallments.length > 0) ? (
+                <div className="rounded-lg border bg-muted/30 p-4">
+                  <LoanWeeklyInstallmentsTable
+                    rows={weeklyInstallments}
+                    onMarkPaid={(row) => void handleMarkWeekPaid(row)}
+                    markingId={markingWeeklyId}
+                  />
+                </div>
+              ) : null}
               {/* Etiquetas do cliente */}
               <div className="rounded-lg border bg-muted/30 p-4 space-y-3">
                 <div className="flex items-center justify-between gap-2">
@@ -3543,6 +3764,66 @@ export default function Emprestimos() {
               }}
             >
               Salvar etiqueta
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={contactsExportOpen} onOpenChange={setContactsExportOpen}>
+        <DialogContent className="w-[min(96vw,36rem)] sm:max-w-none max-h-[90vh] overflow-y-auto">
+          <DialogHeader>
+            <DialogTitle>Contatos dos clientes com empréstimo</DialogTitle>
+            <DialogDescription>
+              Nome e celular de todos os clientes com empréstimo ativo, vencido ou parcialmente pago.
+            </DialogDescription>
+          </DialogHeader>
+          {contactsExportLoading ? (
+            <p className="text-sm text-muted-foreground py-6 text-center">Carregando contatos...</p>
+          ) : loanClientContacts.length === 0 ? (
+            <p className="text-sm text-muted-foreground py-6 text-center">Nenhum cliente com empréstimo ativo.</p>
+          ) : (
+            <div className="space-y-3">
+              <p className="text-xs text-muted-foreground">{loanClientContacts.length} cliente(s) único(s)</p>
+              <ScrollArea className="h-[min(360px,50vh)] rounded-md border">
+                <table className="w-full text-xs">
+                  <thead className="sticky top-0 bg-muted/90 backdrop-blur">
+                    <tr className="border-b">
+                      <th className="text-left p-2 font-semibold">Nome</th>
+                      <th className="text-left p-2 font-semibold">Celular</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {loanClientContacts.map((c) => (
+                      <tr key={c.client_id} className="border-b border-border/40">
+                        <td className="p-2 font-medium">{c.client_name}</td>
+                        <td className="p-2 tabular-nums">{c.client_phone || "—"}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </ScrollArea>
+            </div>
+          )}
+          <DialogFooter className="flex flex-wrap gap-2 sm:space-x-0">
+            <Button variant="outline" onClick={() => setContactsExportOpen(false)}>
+              Fechar
+            </Button>
+            <Button
+              variant="outline"
+              className="gap-1.5"
+              disabled={!loanClientContacts.length || contactsExportLoading}
+              onClick={() => void copyLoanClientContacts()}
+            >
+              <Copy className="h-3.5 w-3.5" />
+              Copiar lista
+            </Button>
+            <Button
+              className="gap-1.5"
+              disabled={!loanClientContacts.length || contactsExportLoading}
+              onClick={downloadLoanClientContacts}
+            >
+              <FileDown className="h-3.5 w-3.5" />
+              Baixar TXT
             </Button>
           </DialogFooter>
         </DialogContent>

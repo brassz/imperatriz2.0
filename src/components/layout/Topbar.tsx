@@ -20,6 +20,7 @@ const routeNames: Record<string, string> = {
   "/captacao": "Captação de Capital",
   "/relatorios": "Relatórios",
   "/pdfs": "PDFs",
+  "/24horas": "24HORAS",
   "/configuracoes": "Configurações",
   "/usuarios": "Usuários",
 };

@@ -22,8 +22,9 @@ const TRADE_NAME_BY_BRANCH: Record<string, string> = {
   "Litoral Cred": "LITORALCRED",
   Mogiana: "MOGIANACRED",
   "Mogiana Cred": "MOGIANACRED",
-  Imperatriz: "IMPERATRIZCRED",
-  "Imperatriz Cred": "IMPERATRIZCRED",
+  Imperatriz: "CRED CARD - IMPERATRIZ",
+  "Imperatriz Cred": "CRED CARD - IMPERATRIZ",
+  "CRED CARD": "CRED CARD - IMPERATRIZ",
   Ribeirao: "RIBEIRAOCRED",
 };
 

@@ -1,4 +1,7 @@
 import { supabase } from "@/lib/supabase";
+import type { UnaiLoanProduct } from "@/lib/unai-cred";
+import { isWeeklyLoanProduct, supportsWeeklyLoanProducts } from "@/lib/unai-cred";
+import { createUnaiWeeklySchedule } from "./loan-weekly-installments";
 import { PAGE_SIZE } from "@/lib/constants";
 import { computeLoanRemainingTotal, effectiveLoanPrincipal } from "@/api/loan-calc";
 
@@ -689,6 +692,49 @@ export async function fetchClientLoansForParcelamentoLink(clientId: string) {
   return list.filter((l) => !linked.has(String(l.id)));
 }
 
+export type LoanClientContact = {
+  client_id: string;
+  client_name: string;
+  client_phone: string;
+};
+
+/** Clientes únicos com empréstimo ativo (active, overdue, partial_paid). */
+export async function fetchLoanClientContacts(): Promise<LoanClientContact[]> {
+  const CHUNK = 50;
+  const openStatuses = ["active", "overdue", "partial_paid"];
+  let offset = 0;
+  let hasMore = true;
+  const byClient = new Map<string, LoanClientContact>();
+
+  while (hasMore) {
+    const { data, error } = await supabase
+      .from("loans")
+      .select("client_id, clients (name, phone)")
+      .in("status", openStatuses)
+      .order("client_id")
+      .range(offset, offset + CHUNK - 1);
+    if (error) throw error;
+    const list = data || [];
+    for (const row of list) {
+      const rec = row as Record<string, unknown>;
+      const clientId = String(rec.client_id || "");
+      if (!clientId || byClient.has(clientId)) continue;
+      const cl = (rec.clients as { name?: string; phone?: string }) || {};
+      byClient.set(clientId, {
+        client_id: clientId,
+        client_name: String(cl.name || "—").trim(),
+        client_phone: String(cl.phone || "").trim(),
+      });
+    }
+    hasMore = list.length === CHUNK;
+    offset += CHUNK;
+  }
+
+  return Array.from(byClient.values()).sort((a, b) =>
+    a.client_name.localeCompare(b.client_name, "pt-BR", { sensitivity: "base" }),
+  );
+}
+
 export async function fetchActiveLoansForSelect() {
   const { data, error } = await supabase
     .from("loans")
@@ -720,11 +766,12 @@ export async function createLoan(data: {
   interest_rate: number;
   loan_date: string;
   due_date: string;
+  loan_product?: UnaiLoanProduct;
   capital_raise_id?: string | null;
   capital_raise_capital?: number;
   capital_raise_interest?: number;
 }) {
-  const row = {
+  const row: Record<string, unknown> = {
     client_id: data.client_id,
     amount: data.amount,
     original_amount: data.amount,
@@ -736,6 +783,11 @@ export async function createLoan(data: {
     capital_raise_capital: data.capital_raise_capital ?? null,
     capital_raise_interest: data.capital_raise_interest ?? null,
   };
+  if (supportsWeeklyLoanProducts()) {
+    const product = data.loan_product || "mensal";
+    row.loan_product = product;
+    row.loan_format = isWeeklyLoanProduct(product) ? "semanal" : "mensal";
+  }
   const { data: inserted, error } = await supabase.from("loans").insert([row]).select("id").single();
   if (error) {
     let msg = error.message || "Erro ao criar empréstimo";
@@ -743,6 +795,18 @@ export async function createLoan(data: {
     if (error.hint) msg += ` (${error.hint})`;
     throw new Error(msg);
   }
+
+  const loanId = String(inserted?.id || "");
+  const product = data.loan_product || "mensal";
+  if (supportsWeeklyLoanProducts() && loanId && isWeeklyLoanProduct(product)) {
+    try {
+      await createUnaiWeeklySchedule(loanId, product, data.amount, data.interest_rate, data.loan_date);
+    } catch (weeklyErr) {
+      await supabase.from("loans").delete().eq("id", loanId);
+      throw weeklyErr instanceof Error ? weeklyErr : new Error("Erro ao criar parcelas semanais");
+    }
+  }
+
   return inserted;
 }
 
@@ -890,6 +954,10 @@ export async function markLoanAsPaid(loanId: string, paidDate: string) {
 }
 
 export async function fetchLoanById(id: string) {
+  const unaiFields = supportsWeeklyLoanProducts()
+    ? `
+      loan_product,`
+    : "";
   const { data, error } = await supabase
     .from("loans")
     .select(`
@@ -900,7 +968,7 @@ export async function fetchLoanById(id: string) {
       interest_rate,
       loan_date,
       due_date,
-      status,
+      status,${unaiFields}
       created_at,
       clients (name, cpf, email, phone, address, rg)
     `)
