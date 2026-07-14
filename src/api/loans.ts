@@ -829,6 +829,16 @@ function throwLoanUpdateError(error: PgLikeError, action: string): never {
         `(alinha CHECK em loans.status e a função calculate_loan_status). Detalhe: ${msg}`,
     );
   }
+  if (
+    code === "42P10" ||
+    lower.includes("no unique or exclusion constraint matching the on conflict")
+  ) {
+    throw new Error(
+      `${action}: falta índice UNIQUE em paid_loans(loan_id) para o trigger de quitação. ` +
+        `No SQL Editor do Supabase, execute ` +
+        `supabase/migrations/20260714140000_imperatriz_fix_payments_quitacao.sql. Detalhe: ${msg}`,
+    );
+  }
   if (code === "42501" || lower.includes("permission denied") || lower.includes("row-level security")) {
     throw new Error(`${action}: atualização bloqueada por RLS/permissões em public.loans. ${msg}`);
   }

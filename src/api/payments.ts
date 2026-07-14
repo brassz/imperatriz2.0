@@ -138,6 +138,19 @@ export async function fetchPaymentsByLoanId(loanId: string) {
   }));
 }
 
+function throwPaymentInsertError(error: { message?: string; code?: string; details?: string }, action: string): never {
+  const msg = String(error.message || "");
+  const code = String(error.code || "");
+  if (code === "23514" || msg.includes("payments_payment_type_check")) {
+    throw new Error(
+      `${action}: o banco rejeitou o tipo de pagamento (CHECK payments_payment_type_check). ` +
+        `No SQL Editor do Supabase, execute ` +
+        `supabase/migrations/20260714140000_imperatriz_fix_payments_quitacao.sql. Detalhe: ${msg}`,
+    );
+  }
+  throw new Error(msg || `${action}: erro ao gravar pagamento`);
+}
+
 export async function createRenewalPayment(data: {
   loan_id: string;
   amount: number;
@@ -156,7 +169,7 @@ export async function createRenewalPayment(data: {
     notes,
     fine_amount: fine_amount ?? 0,
   }]);
-  if (payErr) throw payErr;
+  if (payErr) throwPaymentInsertError(payErr, "Registrar pagamento");
 
   const { error: loanErr } = await supabase
     .from("loans")
@@ -165,7 +178,7 @@ export async function createRenewalPayment(data: {
   if (loanErr) throw loanErr;
 
   const renewalNote = `EMPRÉSTIMO RENOVADO: Data de vencimento estendida. Nova data: ${data.new_due_date.split("T")[0]}. ${notes}`;
-  await supabase.from("payments").insert([{
+  const { error: renewalErr } = await supabase.from("payments").insert([{
     loan_id,
     amount: 0,
     payment_date,
@@ -173,6 +186,7 @@ export async function createRenewalPayment(data: {
     notes: renewalNote,
     fine_amount: 0,
   }]);
+  if (renewalErr) throwPaymentInsertError(renewalErr, "Registrar renovação");
 }
 
 export async function deletePayment(paymentId: string) {
@@ -196,5 +210,5 @@ export async function createPayment(data: {
     notes: data.notes || null,
     fine_amount: data.fine_amount ?? 0,
   }]);
-  if (error) throw error;
+  if (error) throwPaymentInsertError(error, "Registrar pagamento");
 }

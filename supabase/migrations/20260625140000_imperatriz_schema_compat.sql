@@ -26,7 +26,10 @@ ALTER TABLE public.payments
     payment_type IN (
       'partial', 'full', 'interest_renewal', 'capital_payment', 'partial_interest',
       'adjustment', 'dinheiro', 'pix', 'transferencia', 'cartao', 'cartao_debito',
-      'cartao_credito', 'boleto', 'loan_renewal'
+      'cartao_credito', 'boleto', 'loan_renewal',
+      -- tipos usados pelo app (renovação / quitação)
+      'capital_interest_renewal', 'capital_renewal', 'quitacao_total',
+      'early_payment_interest_renewal'
     )
   );
 
